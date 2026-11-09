@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "version": "0.0.65",
+  "source_commit": "c83de8f0947b2e45074c7f71b9899365b433d421",
+  "sha256": "29783ce22267664232b1baecb98677499ad0a895c9a3b31adf1d6df0f93281ec",
+  "bytes": 33728000,
+  "patches": {
+    "neo-workspace-runtime.patch": "5eb80754f518f830c5a3f230c8f12015d11560010604eee39e06cdb11a70707f",
+    "neo-close-notice-0.0.65.patch": "eb41b2fd9c6cf7333e43a08238d942abcbe2a75c8ccab6e4920dfdc4dcb8c3da"
+  },
+  "license": "AGPL-3.0-or-later",
+  "rustc": "1.98.0",
+  "cargo": "1.98.0",
+  "profile": "release optimized; jobs=2",
+  "path_policy": "Rust source and Cargo paths remapped; native C builds use anonymous owned build run without user or task identifiers",
+  "private_marker_scan": {
+    "user_name": 0,
+    "task_id": 0
+  },
+  "catalog_origin": "actual owned server, guarded before initialize and tools-list",
+  "qualification_status": "OWNED_BINARY_MCP_AND_SCHEMA_VERIFIED; distribution acceptance recorded separately",
+  "corresponding_source": {
+    "filename": "neo-server-0.0.65-public-source.zip",
+    "sha256": "2cac3096ef4b51df3f56061f5029eb6b2b0cfec3c65b2ad450729979bdbb36fb",
+    "bytes": 83834586,
+    "source_files": 2289,
+    "vendor_files": 22125,
+    "offline_resolved_packages": 403
+  },
+  "external_native_runtime": "Microsoft Visual C++ v14 x64 Redistributable, VCRUNTIME140.dll"
+}

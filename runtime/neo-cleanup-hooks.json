@@ -1,0 +1,22 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "browseros-neo",
+            "tool": "workspace_cleanup",
+            "input": {
+              "action": "check",
+              "task_id": "${session_id}",
+              "stop_hook_active": "${stop_hook_active}"
+            },
+            "timeout": 25,
+            "statusMessage": "Checking this task's Neo tabs"
+          }
+        ]
+      }
+    ]
+  }
+}

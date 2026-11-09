@@ -1,0 +1,7 @@
+local/
+assets/
+*.zip
+.venv/
+__pycache__/
+runtime/runtime-plan.json
+*.log

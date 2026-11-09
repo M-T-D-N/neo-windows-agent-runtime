@@ -1,0 +1,5 @@
+Unofficial Neo Windows Agent Runtime.
+BrowserOS upstream: browseros-ai/BrowserOS, AGPL-3.0-or-later.
+Runtime adapters, safe storage helpers, patches and installer: distributed under AGPL-3.0-or-later.
+Python dependencies retain their own licenses; they are installed into a private environment.
+No affiliation or endorsement by BrowserOS, OpenAI, or AGY.

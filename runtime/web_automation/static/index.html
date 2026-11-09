@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Synthetic publishing fixture</title><link rel="stylesheet" href="/style.css"><script defer src="/app.js"></script></head>
+<body><main><h1>Synthetic publishing fixture</h1><p class="notice">Fictional local editor · no external account or website</p>
+<label>Operation ID <input id="operation" value="synthetic-demo" maxlength="80"></label>
+<label>Title <input id="title" maxlength="200"></label>
+<label>Editor <select id="mode"><option value="rich">Contenteditable</option><option value="iframe">Iframe contenteditable</option><option value="plain">Textarea</option></select></label>
+<div id="toolbar"><button type="button" id="bold">Bold</button><label>Link URL <input id="link-url" placeholder="https://example.test/"></label><button type="button" id="link">Insert link on selection</button></div>
+<div id="rich" contenteditable="true" role="textbox" aria-label="Rich body" aria-multiline="true"></div>
+<iframe id="frame" title="Iframe body editor" src="/editor.html" hidden></iframe>
+<textarea id="plain" aria-label="Plain body" hidden></textarea>
+<section><h2>Attachments</h2><div id="file-control"></div><ol id="attachments"></ol><p>Files are uploaded as real bytes, then previewed and inserted in their selection order.</p></section>
+<details><summary>Synthetic failure controls</summary><label>Upload delay (ms) <input id="upload-delay" type="number" min="0" max="3000" value="0"></label><label><input id="upload-fail" type="checkbox">Fail upload before commit</label><label>Save/publish delay (ms) <input id="save-delay" type="number" min="0" max="3000" value="0"></label><label><input id="save-fail" type="checkbox">Fail save/publish before commit</label><label><input id="drop" type="checkbox">Drop publish response after committing post</label></details>
+<div id="actions"></div><p id="status" role="status" aria-live="polite">Ready</p><pre id="result"></pre><section><h2>Reconciliation</h2><button id="find" type="button">Find posts for operation</button><div id="posts"></div></section>
+</main></body></html>

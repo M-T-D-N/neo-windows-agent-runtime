@@ -1,0 +1,19 @@
+{
+  "version": "0.51.0",
+  "chromium_version": "155.0.8309.26",
+  "installer_url": "https://cdn.browseros.com/releases/browserclaw/0.51.0/win/BrowserOS_neo_v0.51.0_x64_installer.exe",
+  "installer_bytes": 137351224,
+  "installer_sha256": "101d428144d67b04d60d91685645193612ad83be30d06d64ee940d62577938e3",
+  "authenticode_publisher": "Felafax, Inc.",
+  "session_idle_ms": 86400000,
+  "server_override": {
+    "version": "0.0.65",
+    "sha256": "29783ce22267664232b1baecb98677499ad0a895c9a3b31adf1d6df0f93281ec",
+    "source_commit": "c83de8f0947b2e45074c7f71b9899365b433d421"
+  },
+  "upstream_repository": "https://github.com/browseros-ai/BrowserOS.git",
+  "patches": {
+    "neo-workspace-runtime.patch": "5eb80754f518f830c5a3f230c8f12015d11560010604eee39e06cdb11a70707f",
+    "neo-close-notice-0.0.65.patch": "eb41b2fd9c6cf7333e43a08238d942abcbe2a75c8ccab6e4920dfdc4dcb8c3da"
+  }
+}

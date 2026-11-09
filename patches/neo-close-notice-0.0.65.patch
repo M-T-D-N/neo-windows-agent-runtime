@@ -1,0 +1,352 @@
+--- a/apps/claw-server-rust/src/api/mcp/dispatch.rs
++++ b/apps/claw-server-rust/src/api/mcp/dispatch.rs
+@@ -52,6 +52,9 @@
+     /// Pre-execution page incarnation retained for activity, close cleanup, and
+     /// audit fallback even if execution changes or removes the live page.
+     pub page_snapshot: Option<PageInfo>,
++    /// Ownership captured before execution or asynchronous detach cleanup. Outer None means attribution
++    /// was unavailable; inner None means an existing page had no agent claim.
++    pub(crate) page_owner_snapshot: Option<Option<ConvoId>>,
+     pub started_at_ms: i64,
+     /// Linked token passed into browser execution; session cancellation becomes a
+     /// protocol error that skips effects.
+@@ -124,6 +127,7 @@
+             identity,
+             browser_session,
+             page_snapshot: None,
++            page_owner_snapshot: None,
+             started_at_ms: crate::clock::now_epoch_ms(),
+             cancel,
+             client_cancel,
+@@ -273,6 +277,10 @@
+     }
+     if let (Some(browser), Some(page_id)) = (&call.browser_session, extract_page_id(&call)) {
+         call.page_snapshot = browser.pages.get_info(PageId(page_id)).await;
++        if call.page_snapshot.is_some() {
++            call.page_owner_snapshot =
++                Some(call.state.sessions.owner_of_page(&PageId(page_id)).await);
++        }
+     }
+
+     let result = if let Some(rejection) = run_guards(&call, guards).await {
+--- a/apps/claw-server-rust/src/api/mcp/effects/page_ownership_notice.rs
++++ b/apps/claw-server-rust/src/api/mcp/effects/page_ownership_notice.rs
+@@ -36,7 +36,7 @@
+ /// Appends a one-line note when the acted-on page belongs to someone else.
+ ///
+ /// Returns `None` far more often than not: the common case is an agent working in its
+-/// own tab, which needs no annotation. Silence means "yours".
++/// own tab, which needs no annotation. Unknown attribution is also left unlabelled.
+ pub fn apply(context: ToolEffectContext<'_>) -> BoxFuture<'_, anyhow::Result<Option<ToolResult>>> {
+     Box::pin(async move {
+         // Nothing to say about a call that failed for its own reasons.
+@@ -56,7 +56,14 @@
+         };
+         let page_id = PageId(page_id);
+
+-        let owner = context.call.state.sessions.owner_of_page(&page_id).await;
++        // Any page action (including dialog acceptance) can detach its target.
++        // The asynchronous detach hook may already have removed the live claim.
++        // Attribute this operation to its admission snapshot, never to the absence
++        // of a claim after execution. Unknown attribution is not a user claim.
++        let Some(owner) = &context.call.page_owner_snapshot else {
++            return Ok(None);
++        };
++        let owner = owner.clone();
+         let notice = match owner {
+             // Claimed by this conversation: the ordinary case, say nothing.
+             Some(owner) if owner == identity.ownership_key => return Ok(None),
+@@ -189,6 +196,95 @@
+         .unwrap_or(None)
+     }
+
++    // Effect-only fixtures represent a page known to exist at admission.
++    // Detached/unknown fixtures below supply (or omit) their snapshot explicitly.
++    async fn run_known_live_page(
++        call: &crate::api::mcp::dispatch::ToolCall,
++        result: &ToolResult,
++    ) -> Option<ToolResult> {
++        let mut admitted = call.clone();
++        let page = PageId(extract_page_id(call).expect("page-targeted fixture"));
++        admitted.page_owner_snapshot = Some(call.state.sessions.owner_of_page(&page).await);
++        run(&admitted, result).await
++    }
++
++    #[tokio::test]
++    async fn detached_dialog_accept_keeps_admission_owner() -> anyhow::Result<()> {
++        // The browser connection's on_page_detached hook can remove the claim
++        // before this effect, independently of the tabs-close ownership effect.
++        for kind in ["own", "other", "user"] {
++            let mut call = crate::api::mcp::test_support::tool_call(
++                "act",
++                json!({"page": 7, "kind": "dialog_accept"}),
++            )
++            .await?;
++            let owner = match kind {
++                "own" => Some(
++                    call.identity
++                        .as_ref()
++                        .expect("identity")
++                        .ownership_key
++                        .clone(),
++                ),
++                "other" => Some(ConvoId::new("other-dialog-client")),
++                _ => None,
++            };
++            if let Some(owner) = &owner {
++                call.state
++                    .sessions
++                    .ownership()
++                    .claim_page(owner.clone(), PageId(7))
++                    .await;
++            }
++            call.page_owner_snapshot = Some(owner);
++            call.state
++                .sessions
++                .ownership()
++                .remove_page(&PageId(7))
++                .await;
++            assert!(!call.flags.close_page);
++            let result = run(&call, &ToolResult::text("ok (dialog_accept)", None)).await;
++            match kind {
++                "own" => assert!(
++                    result.is_none(),
++                    "detached own page must stay own: {result:?}"
++                ),
++                "other" => {
++                    let text = text_of(&result.expect("other owner notice"));
++                    assert!(
++                        text.contains("belongs to another agent")
++                            && !text.contains("user's own tabs"),
++                        "{text}"
++                    );
++                }
++                _ => assert!(text_of(&result.expect("user notice")).contains("user's own tabs")),
++            }
++            assert!(
++                call.state
++                    .sessions
++                    .owner_of_page(&PageId(7))
++                    .await
++                    .is_none()
++            );
++        }
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn dialog_without_admission_does_not_infer_user() -> anyhow::Result<()> {
++        let call = crate::api::mcp::test_support::tool_call(
++            "act",
++            json!({"page": 7, "kind": "dialog_accept"}),
++        )
++        .await?;
++        assert!(
++            run(&call, &ToolResult::text("ok (dialog_accept)", None))
++                .await
++                .is_none()
++        );
++        Ok(())
++    }
++
+     /// A reconnect gives one client a new conversation, so an agent reading its
+     /// own earlier tab sees its own name as the owner. Telling it only that the
+     /// page is another agent's made a careful agent abandon its own work, so the
+@@ -219,15 +315,9 @@
+             .claim_page(earlier.convo_id().clone(), PageId(7))
+             .await;
+         let result = ToolResult::text("script returned 1", None);
+-        let annotated = apply(ToolEffectContext {
+-            call: &call,
+-            result: &result,
+-            cancelled: false,
+-            duration_ms: 1,
+-        })
+-        .await
+-        .unwrap_or_else(|error| panic!("effect failed: {error}"))
+-        .unwrap_or_else(|| panic!("expected a notice"));
++        let annotated = run_known_live_page(&call, &result)
++            .await
++            .unwrap_or_else(|| panic!("expected a notice"));
+         let text = text_of(&annotated);
+         assert!(text.contains("earlier session"), "{text}");
+         assert!(text.contains("groupId"), "names the way back: {text}");
+@@ -262,15 +352,9 @@
+             .claim_page(ConvoId::new(format!("{slug}-prior")), PageId(7))
+             .await;
+         let result = ToolResult::text("script returned 1", None);
+-        let annotated = apply(ToolEffectContext {
+-            call: &call,
+-            result: &result,
+-            cancelled: false,
+-            duration_ms: 1,
+-        })
+-        .await
+-        .unwrap_or_else(|error| panic!("effect failed: {error}"))
+-        .unwrap_or_else(|| panic!("expected a notice"));
++        let annotated = run_known_live_page(&call, &result)
++            .await
++            .unwrap_or_else(|| panic!("expected a notice"));
+         let text = text_of(&annotated);
+         assert!(text.contains("earlier session"), "{text}");
+         assert!(text.contains("groupId"), "names the way back: {text}");
+@@ -291,7 +375,7 @@
+             .await;
+
+         let ok = ToolResult::text("navigated", None);
+-        let annotated = run(&call, &ok).await;
++        let annotated = run_known_live_page(&call, &ok).await;
+
+         let annotated = annotated.unwrap_or_else(|| panic!("expected a notice"));
+         assert!(!annotated.is_error, "ownership must never fail a call");
+@@ -309,7 +393,7 @@
+             crate::api::mcp::test_support::tool_call("navigate", json!({ "page": 3 })).await?;
+         let ok = ToolResult::text("navigated", None);
+
+-        let annotated = run(&call, &ok)
++        let annotated = run_known_live_page(&call, &ok)
+             .await
+             .unwrap_or_else(|| panic!("expected a notice"));
+         assert!(!annotated.is_error);
+@@ -336,7 +420,10 @@
+             .await;
+
+         let ok = ToolResult::text("navigated", None);
+-        assert!(run(&call, &ok).await.is_none(), "own pages need no notice");
++        assert!(
++            run_known_live_page(&call, &ok).await.is_none(),
++            "own pages need no notice"
++        );
+         Ok(())
+     }
+
+@@ -396,4 +483,129 @@
+         assert!(run(&call, &failed).await.is_none());
+         Ok(())
+     }
++
++    #[tokio::test]
++    async fn successful_close_preserves_own_attribution() -> anyhow::Result<()> {
++        let mut call =
++            crate::api::mcp::test_support::tool_call("tabs", json!({"action":"close", "page":9}))
++                .await?;
++        let owner = call
++            .identity
++            .as_ref()
++            .expect("identity")
++            .ownership_key
++            .clone();
++        call.state
++            .sessions
++            .ownership()
++            .claim_page(owner.clone(), PageId(9))
++            .await;
++        call.page_owner_snapshot = Some(Some(owner));
++        let ok = ToolResult::text("closed page 9", None);
++        crate::api::mcp::effects::ownership_claims::apply(ToolEffectContext {
++            call: &call,
++            result: &ok,
++            cancelled: false,
++            duration_ms: 1,
++        })
++        .await?;
++        assert!(
++            call.state
++                .sessions
++                .owner_of_page(&PageId(9))
++                .await
++                .is_none()
++        );
++        let annotated = run(&call, &ok).await;
++        assert!(
++            annotated.is_none(),
++            "own close must not be relabelled: {annotated:?}"
++        );
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn successful_close_keeps_user_and_other_attribution() -> anyhow::Result<()> {
++        for owner in [None, Some(ConvoId::new("another-agent-prior"))] {
++            let mut call = crate::api::mcp::test_support::tool_call(
++                "tabs",
++                json!({"action":"close", "page":7}),
++            )
++            .await?;
++            if let Some(owner) = &owner {
++                call.state
++                    .sessions
++                    .ownership()
++                    .claim_page(owner.clone(), PageId(7))
++                    .await;
++            }
++            call.page_owner_snapshot = Some(owner.clone());
++            let ok = ToolResult::text("closed page 7", None);
++            crate::api::mcp::effects::ownership_claims::apply(ToolEffectContext {
++                call: &call,
++                result: &ok,
++                cancelled: false,
++                duration_ms: 1,
++            })
++            .await?;
++            assert!(
++                call.state
++                    .sessions
++                    .owner_of_page(&PageId(7))
++                    .await
++                    .is_none()
++            );
++            let annotated = run(&call, &ok).await.expect("foreign attribution");
++            let text = text_of(&annotated);
++            assert_eq!(text.contains("user's own tabs"), owner.is_none(), "{text}");
++            assert_eq!(text.contains("another agent"), owner.is_some(), "{text}");
++        }
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn close_without_snapshot_does_not_assume_user() -> anyhow::Result<()> {
++        let call =
++            crate::api::mcp::test_support::tool_call("tabs", json!({"action":"close", "page":7}))
++                .await?;
++        assert!(
++            run(&call, &ToolResult::text("closed page 7", None))
++                .await
++                .is_none()
++        );
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn failed_close_preserves_claim_and_emits_no_notice() -> anyhow::Result<()> {
++        let mut call =
++            crate::api::mcp::test_support::tool_call("tabs", json!({"action":"close", "page":9}))
++                .await?;
++        let owner = call
++            .identity
++            .as_ref()
++            .expect("identity")
++            .ownership_key
++            .clone();
++        call.state
++            .sessions
++            .ownership()
++            .claim_page(owner.clone(), PageId(9))
++            .await;
++        call.page_owner_snapshot = Some(Some(owner.clone()));
++        let failed = ToolResult::error("beforeunload cancelled");
++        crate::api::mcp::effects::ownership_claims::apply(ToolEffectContext {
++            call: &call,
++            result: &failed,
++            cancelled: false,
++            duration_ms: 1,
++        })
++        .await?;
++        assert_eq!(
++            call.state.sessions.owner_of_page(&PageId(9)).await,
++            Some(owner)
++        );
++        assert!(run(&call, &failed).await.is_none());
++        Ok(())
++    }
+ }

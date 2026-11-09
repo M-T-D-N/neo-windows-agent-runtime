@@ -1,0 +1,1008 @@
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -486,7 +486,7 @@
+ 
+ [[package]]
+ name = "claw-server-rust"
+-version = "0.0.64"
++version = "0.0.65"
+ dependencies = [
+  "anyhow",
+  "axum",
+--- a/apps/claw-server-rust/Cargo.toml
++++ b/apps/claw-server-rust/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "claw-server-rust"
+-version = "0.0.64"
++version = "0.0.65"
+ edition.workspace = true
+ rust-version.workspace = true
+ license.workspace = true
+--- a/apps/claw-server-rust/src/api/http/mod.rs
++++ b/apps/claw-server-rust/src/api/http/mod.rs
+@@ -165,6 +165,28 @@
+             return AppError::unsupported_media_type("unsupported content type").into_response();
+         }
+     }
++    // Older Workspace transports may have initialized against a stateless
++    // upstream. Make only their headerless readiness ping look like an expired
++    // HTTP session, so the existing transport can reinitialize before dispatch.
++    let req = if std::env::var("WORKSPACE_NEO_STATEFUL_PREFLIGHT_COMPAT").as_deref() == Ok("1")
++        && *req.method() == Method::POST
++        && !req.headers().contains_key("mcp-session-id")
++    {
++        let (parts, body) = req.into_parts();
++        let bytes = match axum::body::to_bytes(body, RECORDING_INGEST_MAX_BYTES).await {
++            Ok(bytes) => bytes,
++            Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
++        };
++        let headerless_ping = serde_json::from_slice::<serde_json::Value>(&bytes)
++            .ok()
++            .is_some_and(|value| value["jsonrpc"] == "2.0" && value["method"] == "ping");
++        if headerless_ping {
++            return (StatusCode::NOT_FOUND, "HTTP session requires initialize").into_response();
++        }
++        Request::from_parts(parts, axum::body::Body::from(bytes))
++    } else {
++        req
++    };
+     next.run(req).await
+ }
+ 
+--- a/apps/claw-server-rust/src/api/mcp/effects/tab_groups.rs
++++ b/apps/claw-server-rust/src/api/mcp/effects/tab_groups.rs
+@@ -542,6 +542,27 @@
+     }
+     warn!(key = %key, error = %collapse_error, "agent tab group collapse failed");
+     false
++}
++
++/// Manual cleanup must not discard ownership while a retained group still exists.
++pub async fn agent_tab_group_is_absent(
++    browser: Option<&Arc<BrowserSession>>,
++    ownership: &Arc<PageOwnership>,
++    key: &ConvoId,
++) -> bool {
++    let operation_lock = ownership.group_operation_lock(key).await;
++    let _guard = operation_lock.lock().await;
++    let Some(group_id) = ownership.tab_group_ref(key).await else {
++        return true;
++    };
++    let Some(browser) = browser else {
++        return false;
++    };
++    let output_files = browseros_mcp::output_file::create_browser_output_file_access();
++    if group_exists_unlocked(browser, &group_id, output_files).await != Some(false) {
++        return false;
++    }
++    ownership.clear_tab_group_ref_if_current(key, &group_id).await
+ }
+ 
+ /// Closes a retained session group, confirming absence after a failed close.
+@@ -1346,6 +1367,26 @@
+     }
+ 
+     #[tokio::test]
++    async fn manual_cleanup_keeps_ownership_until_group_is_confirmed_absent() -> anyhow::Result<()> {
++        let recorder = Arc::new(GroupDispatchRecorder::new());
++        recorder.seed_group("group-manual", [101]);
++        let browser = BrowserSession::new(recorder.clone(), BrowserSessionHooks::default());
++        let ownership = Arc::new(PageOwnership::new());
++        let key = ConvoId::new("codex-manual-cleanup");
++        ownership.set_tab_group_ref(key.clone(), Some("group-manual".to_string())).await;
++        assert!(!super::agent_tab_group_is_absent(Some(&browser), &ownership, &key).await);
++        assert_eq!(ownership.tab_group_ref(&key).await.as_deref(), Some("group-manual"));
++        assert!(!super::agent_tab_group_is_absent(None, &ownership, &key).await);
++        recorder.fail_list(true);
++        assert!(!super::agent_tab_group_is_absent(Some(&browser), &ownership, &key).await);
++        assert_eq!(ownership.tab_group_ref(&key).await.as_deref(), Some("group-manual"));
++        recorder.fail_list(false);
++        assert!(super::close_agent_tab_group(Some(&browser), &ownership, &key).await);
++        assert!(super::agent_tab_group_is_absent(Some(&browser), &ownership, &key).await);
++        Ok(())
++    }
++
++    #[tokio::test]
+     async fn retained_group_close_succeeds_and_confirms_already_absent_groups() -> anyhow::Result<()>
+     {
+         let recorder = Arc::new(GroupDispatchRecorder::new());
+--- a/apps/claw-server-rust/src/api/mcp/mod.rs
++++ b/apps/claw-server-rust/src/api/mcp/mod.rs
+@@ -48,6 +48,10 @@
+                         .await
+                     }
+                     RetainedGroupAction::Close => {
++                        // Forget ownership only after the retained browser group is actually absent.
++                        if crate::config::workspace_manual_tab_cleanup() {
++                            return effects::tab_groups::agent_tab_group_is_absent(session.as_ref(), &ownership, &key).await;
++                        }
+                         effects::tab_groups::close_agent_tab_group(
+                             session.as_ref(),
+                             &ownership,
+--- a/apps/claw-server-rust/src/config.rs
++++ b/apps/claw-server-rust/src/config.rs
+@@ -7,6 +7,13 @@
+     path::{Path, PathBuf},
+     time::Duration,
+ };
++
++/// Workspace agents explicitly close finished tabs; transport expiry is not task completion.
++/// Opt-in only: stock behavior remains unchanged when this variable is absent.
++#[must_use]
++pub fn workspace_manual_tab_cleanup() -> bool {
++    env::var("WORKSPACE_NEO_MANUAL_TAB_CLEANUP").as_deref() == Ok("1")
++}
+ 
+ const DEFAULT_SERVER_PORT: u16 = 9200;
+ const DEFAULT_CDP_PORT: u16 = 49337;
+--- a/apps/claw-server-rust/src/main.rs
++++ b/apps/claw-server-rust/src/main.rs
+@@ -204,6 +204,29 @@
+         claw_server_rust::services::runtime_file::write(&runtime_dir, &runtime_url).await;
+     });
+     let shutdown = runtime.state().shutdown;
++    if std::env::var("WORKSPACE_NEO_DIRECT_RECOVERY").as_deref() == Ok("1") {
++        let browser = runtime.state().browser;
++        let recovery_shutdown = shutdown.clone();
++        runtime.spawn_task("Workspace direct server browser lifecycle", async move {
++            let mut disconnected_seconds = 0_u8;
++            loop {
++                tokio::select! {
++                    () = recovery_shutdown.requested() => return,
++                    () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
++                }
++                if browser.state().connected {
++                    disconnected_seconds = 0;
++                } else {
++                    disconnected_seconds += 1;
++                    if disconnected_seconds >= 10 {
++                        info!("Workspace direct recovery browser disconnected; stopping own server");
++                        recovery_shutdown.request();
++                        return;
++                    }
++                }
++            }
++        });
++    }
+     runtime.spawn_task("harness integration reconciliation", boot_task);
+     axum::serve(listener, app.into_make_service())
+         .with_graceful_shutdown(wait_for_shutdown(shutdown))
+@@ -264,6 +287,11 @@
+ }
+ 
+ async fn heal_boot_config(state: &AppState) {
++    // This dedicated runtime's agent links and skills are owned by Workspace.
++    if std::env::var("WORKSPACE_NEO_PRESERVE_AGENT_CONFIG").as_deref() == Ok("1") {
++        info!("Workspace manages agent configuration; skipped automatic harness changes");
++        return;
++    }
+     match state
+         .harness
+         .migrate_browseros_identity(&state.config.public_mcp_url())
+--- a/apps/claw-server-rust/src/services/tab_cleanup.rs
++++ b/apps/claw-server-rust/src/services/tab_cleanup.rs
+@@ -41,6 +41,9 @@
+     now: i64,
+     cleanup_grace: Duration,
+ ) -> AppResult<usize> {
++    if crate::config::workspace_manual_tab_cleanup() {
++        return Ok(0);
++    }
+     let cutoff = now.saturating_sub(i64::try_from(cleanup_grace.as_millis()).unwrap_or(i64::MAX));
+     let orphaned = session_tabs.list_orphaned_owned_tabs(cutoff).await?;
+     if orphaned.is_empty() {
+--- a/crates/browseros-core/src/browser.rs
++++ b/crates/browseros-core/src/browser.rs
+@@ -57,10 +57,6 @@
+         url: &str,
+         opts: crate::pages::NewPageOptions,
+     ) -> Result<PageId, CoreError> {
+-        let mut opts = opts;
+-        if opts.window_id.is_none() {
+-            opts.window_id = self.resolve_visible_window_id().await?;
+-        }
+         self.core.pages.new_page(url, opts).await
+     }
+ 
+@@ -145,19 +141,6 @@
+     async fn resolve_session(&self, page_id: PageId) -> Result<ProtocolSession, CoreError> {
+         Ok(self.core.pages.get_session(page_id).await?.session)
+     }
+-
+-    async fn resolve_visible_window_id(&self) -> Result<Option<crate::WindowId>, CoreError> {
+-        let windows = self.core.windows.list().await?;
+-        let active = windows
+-            .iter()
+-            .find(|window| window.is_visible && window.is_active)
+-            .or_else(|| windows.iter().find(|window| window.is_visible));
+-        if let Some(active) = active {
+-            return Ok(Some(crate::WindowId(active.window_id)));
+-        }
+-        let created = self.core.windows.create().await?;
+-        Ok(Some(crate::WindowId(created.window_id)))
+-    }
+ }
+ 
+ #[derive(Debug, Clone, PartialEq)]
+--- a/crates/browseros-core/src/pages.rs
++++ b/crates/browseros-core/src/pages.rs
+@@ -290,17 +290,46 @@
+         Ok(out)
+     }
+ 
++    async fn new_page_window(
++        &self,
++        root: &ProtocolSession,
++        opts: &NewPageOptions,
++    ) -> Result<WindowId, CoreError> {
++        if let Some(group_id) = opts.tab_group_id.as_ref() {
++            let groups: browser::GetTabGroupsResult =
++                root.send("Browser.getTabGroups", json!({})).await?;
++            if let Some(group) = groups.groups.iter().find(|g| &g.group_id == group_id) {
++                if opts
++                    .window_id
++                    .as_ref()
++                    .is_some_and(|id| id.0 != group.window_id)
++                {
++                    return Err(CoreError::Message(
++                        "Requested window conflicts with existing group window".into(),
++                    ));
++                }
++                return Ok(WindowId(group.window_id));
++            }
++        }
++        if let Some(window_id) = opts.window_id.as_ref() {
++            return Ok(window_id.clone());
++        }
++        let (window, _) = crate::windows::WindowManager::new(self.cdp.clone())
++            .ensure_normal()
++            .await?;
++        Ok(WindowId(window.window_id))
++    }
++
+     pub async fn new_page(&self, url: &str, opts: NewPageOptions) -> Result<PageId, CoreError> {
+         self.ensure_connected().await?;
+         let root = ProtocolSession::root(self.cdp.clone());
++        let window_id = self.new_page_window(&root, &opts).await?;
+         let mut params = serde_json::Map::new();
+         params.insert("url".to_string(), Value::String(url.to_string()));
+         if let Some(background) = opts.background {
+             params.insert("background".to_string(), Value::Bool(background));
+         }
+-        if let Some(window_id) = opts.window_id {
+-            params.insert("windowId".to_string(), Value::from(window_id.0));
+-        }
++        params.insert("windowId".to_string(), Value::from(window_id.0));
+         let created: browser::CreateTabResult = root
+             .send("Browser.createTab", Value::Object(params))
+             .await?;
+@@ -373,6 +402,28 @@
+         let _: Value = root
+             .send("Browser.closeTab", json!({ "tabId": info.tab_id.0 }))
+             .await?;
++        // Browser.closeTab acknowledges the request, not necessarily physical closure.
++        // Retain the page/session (and dialog listener) until its target is gone.
++        let mut closed = false;
++        for _ in 0..20 {
++            let targets: Value = root.send("Target.getTargets", json!({})).await?;
++            let targets = targets
++                .get("targetInfos")
++                .and_then(Value::as_array)
++                .ok_or_else(|| {
++                    CoreError::Message("close: missing target list; page binding preserved".into())
++                })?;
++            if !targets.iter().any(|target| {
++                target.get("targetId").and_then(Value::as_str) == Some(info.target_id.as_str())
++            }) {
++                closed = true;
++                break;
++            }
++            sleep(std::time::Duration::from_millis(25)).await;
++        }
++        if !closed {
++            return Err(CoreError::Message("close request acknowledged, but target remains; inspect and resolve any dialog explicitly before retrying; page binding preserved".into()));
++        }
+         let mut state = self.state.lock().await;
+         state.pages.remove(&page_id);
+         state.sessions.remove(&info.target_id);
+@@ -597,6 +648,154 @@
+         })
+     }
+ 
++    fn window_json(id: i64, kind: &str, visible: bool, active: bool) -> Value {
++        json!({"windowId":id,"windowType":kind,"bounds":{},"isVisible":visible,
++            "isActive":active,"tabCount":1,"browserContextId":"Default"})
++    }
++
++    #[tokio::test]
++    async fn new_page_reuses_minimized_normal_window_instead_of_active_popup()
++    -> Result<(), Box<dyn Error>> {
++        let connection = TestConnection::new([
++            (
++                "Browser.getWindows",
++                json!({"windows":[window_json(8,"popup",true,true),window_json(5,"normal",false,false),window_json(3,"normal",false,false)]}),
++            ),
++            ("Browser.createTab", json!({"tab":tab_json(7,"target-7")})),
++            ("Browser.getTabInfo", json!({"tab":tab_json(7,"target-7")})),
++        ]);
++        crate::Browser::new(connection.clone())
++            .new_page("about:blank", NewPageOptions::default())
++            .await?;
++        let calls = connection.calls()?;
++        assert_eq!(
++            calls
++                .iter()
++                .find(|c| c.method == "Browser.createTab")
++                .map(|c| c.params.get("windowId")),
++            Some(Some(&json!(3)))
++        );
++        assert!(!calls.iter().any(|c| c.method == "Browser.createWindow"));
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn new_page_stays_in_requested_group_window() -> Result<(), Box<dyn Error>> {
++        let connection = TestConnection::new([
++            (
++                "Browser.getTabGroups",
++                json!({"groups":[{"groupId":"group-3","windowId":3,"title":"test","color":"green","collapsed":false,"tabIds":[6]}]}),
++            ),
++            ("Browser.createTab", json!({"tab":tab_json(7,"target-7")})),
++            ("Browser.getTabInfo", json!({"tab":tab_json(7,"target-7")})),
++            (
++                "Browser.addTabsToGroup",
++                json!({"group":{"groupId":"group-3","windowId":3,"title":"test","color":"green","collapsed":false,"tabIds":[6,7]}}),
++            ),
++            ("Browser.getTabInfo", json!({"tab":tab_json(7,"target-7")})),
++        ]);
++        PageManager::new(connection.clone(), PageManagerHooks::default())
++            .new_page(
++                "about:blank",
++                NewPageOptions {
++                    tab_group_id: Some("group-3".into()),
++                    ..Default::default()
++                },
++            )
++            .await?;
++        let calls = connection.calls()?;
++        assert_eq!(
++            calls
++                .iter()
++                .find(|c| c.method == "Browser.createTab")
++                .map(|c| c.params.get("windowId")),
++            Some(Some(&json!(3)))
++        );
++        assert!(!calls.iter().any(|c| c.method == "Browser.createWindow"));
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn new_page_rejects_conflicting_group_window_without_creating_tab()
++    -> Result<(), Box<dyn Error>> {
++        let connection = TestConnection::new([(
++            "Browser.getTabGroups",
++            json!({"groups":[{"groupId":"group-3","windowId":3,"title":"test","color":"green","collapsed":false,"tabIds":[6]}]}),
++        )]);
++        let err = PageManager::new(connection.clone(), PageManagerHooks::default())
++            .new_page(
++                "about:blank",
++                NewPageOptions {
++                    window_id: Some(crate::WindowId(9)),
++                    tab_group_id: Some("group-3".into()),
++                    ..Default::default()
++                },
++            )
++            .await
++            .unwrap_err();
++        assert!(err.to_string().contains("group window"));
++        assert!(
++            !connection
++                .calls()?
++                .iter()
++                .any(|c| c.method == "Browser.createTab" || c.method == "Browser.createWindow")
++        );
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn new_page_inventory_failure_does_not_create_fallback_window()
++    -> Result<(), Box<dyn Error>> {
++        let connection = TestConnection::new([]);
++        assert!(
++            PageManager::new(connection.clone(), PageManagerHooks::default())
++                .new_page("about:blank", NewPageOptions::default())
++                .await
++                .is_err()
++        );
++        assert_eq!(
++            connection
++                .calls()?
++                .iter()
++                .map(|c| c.method.as_str())
++                .collect::<Vec<_>>(),
++            vec!["Browser.getWindows"]
++        );
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn new_page_creates_first_normal_window_only_when_absent() -> Result<(), Box<dyn Error>> {
++        let connection = TestConnection::new([
++            ("Browser.getWindows", json!({"windows":[]})),
++            (
++                "Browser.createWindow",
++                json!({"window":window_json(3,"normal",true,false)}),
++            ),
++            ("Browser.createTab", json!({"tab":tab_json(7,"target-7")})),
++            ("Browser.getTabInfo", json!({"tab":tab_json(7,"target-7")})),
++        ]);
++        PageManager::new(connection.clone(), PageManagerHooks::default())
++            .new_page("about:blank", NewPageOptions::default())
++            .await?;
++        let calls = connection.calls()?;
++        assert_eq!(
++            calls
++                .iter()
++                .filter(|c| c.method == "Browser.createWindow")
++                .count(),
++            1
++        );
++        assert_eq!(
++            calls
++                .iter()
++                .find(|c| c.method == "Browser.createTab")
++                .map(|c| c.params.get("windowId")),
++            Some(Some(&json!(3)))
++        );
++        Ok(())
++    }
++
+     fn attach_responses() -> Vec<(&'static str, Value)> {
+         vec![
+             ("Target.attachToTarget", json!({ "sessionId": "session-7" })),
+@@ -626,6 +825,10 @@
+     #[tokio::test]
+     async fn agent_created_tab_gets_focus_emulation_on_attach() -> Result<(), Box<dyn Error>> {
+         let mut responses = vec![
++            (
++                "Browser.getWindows",
++                json!({"windows":[window_json(3,"normal",true,false)]}),
++            ),
+             (
+                 "Browser.createTab",
+                 json!({ "tab": tab_json(7, "target-7") }),
+--- a/crates/browseros-core/src/windows.rs
++++ b/crates/browseros-core/src/windows.rs
+@@ -21,6 +21,24 @@
+         let root = ProtocolSession::root(self.cdp.clone());
+         let result: browser::GetWindowsResult = root.send("Browser.getWindows", json!({})).await?;
+         Ok(result.windows)
++    }
++
++    pub async fn ensure_normal(&self) -> Result<(WindowInfo, bool), CoreError> {
++        let windows = self.list().await?;
++        // A minimized normal window remains a valid shared workspace window.
++        if let Some(window) = windows
++            .iter()
++            .filter(|w| {
++                w.window_type == "normal"
++                    && w.browser_context_id
++                        .as_deref()
++                        .is_none_or(|id| id.is_empty() || id == "Default")
++            })
++            .min_by_key(|w| (!w.is_active, !w.is_visible, w.window_id))
++        {
++            return Ok((window.clone(), false));
++        }
++        Ok((self.create().await?, true))
+     }
+ 
+     pub async fn create(&self) -> Result<WindowInfo, CoreError> {
+--- a/crates/browseros-mcp/src/tests.rs
++++ b/crates/browseros-mcp/src/tests.rs
+@@ -128,6 +128,9 @@
+     sender: broadcast::Sender<CdpEvent>,
+     calls: Mutex<Vec<HarnessCall>>,
+     emit_console_on_input: AtomicBool,
++    emit_navigation_dialog: AtomicBool,
++    close_requested: AtomicBool,
++    retain_closed_target: AtomicBool,
+ }
+ 
+ impl HarnessConnection {
+@@ -137,6 +140,9 @@
+             sender,
+             calls: Mutex::new(Vec::new()),
+             emit_console_on_input: AtomicBool::new(false),
++            emit_navigation_dialog: AtomicBool::new(false),
++            close_requested: AtomicBool::new(false),
++            retain_closed_target: AtomicBool::new(false),
+         })
+     }
+ 
+@@ -176,8 +182,44 @@
+                     params: params.clone(),
+                     session: session.cloned(),
+                 });
++            let is_navigation = matches!(method, "Page.navigate" | "Page.reload")
++                || (method == "Runtime.evaluate"
++                    && params
++                        .get("expression")
++                        .and_then(Value::as_str)
++                        .is_some_and(|value| value.starts_with("history.")));
++            if is_navigation && self.emit_navigation_dialog.load(Ordering::SeqCst) {
++                self.emit(
++                    "Page.javascriptDialogOpening",
++                    json!({"type": "beforeunload", "message": "unsaved test draft"}),
++                    session.map(SessionId::as_str),
++                );
++                // Model the blocked CDP acknowledgment, not just a dialog present before input.
++                return std::future::pending::<Result<Value, CdpError>>().await;
++            }
+             match method {
++                "Browser.closeTab" => {
++                    self.close_requested.store(true, Ordering::SeqCst);
++                    if self.retain_closed_target.load(Ordering::SeqCst) {
++                        self.emit(
++                            "Page.javascriptDialogOpening",
++                            json!({"type": "beforeunload", "message": "unsaved close"}),
++                            Some("session-1"),
++                        );
++                    }
++                    Ok(json!({}))
++                }
++                "Target.getTargets" => {
++                    let present = !self.close_requested.load(Ordering::SeqCst)
++                        || self.retain_closed_target.load(Ordering::SeqCst);
++                    Ok(
++                        json!({"targetInfos": if present {vec![json!({"targetId":"target-1"})]} else {vec![]} }),
++                    )
++                }
+                 "Browser.getTabs" => Ok(json!({ "tabs": [harness_tab()] })),
++                "Browser.getWindows" => Ok(
++                    json!({"windows":[{"windowId":1,"windowType":"normal","bounds":{},"isActive":false,"isVisible":true,"tabCount":1}]}),
++                ),
+                 "Browser.getTabInfo" => {
+                     let tab = if params.get("tabId").and_then(Value::as_i64) == Some(202) {
+                         new_harness_tab()
+@@ -187,6 +229,9 @@
+                     Ok(json!({ "tab": tab }))
+                 }
+                 "Browser.createTab" => Ok(json!({ "tab": new_harness_tab() })),
++                "Browser.createWindow" => Ok(
++                    json!({"window":{"windowId":2,"windowType":"normal","bounds":{},"isActive":false,"isVisible":true,"tabCount":1}}),
++                ),
+                 "History.getRecent" => {
+                     if params.get("maxResults") == Some(&json!(2)) {
+                         Ok(json!({
+@@ -916,6 +961,56 @@
+ }
+ 
+ #[tokio::test]
++async fn windows_create_reuses_existing_normal_by_default() {
++    let (ctx, connection, _) = harness_ctx().await;
++    let result = execute_tool(&tool_by_name("windows"), json!({"action":"create"}), &ctx)
++        .await
++        .expect("windows result");
++    assert!(!result.is_error);
++    assert_eq!(
++        result
++            .structured_content
++            .as_ref()
++            .and_then(|v| v.get("action")),
++        Some(&json!("reuse"))
++    );
++    assert!(
++        !connection
++            .calls()
++            .iter()
++            .any(|c| c.method == "Browser.createWindow")
++    );
++}
++
++#[tokio::test]
++async fn windows_create_explicit_separate_preserves_new_window_capability() {
++    let (ctx, connection, _) = harness_ctx().await;
++    let result = execute_tool(
++        &tool_by_name("windows"),
++        json!({"action":"create","separate":true}),
++        &ctx,
++    )
++    .await
++    .expect("windows result");
++    assert!(!result.is_error);
++    assert_eq!(
++        result
++            .structured_content
++            .as_ref()
++            .and_then(|v| v.get("action")),
++        Some(&json!("create"))
++    );
++    assert_eq!(
++        connection
++            .calls()
++            .iter()
++            .filter(|c| c.method == "Browser.createWindow")
++            .count(),
++        1
++    );
++}
++
++#[tokio::test]
+ async fn tabs_new_attaches_first_snapshot() {
+     let (ctx, connection, _page) = harness_ctx().await;
+     let tabs = tool_by_name("tabs");
+@@ -1495,3 +1590,125 @@
+         .unwrap_or_else(|| panic!("act should declare required arguments"));
+     assert!(!required.iter().any(|entry| entry == "button"));
+ }
++
++#[tokio::test]
++async fn navigation_dialog_returns_before_blocked_cdp_ack_for_granular_and_sdk() {
++    for tool in ["navigate", "run"] {
++        for action in ["url", "reload", "back", "forward"] {
++            let (ctx, connection, page) = harness_ctx().await;
++            connection
++                .emit_navigation_dialog
++                .store(true, Ordering::SeqCst);
++            let args = if tool == "navigate" {
++                json!({"page": page, "action": action, "url": "https://next.example/"})
++            } else {
++                let method = if action == "url" {
++                    "goto('https://next.example/')"
++                } else {
++                    match action {
++                        "reload" => "reload()",
++                        "back" => "back()",
++                        _ => "forward()",
++                    }
++                };
++                json!({"code": format!("return await browser.page({page}).{method};")})
++            };
++            let definition = tool_by_name(tool);
++            let result = tokio::time::timeout(
++                Duration::from_secs(1),
++                execute_tool(&definition, args, &ctx),
++            )
++            .await
++            .unwrap_or_else(|_| panic!("{tool}/{action} waited for blocked CDP ack"))
++            .unwrap_or_else(|err| panic!("{tool}/{action}: {err}"));
++            assert!(
++                !result.is_error,
++                "{tool}/{action}: {}",
++                result_text(&result)
++            );
++            let data = result.structured_content.expect("structured dialog result");
++            let marker = if tool == "run" { &data["value"] } else { &data };
++            assert_eq!(marker["dialogOpen"], true, "{tool}/{action}: {data}");
++            assert_eq!(marker["kind"], "beforeunload");
++            assert_eq!(marker["message"], "unsaved test draft");
++            assert!(
++                ctx.session
++                    .page_signals
++                    .pending_dialog(&PageId(page))
++                    .is_some()
++            );
++            assert!(!connection.calls().iter().any(|call| matches!(
++                call.method.as_str(),
++                "Page.handleJavaScriptDialog" | "Accessibility.getFullAXTree"
++            )));
++        }
++    }
++}
++
++#[tokio::test]
++async fn navigation_dialog_preexisting_stops_without_sending_navigation() {
++    for tool in ["navigate", "run"] {
++        let (ctx, connection, page) = harness_ctx().await;
++        connection.emit(
++            "Page.javascriptDialogOpening",
++            json!({"type": "confirm", "message": "keep draft?"}),
++            Some("session-1"),
++        );
++        eventually(|| {
++            ctx.session
++                .page_signals
++                .pending_dialog(&PageId(page))
++                .is_some()
++        })
++        .await;
++        let args = if tool == "navigate" {
++            json!({"page": page, "action": "reload"})
++        } else {
++            json!({"code": format!("return await browser.page({page}).reload();")})
++        };
++        let result = execute_tool(&tool_by_name(tool), args, &ctx)
++            .await
++            .expect("dialog marker");
++        assert!(!result.is_error, "{}", result_text(&result));
++        assert!(!connection.calls().iter().any(|call| matches!(
++            call.method.as_str(),
++            "Page.reload" | "Page.navigate" | "Page.handleJavaScriptDialog"
++        )));
++    }
++}
++
++#[tokio::test]
++async fn navigation_dialog_close_ack_preserves_binding_until_target_is_absent() {
++    for retain in [true, false] {
++        let (ctx, connection, page) = harness_ctx().await;
++        connection
++            .retain_closed_target
++            .store(retain, Ordering::SeqCst);
++        let result = execute_tool(
++            &tool_by_name("tabs"),
++            json!({"action":"close","page":page}),
++            &ctx,
++        )
++        .await
++        .expect("close tool result");
++        assert_eq!(result.is_error, retain, "{}", result_text(&result));
++        assert_eq!(
++            ctx.session.pages.get_info(PageId(page)).await.is_some(),
++            retain
++        );
++        if retain {
++            assert!(
++                ctx.session
++                    .page_signals
++                    .pending_dialog(&PageId(page))
++                    .is_some()
++            );
++            assert!(
++                !connection
++                    .calls()
++                    .iter()
++                    .any(|c| c.method == "Page.handleJavaScriptDialog")
++            );
++        }
++    }
++}
+--- a/crates/browseros-mcp/src/tools/navigate.rs
++++ b/crates/browseros-mcp/src/tools/navigate.rs
+@@ -4,11 +4,15 @@
+ use schemars::JsonSchema;
+ use serde::Deserialize;
+ use serde_json::json;
++use std::time::Duration;
++use tokio::time::sleep;
+ 
+ const DESCRIPTION: &str = "\
+ Navigate a page: load a url, or go back/forward/reload. \
+ Returns a fresh snapshot of the resulting page \
+-(navigation invalidates refs, so old [ref=eN] handles no longer apply).";
++(navigation invalidates refs, so old [ref=eN] handles no longer apply). \
++If a blocking dialog opens, returns dialogOpen/kind/message immediately; \
++resolve it explicitly with act dialog_accept or dialog_dismiss before continuing.";
+ 
+ #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+ #[serde(rename_all = "lowercase")]
+@@ -43,29 +47,67 @@
+     Box::pin(async move {
+         let args: NavigateArgs = parse_args(raw)?;
+         let nav = ctx.session.nav(PageId(args.page));
+-        let action = match args.action {
+-            NavigateAction::Url => {
+-                let Some(url) = args.url.as_deref().filter(|url| !url.is_empty()) else {
+-                    return Ok(Some(error_result(
+-                        "navigate: url is required for action=\"url\".",
+-                    )));
+-                };
+-                nav.goto(url).await?;
+-                "url"
+-            }
+-            NavigateAction::Back => {
+-                nav.back().await?;
+-                "back"
+-            }
+-            NavigateAction::Forward => {
+-                nav.forward().await?;
+-                "forward"
+-            }
+-            NavigateAction::Reload => {
+-                nav.reload().await?;
+-                "reload"
++        if matches!(args.action, NavigateAction::Url)
++            && args.url.as_deref().filter(|url| !url.is_empty()).is_none()
++        {
++            return Ok(Some(error_result(
++                "navigate: url is required for action=\"url\".",
++            )));
++        }
++        let navigation = async {
++            let action = match args.action {
++                NavigateAction::Url => {
++                    let url = args.url.as_deref().unwrap_or_default();
++                    nav.goto(url).await?;
++                    "url"
++                }
++                NavigateAction::Back => {
++                    nav.back().await?;
++                    "back"
++                }
++                NavigateAction::Forward => {
++                    nav.forward().await?;
++                    "forward"
++                }
++                NavigateAction::Reload => {
++                    nav.reload().await?;
++                    "reload"
++                }
++            };
++            Ok::<_, browseros_core::CoreError>(action)
++        };
++        let dialog = async {
++            while ctx
++                .session
++                .page_signals
++                .pending_dialog(&PageId(args.page))
++                .is_none()
++            {
++                sleep(Duration::from_millis(25)).await;
+             }
+         };
++        let outcome = tokio::select! {
++            biased;
++            () = dialog => None,
++            result = navigation => Some(result),
++        };
++        if let Some(dialog) = ctx.session.page_signals.pending_dialog(&PageId(args.page)) {
++            return Ok(Some(ToolResult::text(
++                format!(
++                    "navigation paused: {} dialog; explicitly accept or dismiss before continuing",
++                    dialog.kind
++                ),
++                Some(
++                    json!({"page": args.page, "dialogOpen": true, "kind": dialog.kind, "message": dialog.message}),
++                ),
++            )));
++        }
++        let Some(outcome) = outcome else {
++            return Ok(Some(error_result(
++                "navigation interrupted by a dialog; inspect the page before continuing",
++            )));
++        };
++        let action = outcome?;
+         let origin = ctx
+             .session
+             .pages
+--- a/crates/browseros-mcp/src/tools/run.rs
++++ b/crates/browseros-mcp/src/tools/run.rs
+@@ -836,7 +836,7 @@
+         outcome
+     }
+ 
+-    /// Runs a page input action but stops waiting if a blocking JavaScript dialog
++    /// Runs a page input or navigation action but stops waiting if a blocking JavaScript dialog
+     /// opens on that page (or is already open). A confirm/prompt/beforeunload freezes
+     /// the renderer main thread, so the action's CDP ack never returns and the run
+     /// would otherwise hang to its 30s cap (#2780). The dialog listener records it
+@@ -857,8 +857,14 @@
+         };
+         tokio::select! {
+             biased;
+-            result = self.control.race(future) => result.map(Some),
+             () = dialog => Ok(None),
++            result = self.control.race(future) => {
++                if self.ctx.session.page_signals.pending_dialog(page_id).is_some() {
++                    Ok(None)
++                } else {
++                    result.map(Some)
++                }
++            },
+         }
+     }
+ 
+@@ -1042,27 +1048,35 @@
+             "nav.goto" => {
+                 let page_id = page_arg(&args, 0)?;
+                 let url = string_arg(&args, 1, "url")?;
+-                let nav = self.ctx.session.nav(page_id);
+-                self.control.race(nav.goto(&url)).await?;
+-                Ok(BrowserCallValue::Undefined)
++                let nav = self.ctx.session.nav(page_id.clone());
++                match self.race_input(&page_id, nav.goto(&url)).await? {
++                    Some(_) => Ok(BrowserCallValue::Undefined),
++                    None => Ok(self.dialog_open_value(&page_id)),
++                }
+             }
+             "nav.back" => {
+                 let page_id = page_arg(&args, 0)?;
+-                let nav = self.ctx.session.nav(page_id);
+-                self.control.race(nav.back()).await?;
+-                Ok(BrowserCallValue::Undefined)
++                let nav = self.ctx.session.nav(page_id.clone());
++                match self.race_input(&page_id, nav.back()).await? {
++                    Some(_) => Ok(BrowserCallValue::Undefined),
++                    None => Ok(self.dialog_open_value(&page_id)),
++                }
+             }
+             "nav.forward" => {
+                 let page_id = page_arg(&args, 0)?;
+-                let nav = self.ctx.session.nav(page_id);
+-                self.control.race(nav.forward()).await?;
+-                Ok(BrowserCallValue::Undefined)
++                let nav = self.ctx.session.nav(page_id.clone());
++                match self.race_input(&page_id, nav.forward()).await? {
++                    Some(_) => Ok(BrowserCallValue::Undefined),
++                    None => Ok(self.dialog_open_value(&page_id)),
++                }
+             }
+             "nav.reload" => {
+                 let page_id = page_arg(&args, 0)?;
+-                let nav = self.ctx.session.nav(page_id);
+-                self.control.race(nav.reload()).await?;
+-                Ok(BrowserCallValue::Undefined)
++                let nav = self.ctx.session.nav(page_id.clone());
++                match self.race_input(&page_id, nav.reload()).await? {
++                    Some(_) => Ok(BrowserCallValue::Undefined),
++                    None => Ok(self.dialog_open_value(&page_id)),
++                }
+             }
+             "cdp" => {
+                 let method = string_arg(&args, 0, "method")?;
+@@ -1635,7 +1649,14 @@
+                     "Browser.getTabs" => Ok(json!({
+                         "tabs": [fake_tab_json(7, "target-7", "https://example.com", "Example", 1, 0)]
+                     })),
+-                    "Browser.getWindows" => Ok(json!({ "windows": [] })),
++                    "Browser.getWindows" => Ok(
++                        json!({"windows":[{"windowId":1,"windowType":"normal","bounds":{},"isActive":false,"isVisible":true,"tabCount":1}]}),
++                    ),
++                    "Browser.getTabGroups" => Ok(json!({"groups":[
++                        {"groupId":"group-1","windowId":42,"title":"test","color":"green","collapsed":false,"tabIds":[]},
++                        {"groupId":"default-group","windowId":42,"title":"default","color":"green","collapsed":false,"tabIds":[]},
++                        {"groupId":"group-opts","windowId":88,"title":"opts","color":"green","collapsed":false,"tabIds":[]}
++                    ]})),
+                     "Browser.hang" => {
+                         futures_util::future::pending::<Result<Value, CdpError>>().await
+                     }
+--- a/crates/browseros-mcp/src/tools/windows.rs
++++ b/crates/browseros-mcp/src/tools/windows.rs
+@@ -7,7 +7,7 @@
+ use serde::Deserialize;
+ use serde_json::{Value, json};
+ 
+-const DESCRIPTION: &str = "Manage browser windows: list, create, or close windows.";
++const DESCRIPTION: &str = "Manage browser windows: list, create, or close. create reuses an existing normal window, including minimized windows. Only set separate=true when the user explicitly requests a separate window; task separation, recording, screenshots or placement errors do not qualify.";
+ 
+ #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+ #[serde(rename_all = "snake_case")]
+@@ -27,6 +27,9 @@
+     /// Window id for close.
+     #[serde(rename = "windowId")]
+     window_id: Option<i64>,
++    /// For create only: explicitly user-requested separate window. Defaults to reuse.
++    #[serde(default)]
++    separate: bool,
+ }
+ 
+ pub fn definition() -> crate::framework::ToolDef {
+@@ -54,10 +57,23 @@
+                 )
+             }
+             WindowsAction::Create => {
+-                let window = ctx.session.windows.create().await?;
++                let (window, created) = if args.separate {
++                    (ctx.session.windows.create().await?, true)
++                } else {
++                    ctx.session.windows.ensure_normal().await?
++                };
++                let action = if created { "create" } else { "reuse" };
+                 text_result(
+-                    format!("created window {}", window.window_id),
+-                    Some(json!({ "action": "create", "window": window })),
++                    format!(
++                        "{} window {}",
++                        if created {
++                            "created"
++                        } else {
++                            "reused existing"
++                        },
++                        window.window_id
++                    ),
++                    Some(json!({ "action": action, "window": window, "reused": !created })),
+                 )
+             }
+             WindowsAction::Close => {
