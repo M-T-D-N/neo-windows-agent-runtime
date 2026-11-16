@@ -10,6 +10,55 @@ def page(target='one',group='original',ownership='mine',url='https://example.com
     return dict(pageId=1,targetId=target,groupId=group,url=url,ownership=ownership,ownerAgentId=None)
 
 class TaskStateTests(unittest.TestCase):
+    def test_closed_parent_leaves_registered_unclaimed_child_without_restoration(self):
+        parent = dict(page(), tabId=101)
+        child = dict(page('child', 'original', 'user', 'https://example.com/child'), tabId=202)
+        saved_group = dict(id='original', title='session', tabIds=[101, 202])
+        groups = [dict(saved_group, tabIds=[202])]
+        self.state.save('old', [parent], [saved_group])
+        self.state.record['used_tabs'] = [dict(targetId='child', tabId=202, url=child['url'])]
+        before = json.dumps(self.state.record, sort_keys=True)
+        self.assertEqual(self.state.reconciliation([child], groups, native_targets=['child']), ([], []))
+        self.assertEqual(json.dumps(self.state.record, sort_keys=True), before)
+        self.state.checkpoint_session('reconnected')
+        recovery = dict(prior_group_id='original', group_id='original',
+                        pages=[dict(targetId='child', url=child['url'])],
+                        reason='Human selected the registered child tab for cleanup')
+        self.assertEqual(self.state.reconciliation([child], groups, recovery=recovery,
+                                                   native_targets=['child']), ([], []))
+        self.state.save('reconnected', [child], groups)
+        self.assertEqual(self.state.record['pages'], [])
+        self.assertEqual(self.state.record['groups'], [])
+        self.assertEqual(child['ownership'], 'user')
+        self.assertEqual(self.state.record['used_tabs'][0]['targetId'], 'child')
+
+    def test_registered_unclaimed_remainder_requires_exact_complete_evidence(self):
+        child = dict(page('child', 'original', 'user', 'https://example.com/child'), tabId=202)
+        saved_group = dict(id='original', title='session', tabIds=[101, 202])
+        groups = [dict(saved_group, tabIds=[202])]
+        self.state.save('old', [dict(page(), tabId=101)], [saved_group])
+        self.state.record['used_tabs'] = [dict(targetId='child', tabId=202, url=child['url'])]
+        baseline = json.loads(json.dumps(self.state.record))
+        cases = [
+            ('unregistered', [child], groups, ['child']),
+            ('changed_url', [dict(child, url='https://example.com/changed')], groups, ['child']),
+            ('changed_tab', [dict(child, tabId=303)], [dict(saved_group, tabIds=[303])], ['child']),
+            ('unknown_member', [child], [dict(saved_group, tabIds=[202, 303])], ['child']),
+            ('foreign_owner', [dict(child, ownership='other-agent', ownerAgentId='active')], groups, ['child']),
+            ('foreign_alias', [child, dict(child, pageId=9, ownership='other-agent', ownerAgentId='active')], groups, ['child']),
+            ('surviving_parent', [child], groups, ['child', 'one']),
+            ('missing_native_proof', [child], groups, None),
+            ('not_preexisting', [child], groups, ['child']),
+        ]
+        for label, pages, current_groups, targets in cases:
+            with self.subTest(label=label):
+                self.state.record = json.loads(json.dumps(baseline))
+                if label == 'unregistered': self.state.record['used_tabs'] = []
+                if label == 'not_preexisting': self.state.record['groups'][0]['tabIds'] = [101]
+                before = json.dumps(self.state.record, sort_keys=True)
+                self.assertTrue(self.state.reconciliation(pages, current_groups, native_targets=targets)[1])
+                self.assertEqual(json.dumps(self.state.record, sort_keys=True), before)
+
     def setUp(self):
         root=os.environ['WEB_AUTOMATION_TEST_ROOT']
         self.temp=tempfile.TemporaryDirectory(dir=root)

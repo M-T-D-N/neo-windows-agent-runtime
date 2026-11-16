@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from contextlib import asynccontextmanager
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import time
+import uuid
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
@@ -21,6 +23,10 @@ import httpx
 
 TOOL_PROTOCOL = "2026-07-28"
 SESSION_META_KEY = "com.browseros.neo/session"
+
+INVENTORY_META_KEY = "com.workspace.neo/inventory_receipt"
+INVENTORY_PROPERTY = {"type":"string", "minLength":1, "description":
+    "After a verified browser reset, echo the inventory_receipt returned by this connection's explicit tabs action=list. Select current page IDs/session from that result and issue a new request; never replay an old page request."}
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT.parent))
@@ -122,6 +128,10 @@ class Bridge:
         self.cleanup = CleanupPolicy()
         self.cleanup_empty_session: str | None = None
         self.cleanup_closed_session: str | None = None
+        self.reset_pending = False
+        self.reset_requires_begin = False
+        self.reset_requires_inventory = False
+        self.inventory_receipt = None
         self.catalog = catalog or json.loads((ROOT / 'official-tools.json').read_text(encoding='utf-8'))
         self.task_state = TaskState(state_root) if state_root else None
         self.task_prepared = False
@@ -140,18 +150,66 @@ class Bridge:
         self.cleanup.bind(task_id)
         if self.task_state:
             was_bound = self.task_state.task_id is not None
+            prior_reset = (self.task_state.record or {}).get('browser_reset_id')
+            prior_pending = (self.task_state.record or {}).get('browser_reset_pending')
             record = self.task_state.bind(task_id)
+            reset_changed = was_bound and (record.get('browser_reset_id') != prior_reset or
+                prior_pending is True and record.get('browser_reset_pending') is False)
+            if record.get('browser_reset_id') and (not was_bound or record.get('browser_reset_id') != prior_reset):
+                self.reset_requires_begin = True
+                self.reset_requires_inventory = True
+                self.inventory_receipt = None
+            if reset_changed:
+                self.tool_session = None
+                self.task_prepared = False
+                self.cleanup_empty_session = self.cleanup_closed_session = None
+                self.reset_pending = record.get('browser_reset_pending') is True
+            if record.get('browser_reset_pending'):
+                self.reset_pending = True
             if self.tool_session is None:
                 self.tool_session = record['session']
             if record.get('browser_closed') and not record.get('pages') and not record.get('used_tabs'):
                 self.cleanup_closed_session = self.tool_session
-            if not was_bound:
+            if not was_bound or reset_changed:
                 self.cleanup.retained = {tuple(k):v for k,v in record.get('retained',[])}
                 self.cleanup.review_required = set(self.cleanup.retained)
                 self.cleanup.used = {item['targetId']:item for item in record.get('used_tabs',[])}
                 for item in self.cleanup.used.values():
                     if item.get('deferred'):
                         item['deferred']['review_required'] = True
+
+    def refresh_reset_binding(self, message):
+        """Observe a verified close-all boundary without starting the browser."""
+        if self.task_state and self.task_state.task_id:
+            self.bind_task(self.task_state.task_id)
+            record = self.task_state.record
+            if record.get('browser_reset_id'):
+                params = dict(message.get('params') or {})
+                arguments = dict(params.get('arguments') or {})
+                # All previous browser handles were retired by close-all. Do
+                # not let an old conversation hint reintroduce one on first use.
+                if arguments.get('session') != self.tool_session:
+                    arguments.pop('session', None)
+                    params['arguments'] = arguments
+                    return dict(message, params=params)
+        return message
+
+    @asynccontextmanager
+    async def browser_operation(self, *, local_only=False):
+        if self.task_state is None or local_only:
+            yield
+        else:
+            async with self.task_state.browser_operation():
+                yield
+
+    def consume_reset_receipt(self):
+        if self.reset_pending:
+            try:
+                self.task_state.consume_browser_reset_handle(self.tool_session)
+            except ValueError as error:
+                self.bind_task(self.task_state.task_id)
+                raise UpstreamError('Reset was completed by another connection; inspect the current task state before continuing') from error
+            self.reset_pending = False
 
     async def internal_tool(self, name, arguments):
         self.sequence += 1
@@ -165,6 +223,7 @@ class Bridge:
         handle = (result.get('_meta') or {}).get(SESSION_META_KEY)
         if handle:
             self.tool_session = handle
+            self.consume_reset_receipt()
         if result.get('isError'):
             raise UpstreamError('Task reconciliation failed; no browser action may be replayed')
         return result
@@ -466,15 +525,16 @@ class Bridge:
                 pass
             await asyncio.sleep(2)
 
-    async def handle(self, message: dict):
+    async def _handle(self, message: dict, inventory_pending, arrival_reset_id):
         method = message.get("method")
         sent = False
+        delivered_page_inventory = False
         try:
             if method == 'tools/call':
                 p=message.get('params') or {}
                 a=p.get('arguments') or {}
                 if not (p.get('name') == CLEANUP_TOOL_NAME and a.get('action') in ('begin','outputs')):
-                    await self.guard_endpoint()  # Before task binding/marking or cleanup record changes.
+                    await self.guard_endpoint()  # Preserve public identity validation before any task write.
             if method == "ping":
                 # Transport heartbeat must not reopen a deliberately closed browser.
                 result = {"jsonrpc": "2.0", "id": message["id"], "result": {}}
@@ -495,13 +555,19 @@ class Bridge:
                 # Reclaim is an internal ledger-validated recovery operation, not
                 # an agent-selected way to acquire arbitrary existing groups.
                 for tool in value['tools']:
+                    tool.setdefault('inputSchema', {}).setdefault('properties', {})['inventory_receipt'] = copy.deepcopy(INVENTORY_PROPERTY)
                     if tool.get('name') == 'tabs':
                         properties = tool.get('inputSchema', {}).get('properties', {})
                         action = properties.get('action', {})
                         if isinstance(action.get('enum'), list):
-                            action['enum'] = [item for item in action['enum'] if item != 'reclaim']
+                            action['enum'] = [item for item in action['enum'] if item not in ('reclaim','reclaim_expired','reclaim_restored')]
                         properties.pop('expected', None)
-                value['tools'].append(CLEANUP_TOOL)
+                        properties.pop('priorSession', None)
+                        properties.pop('priorGroupId', None)
+                        properties.pop('prior', None)
+                cleanup_tool = copy.deepcopy(CLEANUP_TOOL)
+                cleanup_tool['inputSchema']['properties']['inventory_receipt'] = copy.deepcopy(INVENTORY_PROPERTY)
+                value['tools'].append(cleanup_tool)
                 result = {'jsonrpc':'2.0','id':message['id'],'result':value}
             elif method in ('resources/list', 'resources/templates/list', 'prompts/list'):
                 key = {'resources/list':'resources','resources/templates/list':'resourceTemplates','prompts/list':'prompts'}[method]
@@ -519,17 +585,35 @@ class Bridge:
                 await self.post(message)
                 return
             elif method == "tools/call" and (message.get("params") or {}).get("name") == CLEANUP_TOOL_NAME:
-                async with self.tool_lock:
-                    result = await self.cleanup_call(message)
+                self.active_tools[message['id']] = asyncio.current_task()
+                try:
+                    async with self.tool_lock, self.browser_operation(local_only=(
+                            (message.get('params') or {}).get('arguments',{}).get('action') in ('begin','outputs'))):
+                        result = await self.cleanup_call(message)
+                finally:
+                    self.active_tools.pop(message['id'], None)
             elif method == "tools/call":
                 self.active_tools[message["id"]] = asyncio.current_task()
                 try:
                     # Serialize first-call minting and handle replacement; concurrent
                     # requests must not fork this connection's browser identity.
-                    async with self.tool_lock:
-                        params = message.get("params") or {}
-                        args = params.get("arguments") or {}
-                        if params.get('name') == 'tabs' and (args.get('action') == 'reclaim' or 'expected' in args):
+                    async with self.tool_lock, self.browser_operation():
+                        supplied_session=((message.get('params') or {}).get('arguments') or {}).get('session')
+                        message = self.refresh_reset_binding(message)
+                        current_reset_id=(self.task_state.record or {}).get('browser_reset_id') if self.task_state else None
+                        if arrival_reset_id != current_reset_id:
+                            raise UpstreamError('Request predates browser reset and was not replayed. Call workspace_cleanup begin, then tabs action=list and issue a fresh request')
+                        if self.reset_requires_begin:
+                            raise UpstreamError('Browser was reset; prior page handles are retired. Call workspace_cleanup begin and inspect fresh inventory before new browser work')
+                        params = dict(message.get("params") or {})
+                        args = dict(params.get("arguments") or {})
+                        inventory_receipt = args.pop('inventory_receipt', None)
+                        if inventory_receipt is not None and (not isinstance(inventory_receipt,str) or not inventory_receipt):
+                            raise ValueError('inventory_receipt must be a nonempty string')
+                        params['arguments'] = args
+                        message = dict(message,params=params)
+                        if params.get('name') == 'tabs' and (args.get('action') in ('reclaim','reclaim_expired','reclaim_restored')
+                                or any(k in args for k in ('expected','priorSession','priorGroupId','prior'))):
                             raise ValueError('Task recovery is internal; use workspace_cleanup begin to reconcile recorded tabs')
                         requested_session = args.get("session")
                         if "session" in args:
@@ -541,6 +625,18 @@ class Bridge:
                         inventory_only = (params.get("name") in ("tabs", "windows", "tab_groups")
                                           and args.get("action") == "list"
                                           and set(args) <= {"action", "session", "agentName"})
+                        if (self.reset_requires_inventory or inventory_pending) and not inventory_only:
+                            raise UpstreamError('Fresh caller-visible inventory required after reset: call tabs action=list, select its current page IDs/session, then issue a fresh request. Queued prior requests are not replayed')
+                        if (current_reset_id and not inventory_only
+                                and (not self.inventory_receipt or inventory_receipt != self.inventory_receipt)):
+                            raise UpstreamError('Post-reset request requires inventory_receipt from this connection\'s tabs action=list. Select current page IDs/session and issue a fresh request; old requests are not replayed')
+                        if (current_reset_id and supplied_session is not None and supplied_session != self.tool_session
+                                and not inventory_only):
+                            raise UpstreamError('Retired session hint cannot address current pages. Select current page IDs/session from tabs action=list and issue a fresh request')
+                        # Fixed observation tools cannot adopt, navigate or edit.
+                        # Arbitrary run/evaluate code still requires reconciliation.
+                        observation_only = inventory_only or params.get("name") in (
+                            "snapshot", "read", "grep", "diff", "screenshot")
                         clean_session = self.tool_session
                         clean_close = (self.cleanup_empty_session == self.tool_session
                                        and self.tool_session is not None
@@ -551,7 +647,7 @@ class Bridge:
                         # Any new browser work invalidates prior completion. Only
                         # an exact native close acknowledgement can restore it.
                         self.cleanup_empty_session = self.cleanup_closed_session = None
-                        if self.task_state and self.task_state.record:
+                        if self.task_state and self.task_state.record and not self.reset_pending:
                             self.task_state.record['browser_closed'] = False
                         if self.task_state and not self.task_state.task_id:
                             raise UpstreamError('Bind the actual task UUID with workspace_cleanup begin before browser work')
@@ -560,9 +656,14 @@ class Bridge:
                         await self.ensure_ready()
                         # Inventory observes conflicts without claiming groups or
                         # replacing the saved task's previous physical bindings.
-                        if not inventory_only:
+                        if not observation_only:
                             await self.prepare_task()
                         request, headers = self.tool_request(message)
+                        if self.task_state and not observation_only:
+                            # Advance durable state before a mutation-capable
+                            # dispatch. Administrator close-all CAS must detect
+                            # new work even if it later returns to the same tabs.
+                            self.task_state._write_record()
                         sent = True
                         existing_outputs, baseline_error = None, None
                         if self.task_state:
@@ -575,7 +676,18 @@ class Bridge:
                         handle = ((result or {}).get("result", {}).get("_meta") or {}).get(SESSION_META_KEY)
                         if isinstance(handle, str) and handle:
                             self.tool_session = handle
+                            self.consume_reset_receipt()
                         upstream = (result or {}).get("result") or {}
+                        if (inventory_only and params.get('name')=='tabs' and isinstance(result,dict)
+                                and 'result' in result and 'error' not in result and not upstream.get('isError')
+                                and any(c.get('type')=='text' and c.get('text','').strip() for c in upstream.get('content',[]))):
+                            delivered_page_inventory = True
+                            if current_reset_id:
+                                if self.inventory_receipt is None:
+                                    self.inventory_receipt = str(uuid.uuid4())
+                                upstream.setdefault('_meta', {})[INVENTORY_META_KEY] = self.inventory_receipt
+                                upstream.setdefault('content', []).append({'type':'text','text':
+                                    f'inventory_receipt: {self.inventory_receipt}. For new post-reset requests, echo this as inventory_receipt and select current page IDs/session from the inventory above. Do not replay old requests.'})
                         if self.task_state:
                             try:
                                 if baseline_error is not None:
@@ -592,7 +704,7 @@ class Bridge:
                             if self.task_state and self.task_state.record:
                                 self.task_state.record['browser_closed'] = True
                                 self.task_state.save(self.tool_session, [], [])
-                        if not inventory_only and not clean_close and result and 'result' in result:
+                        if not observation_only and not clean_close and result and 'result' in result:
                             try:
                                 await self.remember_task()
                             except Exception as error:
@@ -606,6 +718,8 @@ class Bridge:
                 raise UpstreamError('Unsupported non-browser MCP method; browser was not started')
             if result is not None:
                 self.emit(result)
+            if delivered_page_inventory:
+                self.reset_requires_inventory = False
         except Exception as error:
             if "id" not in message or "method" not in message:
                 print(f"neo MCP {method or 'response'} failed: {type(error).__name__}", file=sys.stderr)
@@ -628,7 +742,6 @@ class Bridge:
                 self.emit({"jsonrpc": "2.0", "id": message["id"], "result": {
                     "content": [{"type": "text", "text": json.dumps(hook_value)}], "structuredContent": value}})
             elif method == "tools/call":
-                sent = sent and not isinstance(error, EndpointIdentityError)
                 status = "OUTCOME_UNKNOWN" if sent else "NEO_NOT_READY"
                 guidance = ("Request was dispatched and will NOT be replayed. Inspect the actual page/saved result before retrying any action."
                             if sent else "Tool request was NOT dispatched. Fix runtime readiness before invoking the tool again.")
@@ -638,8 +751,20 @@ class Bridge:
                 self.emit({"jsonrpc": "2.0", "id": message["id"],
                            "error": {"code": -32000, "message": detail}})
 
+    def handle(self, message: dict):
+        # Capture at submission, before the coroutine can wait behind another
+        # request. A later catalog cannot authorize an already queued old action.
+        reset_id=(self.task_state.record or {}).get('browser_reset_id') if self.task_state else None
+        return self._handle(message,self.reset_requires_inventory,reset_id)
+
     async def cleanup_call(self, message):
         args = (message.get("params") or {}).get("arguments") or {}
+        if not isinstance(args,dict):
+            raise ValueError('workspace_cleanup arguments must be an object')
+        args = dict(args)
+        inventory_receipt = args.pop('inventory_receipt', None)
+        if inventory_receipt is not None and (not isinstance(inventory_receipt,str) or not inventory_receipt):
+            raise ValueError('inventory_receipt must be a nonempty string')
         schema = CLEANUP_TOOL['inputSchema']
         if (not isinstance(args, dict) or set(args) - schema['properties'].keys()
                 or any(key not in args for key in schema['required'])):
@@ -655,6 +780,14 @@ class Bridge:
                 or not isinstance(args['group_id'], str) or not args['group_id'].strip()):
             raise ValueError('inventory accepts only action, task_id and a nonempty exact group_id')
         self.bind_task(args.get("task_id"))
+        if self.reset_requires_begin and args.get('action') not in ('begin','outputs') and not (
+                args.get('action')=='check' and self.tool_session is None):
+            raise UpstreamError('Browser was reset; call workspace_cleanup begin before restoring or using any prior page handles')
+        if self.reset_requires_inventory and args.get('action') not in ('begin','outputs','check'):
+            raise UpstreamError('Fresh caller-visible inventory required: call tabs action=list before restoring or using prior page handles')
+        if ((self.task_state.record or {}).get('browser_reset_id') if self.task_state else False) and args.get('action') not in ('begin','outputs','check'):
+            if not self.inventory_receipt or inventory_receipt != self.inventory_receipt:
+                raise UpstreamError('Post-reset cleanup requires inventory_receipt from this connection\'s tabs action=list; use current page IDs and issue a fresh request')
         if args.get('action') == 'inventory':
             # Resolve the recovery-input/prepare_task cycle through a fixed read,
             # never by allowing arbitrary run code past reconciliation.
@@ -673,8 +806,13 @@ class Bridge:
             return {'jsonrpc':'2.0', 'id':message['id'], 'result':{
                 'content':[{'type':'text','text':json.dumps(value, ensure_ascii=False)}], 'structuredContent':value}}
         if args.get('action') == 'begin':
+            self.reset_requires_begin = False
             record = self.task_state.record if self.task_state else {}
             value = {'taskBound':True, 'browserStarted':False, 'priorPages':record.get('pages',[]), 'resumeRequired':bool(record.get('pages')), 'priorUsedTabs':record.get('used_tabs',[])}
+            if record.get('browser_reset_pending'):
+                value.update(browserReset=True, priorHandlesRetired=True)
+            if self.reset_requires_inventory:
+                value.update(freshInventoryRequired=True,nextStep='Call tabs action=list; select its current page IDs/session before issuing a fresh page request')
             return {'jsonrpc':'2.0','id':message['id'],'result':{'content':[{'type':'text','text':json.dumps(value)}], 'structuredContent':value}}
         if args.get('action') == 'resume':
             if self.task_state:

@@ -39,6 +39,97 @@ def response(request, result=None, status=200, session="first"):
         "jsonrpc": "2.0", "id": message.get("id"), "result": result or {}})
 
 class BridgeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_closed_parent_with_used_user_child_reconciles_without_claiming(self):
+        import tempfile
+        from unittest.mock import AsyncMock
+        task='00000000-0000-4000-8000-000000000001'
+        parent=dict(pageId=1,tabId=101,targetId='parent',groupId='g',url='https://example.com/parent',ownership='mine')
+        child=dict(pageId=2,tabId=202,targetId='child',groupId='g',url='https://example.com/child',ownership='user',ownerAgentId=None)
+        for prior_closed, same_url in ((False, False), (True, False), (False, True), (True, True)):
+            child['url'] = parent['url'] if same_url else 'https://example.com/child'
+            with self.subTest(prior_closed=prior_closed, same_url=same_url), tempfile.TemporaryDirectory(dir=os.environ['WEB_AUTOMATION_TEST_ROOT']) as root:
+                pages=[child] if prior_closed else [parent,child]
+                groups=[dict(groupId='g',title='session',tabIds=[p['tabId'] for p in pages])]
+                actions=[]
+                def handler(request):
+                    rpc=json.loads(request.content);name=rpc['params']['name'];args=rpc['params']['arguments']
+                    if name=='tabs':
+                        actions.append(args['action']);self.assertEqual(args['action'],'close');self.assertEqual(args['page'],1)
+                        pages.remove(parent);groups[0]['tabIds']=[202]
+                        return response(request,dict(content=[dict(type='text',text='closed page 1')]))
+                    code=args['code']
+                    value=(dict(pages=list(pages),groups=groups,targets=[p['targetId'] for p in pages])
+                           if 'Browser.getTabGroups' in code else
+                           dict(pages=list(pages),tabs=list(pages),targets=[p['targetId'] for p in pages])
+                           if 'Browser.getTabs' in code else list(pages))
+                    return response(request,dict(structuredContent=dict(ok=True,value=value)))
+                output=[];bridge=Bridge('http://127.0.0.1:9010/mcp',output.append,state_root=root,task_id=task,
+                    client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+                bridge.initialize=INIT;bridge.tool_session='original';bridge.ensure_ready=AsyncMock()
+                bridge.task_state.save('original',[parent],[dict(groupId='g',title='session',tabIds=[101,202])])
+                used=dict(targetId='child',tabId=202,url=child['url'],purpose='Inspect the link-opened child')
+                bridge.task_state.record['used_tabs']=[used];bridge.cleanup.used={'child':used}
+                try:
+                    if prior_closed:
+                        recovery=dict(prior_group_id='g',group_id='g',pages=[dict(targetId='child',url=child['url'])],
+                                      reason='Human approved cleanup of the already registered child')
+                        await bridge.prepare_task(recovery=recovery)
+                    else:
+                        await bridge.handle(dict(jsonrpc='2.0',id=12,method='tools/call',
+                            params=dict(name='tabs',arguments=dict(action='close',page=1))))
+                        self.assertNotIn('WORKSPACE_TRACKING_FAILED',json.dumps(output[-1]))
+                    self.assertEqual(bridge.task_state.record['pages'],[])
+                    await bridge.handle(dict(jsonrpc='2.0',id=13,method='tools/call',
+                        params=dict(name='workspace_cleanup',arguments=dict(action='resume',task_id=task))))
+                    check=output[-1]['result']['structuredContent']
+                    self.assertFalse(check.get('pendingReconciliationGroups'))
+                    self.assertEqual(check['pendingUsedTargetIds'],['child'])
+                    self.assertEqual(child['ownership'],'user')
+                    self.assertEqual(actions,[] if prior_closed else ['close'])
+                    self.assertEqual(pages,[child])
+                finally:
+                    await bridge.close()
+
+    async def test_known_user_sibling_cannot_fall_back_to_url_reclaim(self):
+        import tempfile
+        from unittest.mock import AsyncMock
+        task='00000000-0000-4000-8000-000000000001'
+        parent=dict(pageId=1,tabId=101,targetId='parent',groupId='g',url='https://example.com/same',ownership='mine')
+        child=dict(pageId=2,tabId=202,targetId='child',groupId='g',url=parent['url'],ownership='user',ownerAgentId=None)
+        for case in ('unregistered','url_mismatch','tab_mismatch','current_tab_mismatch','foreign_alias','raw_parent_sdk_missing'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory(dir=os.environ['WEB_AUTOMATION_TEST_ROOT']) as root:
+                current=dict(child, tabId=303 if case=='current_tab_mismatch' else 202)
+                pages=[current]
+                if case=='foreign_alias':pages.append(dict(current,pageId=3,ownership='other-agent',ownerAgentId='foreign'))
+                groups=[dict(groupId='g',title='session',tabIds=[current['tabId']])]
+                actions=[]
+                targets=['parent','child'] if case=='raw_parent_sdk_missing' else ['child']
+                def handler(request):
+                    rpc=json.loads(request.content);name=rpc['params']['name']
+                    if name!='run':actions.append(name);raise AssertionError('Reclaim/create/close must not dispatch')
+                    return response(request,dict(structuredContent=dict(ok=True,value=dict(pages=pages,groups=groups,targets=targets))))
+                output=[];bridge=Bridge('http://127.0.0.1:9010/mcp',output.append,state_root=root,task_id=task,
+                    client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+                bridge.initialize=INIT;bridge.tool_session='original';bridge.ensure_ready=AsyncMock()
+                bridge.task_state.save('original',[parent],[dict(groupId='g',title='session',tabIds=[101,202])])
+                used=dict(targetId='child',tabId=303 if case=='tab_mismatch' else 202,
+                          url='https://example.com/changed' if case=='url_mismatch' else child['url'],purpose='Known user sibling')
+                bridge.task_state.record['used_tabs']=[] if case=='unregistered' else [used]
+                bridge.task_state._write_record()
+                path=Path(root)/(task+'.json');before=path.read_bytes()
+                try:
+                    candidates,conflicts=bridge.task_state.reconciliation(pages,groups,native_targets=targets)
+                    self.assertEqual(candidates,[]);self.assertTrue(conflicts)
+                    with self.assertRaisesRegex(UpstreamError,'ownership reconciliation'):
+                        await bridge.prepare_task()
+                    await bridge.handle(dict(jsonrpc='2.0',id=12,method='tools/call',params=dict(name='workspace_cleanup',arguments=dict(action='resume',task_id=task))))
+                    self.assertIn('block',json.dumps(output[-1]))
+                    self.assertEqual(actions,[])
+                    self.assertEqual(path.read_bytes(),before)
+                    self.assertEqual(current['ownership'],'user')
+                finally:
+                    await bridge.close()
+
     async def test_inventory_disagreement_preserves_saved_record_unless_absence_proven(self):
         import tempfile
         task='00000000-0000-4000-8000-000000000001'
@@ -805,7 +896,13 @@ class OutputBridgeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(calls),1)
             self.assertEqual(len(bridge.task_state.record['outputs']),1)
             self.assertEqual(out[-1]['result']['content'][0]['text'],'original response')
-            with patch('neo_task_state.atomic_write_json', side_effect=OSError('synthetic disk failure')):
+            import neo_task_state
+            actual_write=neo_task_state.atomic_write_json
+            def fail_new_output(path,record,**kwargs):
+                if len(record.get('outputs',[]))>1:
+                    raise OSError('synthetic post-dispatch disk failure')
+                return actual_write(path,record,**kwargs)
+            with patch('neo_task_state.atomic_write_json', side_effect=fail_new_output):
                 await bridge.handle(dict(message,id=12))
             self.assertEqual(len(calls),2)
             self.assertEqual(out[-1]['result']['content'][0]['text'],'original response')
@@ -818,6 +915,11 @@ class OutputBridgeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(out[-1]['result']['content'][0]['text'],'original response')
             self.assertIn('synthetic baseline denial',out[-1]['result']['content'][1]['text'])
             self.assertEqual(len(bridge.task_state.record['outputs']),1)
+            with patch('neo_task_state.atomic_write_json', side_effect=OSError('synthetic pre-dispatch disk failure')):
+                await bridge.handle(dict(message,id=14))
+            self.assertEqual(len(calls),3)
+            self.assertTrue(out[-1]['result']['isError'])
+            self.assertIn('NOT dispatched',out[-1]['result']['content'][0]['text'])
 
 
 if __name__ == "__main__":

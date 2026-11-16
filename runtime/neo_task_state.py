@@ -7,7 +7,9 @@ import uuid
 from collections import Counter
 from pathlib import Path
 from workspace_storage import atomic_write_json, ensure_no_reparse_components
+from workspace_storage.atomic import _file_lock
 from neo_tab_identity import credential_bearing_url, other_owner
+from neo_operation_boundary import OperationBoundary
 
 
 class TaskState:
@@ -17,6 +19,46 @@ class TaskState:
         self.record = None
         self.output_root = Path(output_root) if output_root is not None else None
 
+    def browser_operation(self, *, exclusive=False, timeout=45):
+        root=self.root.parent.parent if self.root.parent.name=='task-tabs' else self.root
+        return OperationBoundary(root/'browser-operations.lock',exclusive=exclusive,timeout=timeout)
+
+    @staticmethod
+    def _validate_reset(record, task_id):
+        reset = record.get('browser_reset_id')
+        if (not isinstance(reset, str) or str(uuid.UUID(reset)) != reset
+                or record.get('browser_reset_verified') is not True
+                or record.get('schema_version') != 1 or record.get('task_id') != task_id):
+            raise ValueError('Invalid administrator reset evidence; preserve task bindings')
+        pending = record.get('browser_reset_pending')
+        if pending is True:
+            if (record.get('browser_closed') is not True or record.get('session') is not None
+                    or record.get('pages_session') is not None or any(record.get(k) != [] for k in
+                    ('pages','groups','used_tabs','retained','prior_bindings','review_required'))):
+                raise ValueError('Incomplete browser reset receipt; preserve task bindings')
+        elif pending is not False or not isinstance(record.get('session'),str) or not record['session']:
+            raise ValueError('Consumed reset lacks its new session; preserve task bindings')
+
+    @staticmethod
+    def _merge_outputs(*records):
+        entries = {}
+        for record in records:
+            for entry in (record or {}).get('outputs', []):
+                if not isinstance(entry,dict) or not isinstance(entry.get('path'),str):
+                    raise ValueError('Invalid output provenance; preserve task record')
+                key = entry['path'].casefold()
+                if key in entries and entries[key] != entry:
+                    raise ValueError('Conflicting output provenance; preserve both records for inspection')
+                entries[key] = entry
+        return list(entries.values())
+
+    def consume_browser_reset_handle(self, session):
+        if not isinstance(session,str) or not session or self.record.get('browser_reset_pending') is not True:
+            raise ValueError('Expected a fresh server handle and pending reset')
+        updated=dict(self.record,browser_reset_pending=False,browser_closed=False,session=session)
+        self._write_record(updated, consume_reset=True)
+        self.record=updated
+
     def bind(self, task_id):
         if str(uuid.UUID(task_id)) != task_id:
             raise ValueError("Use the actual lowercase task UUID")
@@ -25,11 +67,22 @@ class TaskState:
         self.task_id = task_id
         path = self.root / (task_id + '.json')
         ensure_no_reparse_components(path)
+        if self.record is not None and path.exists():
+            fresh = json.loads(path.read_text(encoding='utf-8'))
+            reset = fresh.get('browser_reset_id')
+            if reset is not None and (reset != self.record.get('browser_reset_id') or
+                    self.record.get('browser_reset_pending') is True and fresh.get('browser_reset_pending') is False):
+                self._validate_reset(fresh, task_id)
+                fresh['outputs'] = self._merge_outputs(self.record, fresh)
+                self.record = fresh
         if self.record is None:
-            self.record = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {
+            fresh = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {
                 'schema_version': 1, 'task_id': task_id, 'session': None, 'pages': [], 'groups': [], 'retained': []}
-            if self.record.get('schema_version') != 1 or self.record.get('task_id') != task_id:
+            if fresh.get('schema_version') != 1 or fresh.get('task_id') != task_id:
                 raise ValueError("Invalid/future task binding; preserve it for inspection")
+            if fresh.get('browser_reset_id') is not None or fresh.get('browser_reset_pending'):
+                self._validate_reset(fresh, task_id)
+            self.record = fresh
         return self.record
 
     def save(self, session, pages, groups, retained=None):
@@ -56,10 +109,40 @@ class TaskState:
         self._write_record(updated)
         self.record=updated
 
-    def _write_record(self, record=None):
+    def _write_record(self, record=None, *, administrator_reset=False, consume_reset=False, expected_state=None, operation_guard=None):
+        if administrator_reset:
+            if not isinstance(operation_guard,OperationBoundary):
+                raise ValueError('Administrator reset requires the profile exclusive operation boundary')
+            operation_guard.require_exclusive(self.browser_operation().path)
         target = self.root / (self.task_id + '.json')
         ensure_no_reparse_components(target)
-        atomic_write_json(target, self.record if record is None else record, backup_count=0)
+        updated = self.record if record is None else record
+        # Serialize read/merge/write transactions separately from atomic JSON
+        # installation's own lock. Output receipts from concurrent clients must
+        # survive every task-state update, including administrator close-all.
+        with _file_lock(target.with_suffix('.update'), timeout=5):
+            disk = json.loads(target.read_text(encoding='utf-8')) if target.exists() else {}
+            if disk and (disk.get('task_id') != self.task_id or disk.get('schema_version') != 1):
+                raise ValueError('Foreign task record; preserve it')
+            if administrator_reset:
+                self._validate_reset(updated, self.task_id)
+                if updated.get('browser_reset_pending') is not True:
+                    raise ValueError('Administrator reset must start with a closed pending receipt')
+                if not isinstance(expected_state,dict) or disk != expected_state:
+                    raise ValueError('Task changed since closure verification; preserve current browser bindings')
+                if disk.get('browser_reset_id') == updated.get('browser_reset_id'):
+                    raise ValueError('Reset receipt was already issued; verify a new closure boundary')
+            elif disk.get('browser_reset_id') != updated.get('browser_reset_id') or (
+                    disk.get('browser_reset_pending') is False and updated.get('browser_reset_pending') is True):
+                raise ValueError('Reset changed in another connection; bind before writing')
+            elif consume_reset and disk.get('browser_reset_pending') is False and disk.get('session') != updated.get('session'):
+                raise ValueError('Reset was consumed by another connection; bind before continuing')
+            updated['outputs'] = self._merge_outputs(disk, self.record, updated)
+            revision = disk.get('state_revision',0)
+            if type(revision) is not int or revision < 0:
+                raise ValueError('Invalid task revision; preserve current state')
+            updated['state_revision'] = revision + 1
+            atomic_write_json(target, updated, backup_count=0)
 
     def checkpoint_session(self, session):
         if self.task_id and session and self.record.get('session') != session:
@@ -215,6 +298,59 @@ class TaskState:
             raise ValueError('Prior physical task tabs are still present elsewhere; preserve both groups')
         return recovery['group_id'], members
 
+    def _has_preexisting_sibling(self, group_id, old, pages):
+        """Blocking evidence only; a known non-owned sibling is not a restore."""
+        saved = [g for g in self.record.get('groups', []) if g.get('id', g.get('groupId')) == group_id]
+        if len(saved) != 1 or not isinstance(saved[0].get('tabIds'), list):
+            return False
+        owned_ids = {p.get('tabId') for p in old if type(p.get('tabId')) is int}
+        siblings = {t for t in saved[0]['tabIds'] if type(t) is int} - owned_ids
+        known_targets = {p.get('targetId') for p in self.record.get('used_tabs', [])
+                         if type(p.get('tabId')) is int and p['tabId'] in siblings}
+        return bool(siblings) and any(p.get('groupId') == group_id and (
+            p.get('tabId') in siblings or p.get('targetId') in known_targets) for p in pages)
+
+    def _registered_unclaimed_remainder(self, group_id, old, pages, groups, native_targets):
+        """Prove owned parents closed without adopting their already-used siblings."""
+        if (not isinstance(native_targets, list)
+                or any(not isinstance(t, str) or not t for t in native_targets)
+                or any(p['targetId'] in native_targets for p in old)):
+            return False
+        saved = [g for g in self.record.get('groups', []) if g.get('id', g.get('groupId')) == group_id]
+        current = [g for g in groups if g.get('id', g.get('groupId')) == group_id]
+        if not group_id or len(saved) != 1 or len(current) != 1:
+            return False
+        for group in (saved[0], current[0]):
+            ids = group.get('tabIds')
+            if (not isinstance(ids, list) or any(type(t) is not int for t in ids)
+                    or len(ids) != len(set(ids))):
+                return False
+        if any(type(p.get('tabId')) is not int for p in old):
+            return False
+        owned_ids = {p['tabId'] for p in old}
+        if not owned_ids.issubset(saved[0]['tabIds']):
+            return False
+        members = [p for p in pages if p.get('groupId') == group_id]
+        targets = {p.get('targetId') for p in members}
+        used = self.record.get('used_tabs', [])
+        if (not members or not targets.issubset(native_targets) or None in targets
+                or not isinstance(used, list) or any(not isinstance(p, dict) for p in used)):
+            return False
+        registered = {p.get('targetId'): p for p in used}
+        if len(registered) != len(used):
+            return False
+        aliases = [p for p in pages if p.get('targetId') in targets]
+        for p in aliases:
+            proof = registered.get(p.get('targetId'), {})
+            if (p.get('groupId') != group_id or p.get('ownership') != 'user'
+                    or p.get('ownerAgentId') is not None or type(p.get('tabId')) is not int
+                    or p['tabId'] in owned_ids or p['tabId'] not in saved[0]['tabIds']
+                    or not isinstance(p.get('url'), str) or credential_bearing_url(p['url'])
+                    or proof.get('tabId') != p['tabId'] or proof.get('url') != p['url']):
+                return False
+        tab_ids = {p['tabId'] for p in members}
+        return len(tab_ids) == len(targets) and tab_ids == set(current[0]['tabIds'])
+
     def reconciliation(self, pages, groups, *, recovery=None, native_targets=None):
         """Return unique proven groups or unresolved conflicts, without mutations."""
         selected = self.recovery_group(recovery, pages, groups) if recovery is not None else None
@@ -229,6 +365,15 @@ class TaskState:
         candidates, unresolved = [], []
         for old_id in {p.get('groupId') for p in self.record['pages']}:
             old = [p for p in self.record['pages'] if p.get('groupId') == old_id]
+            if {p['targetId'] for p in old}.intersection(physical_targets).difference(physical):
+                unresolved.append({'groupId':old_id, 'reason':'Recorded physical target is missing from SDK inventory; no URL-based claim'})
+                continue
+            if self._registered_unclaimed_remainder(old_id, old, pages, groups, native_targets):
+                continue
+            if (not {p['targetId'] for p in old}.intersection(physical_targets)
+                    and self._has_preexisting_sibling(old_id, old, pages)):
+                unresolved.append({'groupId':old_id, 'reason':'Previously unowned group member has incomplete registration; no URL-based claim'})
+                continue
             if selected and old_id == recovery['prior_group_id']:
                 owned={p['targetId'] for p in selected[1] if p.get('ownership')=='mine'}
                 if not {p['targetId'] for p in selected[1]}.issubset(owned):

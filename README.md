@@ -6,6 +6,58 @@ server 0.0.65**, not a claim to support the latest upstream version. DOT review 
 required before the first public upload. Current-PC isolated tests and other-PC
 tests are reported separately; the latter are deferred by the owner.
 
+## v0.1.2: registered popup tabs after parent closure
+
+Closing the last owned parent no longer strands its binding when a link-opened,
+unclaimed child remains in the same group. Native absence, the saved full group
+tab IDs, exact registered target/tab/URL and every current alias must agree.
+Known pre-existing unowned siblings cannot fall back to URL restoration when
+registration fails, even when the parent and child have the same URL.
+Unknown group members, other owners, changed registrations or a surviving parent
+preserve the binding. The child is never adopted or closed by reconciliation;
+its contents and used-tab cleanup scope remain intact for explicit review.
+
+Browser 0.51.0, patched server 0.0.65, installer/dependency pins and corresponding
+server source remain unchanged. This release adds no ownership permissions.
+
+After an explicitly authorized administrator close-all, cached clients can
+consume a complete closed reset receipt without starting Neo. A fresh
+browser_reset_id UUID, immutable browser_reset_verified=true,
+browser_reset_pending=true, browser_closed=true, null
+session/pages_session, and empty pages/groups/used_tabs/retained/prior_bindings/
+review_required arrays are required. Output inventories remain intact. A new
+server handle consumes the pending receipt; readiness failures cannot revive
+old hints. Other cached clients can read the pending or consumed state and reuse
+the current handle. Begin only acknowledges retirement. Each connection must
+receive an explicit successful tabs action=list, select current page IDs/session,
+and echo its inventory_receipt on fresh browser and page-using cleanup requests.
+The ephemeral receipt is returned in text and com.workspace.neo/inventory_receipt
+metadata; it is never persisted or forwarded upstream. Internal inventory,
+windows/groups lists and failed lists do not authorize page operations. Old queued
+requests and retired explicit session hints are rejected rather than replayed
+against reused page numbers. Local begin/outputs/check need no receipt.
+Normally close with native browser tools first. Then hold
+state.browser_operation(exclusive=True) from snapshot capture through exact
+browser/server termination verification and all administrator writes:
+TaskState._write_record(administrator_reset=True, operation_guard=guard,
+expected_state=<deep copy read under the guard before closure verification>).
+Browser tools must not be invoked while administration holds this guard.
+The profile-wide OS lock permits concurrent shared Codex/AGY Bridge.handle calls;
+exclusive administration waits for readiness, internal reconciliation, in-flight
+HTTP and result bookkeeping, while blocking new calls. Raw/stateless clients
+outside the adapter are not covered and must not be active at administration.
+After an epoch change an old queued request stops before dispatch until local
+workspace_cleanup begin acknowledges retirement and fresh inventory is inspected.
+The same transaction rejects changed state and reused reset
+UUIDs. Every task write advances a revision; mutation-capable dispatch persists
+it before action, so a later operation cannot return silently to an equal-looking
+old snapshot. Transactions preserve the union of cached/on-disk
+output receipts and reject provenance conflicts or stale reset writes. Two
+in-flight reset mints cannot replace the first consumed handle; the later caller
+refreshes current state and stops its stale preflight before further actions.
+This mechanism never closes tabs or grants ownership by itself. Raw parent
+targets missing from the SDK listing also block URL recovery.
+
 ## v0.1.1: closed-group reconciliation fix
 
 Closing the last tab in one task group no longer leaves an unrecoverable stale
