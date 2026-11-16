@@ -45,6 +45,13 @@ async def finish_check(plan, task_id, execution_id):
     else:
         bridge.cleanup.review_required = {tuple(k) for k in record.get('review_required', bridge.cleanup.retained)}
     try:
+        # This is a fresh observer connection. A consumed administrator reset
+        # still requires local acknowledgement before checking its current scope.
+        await bridge.handle({'jsonrpc':'2.0','id':0,'method':'tools/call','params':{
+            'name':'workspace_cleanup','arguments':{'action':'begin','task_id':task_id}}})
+        bound=(output[-1].get('result',{}).get('structuredContent') or {})
+        if not bound.get('taskBound'):
+            return {'decision':'block','reason':'Finish task binding unavailable','diagnostic':output[-1]}
         await bridge.handle({'jsonrpc':'2.0','id':1,'method':'tools/call','params':{
             'name':'workspace_cleanup','arguments':{'action':'check','task_id':task_id}}})
         result=output[-1].get('result',{})

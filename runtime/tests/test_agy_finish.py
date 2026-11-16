@@ -11,6 +11,53 @@ runner=importlib.util.module_from_spec(spec);spec.loader.exec_module(runner)
 TASK='00000000-0000-4000-8000-000000000001'
 
 class FinishTests(unittest.IsolatedAsyncioTestCase):
+    async def reset_finish(self, scope, *, checked=True):
+        import httpx
+        page=dict(pageId=7,targetId='kept',tabId=17,groupId='g',url='about:blank',ownership='mine')
+        pages=[page] if scope!='empty' else []
+        groups=[dict(groupId='g',tabIds=[17])] if pages else []
+        retained=[[['s','kept','about:blank'],'Next CLI phase reuses this exact synthetic tab']] if scope=='retained' else []
+        self.record(schema_version=1,task_id=TASK,session='s',pages_session='s',pages=pages,groups=groups,
+            retained=retained,used_tabs=[],prior_bindings=[],review_required=[retained[0][0]] if retained and not checked else [],execution_id='current',
+            execution_incomplete=False,finish_checked_execution='current' if checked else 'previous',
+            browser_reset_id='00000000-0000-4000-8000-000000000002',browser_reset_verified=True,
+            browser_reset_pending=False,browser_closed=False)
+        sent=[]
+        def handler(request):
+            rpc=json.loads(request.content);sent.append(rpc)
+            self.assertEqual(rpc['params']['name'],'run')
+            code=rpc['params']['arguments']['code']
+            self.assertIn('browser.pages.list()',code)
+            value=dict(pages=pages,groups=groups,targets=[p['targetId'] for p in pages]) if 'Browser.getTabGroups' in code else pages
+            return httpx.Response(200,json=dict(jsonrpc='2.0',id=rpc['id'],result=dict(structuredContent=dict(ok=True,value=value))))
+        actual=runner.Bridge
+        def factory(*args,**kw):return actual(*args,client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),**kw)
+        with patch.object(runner,'Bridge',factory):
+            result=await runner.finish_check(self.plan,TASK,'current')
+        return result,sent
+
+    async def test_consumed_reset_finishes_clean_scope(self):
+        check,sent=await self.reset_finish('empty')
+        self.assertNotEqual(check.get('decision'),'block',check)
+        self.assertEqual(check['pendingPageIds'],[])
+        self.assertEqual(check['retained'],[])
+        self.assertTrue(sent,'Must inspect the current running session, not assume unused')
+
+    async def test_consumed_reset_preserves_same_execution_retention(self):
+        check,sent=await self.reset_finish('retained')
+        self.assertNotEqual(check.get('decision'),'block',check)
+        self.assertEqual(check['pendingPageIds'],[])
+        self.assertEqual(check['retained'][0]['pageId'],7)
+        self.assertTrue(sent)
+
+    async def test_consumed_reset_still_blocks_pending_and_old_retention(self):
+        for scope,checked in [('pending',True),('retained',False)]:
+            with self.subTest(scope=scope):
+                check,sent=await self.reset_finish(scope,checked=checked)
+                self.assertEqual(check['decision'],'block')
+                self.assertEqual(check['pendingPageIds'] if scope=='pending' else check['reviewPageIds'],[7])
+                self.assertTrue(sent)
+
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(dir=os.environ['WEB_AUTOMATION_TEST_ROOT'])
         self.addCleanup(self.temp.cleanup)
@@ -35,6 +82,9 @@ class FinishTests(unittest.IsolatedAsyncioTestCase):
                 self.emit=emit
                 self.cleanup=type('Policy',(),{'review_required':set(),'retained':{('session','target','url'):'unfinished'}})()
             async def handle(self,message):
+                if message['params']['arguments']['action']=='begin':
+                    self.emit({'result':{'structuredContent':{'taskBound':True}}})
+                    return
                 self.emit({'result':{'structuredContent':{'pendingPageIds':[7],'reviewPageIds':[8] if self.cleanup.review_required else []}}})
             async def close(self):pass
         with patch.object(runner,'Bridge',Fake):

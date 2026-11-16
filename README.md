@@ -6,6 +6,17 @@ server 0.0.65**, not a claim to support the latest upstream version. DOT review 
 required before the first public upload. Current-PC isolated tests and other-PC
 tests are reported separately; the latter are deferred by the owner.
 
+## v0.1.3: AGY finish inspection after an administrator reset
+
+The independent CLI finish observer now locally binds the actual task before its
+read-only cleanup check. After a consumed browser reset, valid retained scope and
+fully cleaned scope no longer incorrectly return exit 6 solely because this fresh
+observer had not acknowledged the reset. Binding failure, pending tabs, stale
+retention, failed browser inspection and unknown outcomes still block completion.
+The observer does not launch Neo, mutate pages or grant inventory receipt rights.
+The public endpoint identity guard and same-execution retention/defer evidence
+remain enforced. Browser 0.51.0, server 0.0.65 and dependency pins are unchanged.
+
 ## v0.1.2: registered popup tabs after parent closure
 
 Closing the last owned parent no longer strands its binding when a link-opened,
