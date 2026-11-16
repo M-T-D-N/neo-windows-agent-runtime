@@ -75,6 +75,25 @@ class TaskStateTests(unittest.TestCase):
         self.assertEqual(self.state.reconciliation([page('unrelated','other','user')],[dict(id='other',title='unrelated')]),([],[]))
         self.assertEqual(self.state.reconciliation([],[]),([],[]))
 
+    def test_native_absence_disambiguates_closed_group_from_same_title(self):
+        groups=[dict(id='other',title='verified task label')]
+        before=json.dumps(self.state.record,sort_keys=True)
+        for owner in ('mine','user','other-agent'):
+            unrelated=page('different','other',owner,'https://example.com/unrelated')
+            self.assertEqual(self.state.reconciliation([unrelated],groups,native_targets=['different']),([],[]))
+            # Missing SDK aliases cannot prove physical closure.
+            self.assertTrue(self.state.reconciliation([unrelated],groups,native_targets=['different','one'])[1])
+        self.assertEqual(json.dumps(self.state.record,sort_keys=True),before)
+        # Exact surviving group/membership conflicts and matching restorations
+        # remain subject to the original ownership/recovery checks.
+        exact=page('different','original','user','https://example.com/unrelated')
+        self.assertTrue(self.state.reconciliation([exact],[dict(id='original',title='verified task label')],native_targets=['different'])[1])
+        matching=page('different','other','other-agent')
+        self.assertTrue(self.state.reconciliation([matching],groups,native_targets=['different'])[1])
+        for invalid in (42,[''],['one'],['different',None]):
+            with self.assertRaisesRegex(ValueError,'Incomplete native target inventory'):
+                self.state.reconciliation([unrelated],groups,native_targets=invalid)
+
     def test_explicit_recovery_requires_exact_members_and_no_other_owner(self):
         restored=page('new','restored','user','https://example.com/login')
         group=dict(id='restored',title='verified task label')

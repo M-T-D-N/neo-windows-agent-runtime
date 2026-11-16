@@ -215,12 +215,17 @@ class TaskState:
             raise ValueError('Prior physical task tabs are still present elsewhere; preserve both groups')
         return recovery['group_id'], members
 
-    def reconciliation(self, pages, groups, *, recovery=None):
+    def reconciliation(self, pages, groups, *, recovery=None, native_targets=None):
         """Return unique proven groups or unresolved conflicts, without mutations."""
         selected = self.recovery_group(recovery, pages, groups) if recovery is not None else None
         if not self.record or not self.record['pages']:
             return [], []
         physical = {p['targetId']:p for p in pages if p.get('targetId')}
+        if native_targets is not None and (not isinstance(native_targets,list)
+                or any(not isinstance(t,str) or not t for t in native_targets)
+                or not set(physical).issubset(native_targets)):
+            raise ValueError('Incomplete native target inventory; preserve prior bindings')
+        physical_targets = set(physical) if native_targets is None else set(native_targets)
         candidates, unresolved = [], []
         for old_id in {p.get('groupId') for p in self.record['pages']}:
             old = [p for p in self.record['pages'] if p.get('groupId') == old_id]
@@ -235,7 +240,7 @@ class TaskState:
                 unresolved.append({'groupId':old_id,'reason':'Another active or unknown owner occupies a recorded physical target'})
                 continue
             owned_targets={p['targetId'] for p in pages if p.get('ownership')=='mine' and p.get('targetId')}
-            surviving=old_targets.intersection(physical)
+            surviving=old_targets.intersection(physical_targets)
             if surviving and surviving.issubset(owned_targets):
                 # Complete physical absence proves the other old tabs closed.
                 # A still-owned exact target proves task continuity.
@@ -254,7 +259,9 @@ class TaskState:
             for group in groups:
                 gid = group.get('id', group.get('groupId'))
                 same = gid == old_id or (titles and group.get('title') in titles)
-                related = related or bool(same)
+                # Distinct groups can share a session title. Native target and
+                # exact group absence prove closure; a title alone does not.
+                related = related or gid == old_id or (bool(same) and native_targets is None)
                 members = {p['targetId']:p for p in pages if p.get('groupId') == gid and p.get('targetId')}
                 if same and Counter(p['url'] for p in members.values()) == expected:
                     # Preserve every alias's ownership during conflict checks.
@@ -270,7 +277,7 @@ class TaskState:
                 continue
             if len(hits) == 1 and all(p.get('ownership') == 'user' and p.get('ownerAgentId') is None for p in hits[0][1]):
                 candidates.append(hits[0][0])
-            elif hits or related or any(p['targetId'] in physical for p in old):
+            elif hits or related or old_targets.intersection(physical_targets):
                 unresolved.append({'groupId':old_id, 'reason':'Ownership/membership conflict; no automatic claim'})
             # Actual absence with no matching restored group means closed; a URL
             # elsewhere does not establish this task's ownership.

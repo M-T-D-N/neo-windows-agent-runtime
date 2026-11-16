@@ -81,7 +81,7 @@ class FinishTests(unittest.IsolatedAsyncioTestCase):
         def handler(request):
             rpc=json.loads(request.content);code=rpc['params']['arguments']['code']
             value=(dict(tabs=[dict(targetId='used',tabId=7,url='about:blank')],targets=['used'],pages=[page])
-                   if 'Browser.getTabs' in code else dict(pages=[page],groups=[]) if 'Browser.getTabGroups' in code else [page])
+                   if 'Browser.getTabs' in code else dict(pages=[page],groups=[],targets=['used']) if 'Browser.getTabGroups' in code else [page])
             return httpx.Response(200,json=dict(jsonrpc='2.0',id=rpc['id'],result=dict(structuredContent=dict(ok=True,value=value))))
         actual=runner.Bridge
         def factory(*args,**kw):return actual(*args,client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),**kw)

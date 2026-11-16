@@ -9,7 +9,7 @@ import unittest
 import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from neo_mcp_bridge import Bridge, SESSION_META_KEY, TOOL_PROTOCOL
+from neo_mcp_bridge import Bridge, SESSION_META_KEY, TOOL_PROTOCOL, UpstreamError
 import neo_mcp_bridge
 
 INIT = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
@@ -31,11 +31,110 @@ class StdioEncodingTests(unittest.TestCase):
 
 def response(request, result=None, status=200, session="first"):
     message = json.loads(request.content)
+    value = ((result or {}).get('structuredContent') or {}).get('value')
+    if (isinstance(value, dict) and 'pages' in value and 'targets' not in value
+            and 'Target.getTargets' in (message.get('params',{}).get('arguments',{}).get('code') or '')):
+        value['targets'] = [p['targetId'] for p in value['pages'] if p.get('targetId')]
     return httpx.Response(status, headers={"Mcp-Session-Id": session}, json={
         "jsonrpc": "2.0", "id": message.get("id"), "result": result or {}})
 
-
 class BridgeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_inventory_disagreement_preserves_saved_record_unless_absence_proven(self):
+        import tempfile
+        task='00000000-0000-4000-8000-000000000001'
+        a=dict(pageId=1,targetId='a',groupId='a-group',url='https://example.com/a',ownership='mine')
+        b=dict(pageId=2,targetId='b',groupId='b-group',url='https://example.com/b',ownership='mine')
+        groups=[dict(groupId=p['groupId'],title='same title') for p in [a,b]]
+        for evidence in ({'absent':[],'present':'a'}, {}, {'absent':[]}, {'absent':['different']},
+                         {'absent':['a'],'present':'a'}, {'absent':['a']}):
+            with self.subTest(evidence=evidence), tempfile.TemporaryDirectory(dir=os.environ['WEB_AUTOMATION_TEST_ROOT']) as root:
+                calls=[]
+                def handler(request):
+                    code=json.loads(request.content)['params']['arguments']['code'];calls.append(code)
+                    value=(dict(pages=[a,b],groups=groups[1:],targets=['b'])
+                           if 'Target.getTargets' in code else evidence)
+                    return response(request,dict(structuredContent=dict(ok=True,value=value)))
+                bridge=Bridge('http://127.0.0.1:9010/mcp',lambda x:None,state_root=root,task_id=task,
+                    client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+                bridge.initialize=INIT;bridge.tool_session='original'
+                bridge.task_state.save('original',[a,b],groups)
+                path=Path(root)/(task+'.json');before=path.read_bytes()
+                try:
+                    if evidence == {'absent':['a']}:
+                        await bridge.remember_task()
+                        self.assertEqual([p['targetId'] for p in json.loads(path.read_text())['pages']],['b'])
+                        await bridge.prepare_task()
+                        self.assertEqual(bridge.task_state.record['pages'][0]['targetId'],'b')
+                    else:
+                        with self.assertRaisesRegex(UpstreamError,'preserve prior bindings'):
+                            await bridge.remember_task()
+                        self.assertEqual(path.read_bytes(),before)
+                    self.assertIn('Target.getTargetInfo',calls[1])
+                    self.assertIn('No target with given id found',calls[1])
+                finally:
+                    await bridge.close()
+
+    async def test_malformed_native_target_inventory_preserves_record(self):
+        import tempfile
+        for targets in (None,'a',[None],[''],[5]):
+            with self.subTest(targets=targets), tempfile.TemporaryDirectory(dir=os.environ['WEB_AUTOMATION_TEST_ROOT']) as root:
+                page=dict(pageId=1,targetId='a',groupId='g',url='https://example.com/a',ownership='mine')
+                def handler(request):
+                    return response(request,dict(structuredContent=dict(ok=True,value=dict(pages=[page],groups=[],targets=targets))))
+                bridge=Bridge('http://127.0.0.1:9010/mcp',lambda x:None,state_root=root,
+                    task_id='00000000-0000-4000-8000-000000000001',client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+                bridge.initialize=INIT;bridge.tool_session='original';bridge.task_state.save('original',[page],[])
+                path=Path(root)/(bridge.task_state.task_id+'.json');before=path.read_bytes()
+                try:
+                    with self.assertRaisesRegex(UpstreamError,'preserve prior bindings'):
+                        await bridge.remember_task()
+                    self.assertEqual(path.read_bytes(),before)
+                finally:
+                    await bridge.close()
+
+    async def test_close_last_group_member_updates_binding_despite_duplicate_titles(self):
+        import tempfile
+        from unittest.mock import AsyncMock
+        task='00000000-0000-4000-8000-000000000001'
+        closed=dict(pageId=1,tabId=101,targetId='closed',groupId='closed-group',
+                    url='https://example.com/temporary',ownership='mine')
+        keep=dict(pageId=2,tabId=102,targetId='keep',groupId='keep-group',
+                  url='https://example.com/follow-up',ownership='mine')
+        pages=[closed,keep]
+        groups=[dict(groupId=p['groupId'],title='same session title') for p in pages]
+        closes=[]
+        def handler(request):
+            rpc=json.loads(request.content)
+            if rpc['params']['name']=='tabs':
+                self.assertEqual(rpc['params']['arguments']['action'],'close')
+                closes.append(rpc['params']['arguments']['page'])
+                pages.remove(closed);groups.pop(0)
+                return response(request,dict(content=[dict(type='text',text='closed page 1')]))
+            code=rpc['params']['arguments']['code']
+            value=(dict(pages=list(pages),groups=list(groups),targets=[p['targetId'] for p in pages])
+                   if 'Browser.getTabGroups' in code else list(pages))
+            return response(request,dict(structuredContent=dict(ok=True,value=value)))
+        with tempfile.TemporaryDirectory(dir=os.environ['WEB_AUTOMATION_TEST_ROOT']) as root:
+            output=[];bridge=Bridge('http://127.0.0.1:9010/mcp',output.append,state_root=root,task_id=task,
+                client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+            self.addAsyncCleanup(bridge.close)
+            bridge.initialize=INIT;bridge.tool_session='original-session';bridge.ensure_ready=AsyncMock()
+            retention=(('original-session','keep',keep['url']),'Confirmed next task needs this page')
+            bridge.cleanup.retained=dict([retention])
+            bridge.task_state.save('original-session',pages,groups,[retention])
+            async def invoke(name,args):
+                await bridge.handle(dict(jsonrpc='2.0',id=12,method='tools/call',params=dict(name=name,arguments=args)))
+                return output[-1]['result']
+            result=await invoke('tabs',dict(action='close',page=1))
+            self.assertFalse(result.get('isError'))
+            self.assertNotIn('WORKSPACE_TRACKING_FAILED',json.dumps(result))
+            record=json.loads((Path(root)/(task+'.json')).read_text(encoding='utf-8'))
+            self.assertEqual([p['targetId'] for p in record['pages']],['keep'])
+            self.assertEqual(record['retained'][0][1],retention[1])
+            result=await invoke('workspace_cleanup',dict(action='resume',task_id=task))
+            self.assertNotEqual(result['structuredContent'].get('decision'),'block')
+            self.assertEqual(closes,[1])
+
     async def test_reclaim_is_internal_and_cannot_dispatch_from_public_tools(self):
         calls = []
         bridge, output = await self.make_bridge(lambda request: calls.append(request))
@@ -66,9 +165,9 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         task_id='00000000-0000-4000-8000-000000000001'
         with tempfile.TemporaryDirectory(dir=os.environ['WEB_AUTOMATION_TEST_ROOT']) as root:
             calls=[]
-            pages=[dict(pageId=10,tabId=20,targetId='restored',groupId='restored-group',
+            pages=[dict(pageId=10,tabId=20,targetId='restored',groupId='old-group',
                         url='https://example.com/login',ownership='user',ownerAgentId=None)]
-            groups=[dict(groupId='restored-group',title='recorded task')]
+            groups=[dict(groupId='old-group',title='recorded task')]
             def handler(request):
                 rpc=json.loads(request.content);calls.append(rpc)
                 if rpc['method']=='ping': return response(request)

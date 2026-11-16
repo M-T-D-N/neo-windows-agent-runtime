@@ -6,6 +6,24 @@ server 0.0.65**, not a claim to support the latest upstream version. DOT review 
 required before the first public upload. Current-PC isolated tests and other-PC
 tests are reported separately; the latter are deferred by the owner.
 
+## v0.1.1: closed-group reconciliation fix
+
+Closing the last tab in one task group no longer leaves an unrecoverable stale
+binding when a different group shares its session title. The bridge checks the
+complete native target list and exact group identity before recognizing absence.
+SDK-only aliases are excluded only after a per-target CDP query returns the
+explicit no-such-target error. Live targets, other errors and incomplete proof
+preserve the prior binding. Arbitrary omissions from both catalogs cannot be
+independently detected; normal CDP catalog completeness remains a trust premise.
+A surviving native target with a missing SDK alias, ownership conflicts and
+ambiguous restoration still preserve the prior binding. Reconnect the MCP client
+after changing the installed source; reuse the same task UUID and existing tabs.
+
+This is a Python bridge/state fix. Browser 0.51.0, patched server 0.0.65, binary
+pins, corresponding server source, installer, endpoint checks and dependencies
+are unchanged from v0.1.0. Install this source into a fresh root as documented;
+the existing installer intentionally refuses to overwrite a different source ID.
+
 ## Requirements and installation
 
 - Windows x64, Python **3.13 x64**, Windows PowerShell 5.1, `tar` with 7z support.

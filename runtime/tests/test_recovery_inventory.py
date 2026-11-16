@@ -36,7 +36,7 @@ class RecoveryInventoryTests(unittest.IsolatedAsyncioTestCase):
             if failure:
                 raise httpx.ConnectError('endpoint offline', request=request)
             result = {'_meta': {SESSION_META_KEY: 'fresh-session'},
-                      'structuredContent': {'ok': True, 'value': {'pages': self.pages, 'groups': self.groups}}}
+                      'structuredContent': {'ok': True, 'value': {'pages': self.pages, 'groups': self.groups, 'targets': [p['targetId'] for p in self.pages]}}}
             return httpx.Response(200, json={'jsonrpc': '2.0', 'id': rpc['id'], 'result': result})
         bridge = Bridge('http://127.0.0.1:9010/mcp', self.output.append,
                         client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
@@ -80,7 +80,7 @@ class RecoveryInventoryTests(unittest.IsolatedAsyncioTestCase):
         bridge.starter.assert_not_awaited()
         self.assertEqual(self.output[-1]['result']['_meta'][SESSION_META_KEY], 'fresh-session')
         self.assertEqual([(c['params']['name'], c['params']['arguments']['code']) for c in self.calls],
-                         [('run', 'const pages=await browser.pages.list(); const targets=(await browser.cdp("Target.getTargets",{})).targetInfos.map(t=>t.targetId); const groups=(await browser.cdp("Browser.getTabGroups",{})).groups; return {pages:pages.filter(p=>!p.targetId || targets.includes(p.targetId)),groups};')])
+                         [('run', 'const pages=await browser.pages.list(); const targets=(await browser.cdp("Target.getTargets",{})).targetInfos.map(t=>t.targetId); const groups=(await browser.cdp("Browser.getTabGroups",{})).groups; return {pages,groups,targets};')])
         self.assertEqual(bridge.task_state.record['pages'][0]['targetId'], 'old-target')
 
     async def test_invalid_scope_or_extra_arguments_never_dispatch(self):

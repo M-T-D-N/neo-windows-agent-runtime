@@ -173,11 +173,34 @@ class Bridge:
         result = await self.internal_tool('run', {'code':
             'const pages=await browser.pages.list(); const targets=(await browser.cdp("Target.getTargets",{})).targetInfos.map(t=>t.targetId); '
             'const groups=(await browser.cdp("Browser.getTabGroups",{})).groups; '
-            'return {pages:pages.filter(p=>!p.targetId || targets.includes(p.targetId)),groups};'})
+            'return {pages,groups,targets};'})
         structured = result.get('structuredContent') or {}
         if structured.get('ok') is not True or not isinstance(structured.get('value'), dict):
             raise UpstreamError('Task inventory unavailable; preserve prior bindings')
-        return structured['value']
+        info = structured['value']
+        pages, targets = info.get('pages'), info.get('targets')
+        if (not isinstance(pages, list) or any(not isinstance(p, dict) for p in pages)
+                or not isinstance(targets, list)
+                or any(not isinstance(t, str) or not t for t in targets)
+                or any(p.get('targetId') is not None and
+                       (not isinstance(p['targetId'], str) or not p['targetId']) for p in pages)):
+            raise UpstreamError('Incomplete native target inventory; preserve prior bindings')
+        missing = sorted({p['targetId'] for p in pages if p.get('targetId')} - set(targets))
+        if missing:
+            # SDK aliases can outlive closed tabs. Only the explicit CDP absence
+            # error proves an omitted alias closed; live/unknown probes preserve
+            # the saved task, rather than filtering away a catalog disagreement.
+            proof = await self.internal_tool('run', {'code':
+                'const absent=[]; for (const targetId of ' + json.dumps(missing) + ') {'
+                'try {await browser.cdp("Target.getTargetInfo",{targetId}); return {absent:[],present:targetId};}'
+                'catch(e) {if(e.message!=="CDP error: No target with given id found") throw e; absent.push(targetId);}} '
+                'return {absent};'})
+            evidence = proof.get('structuredContent') or {}
+            value = evidence.get('value')
+            if (evidence.get('ok') is not True or not isinstance(value, dict)
+                    or value.get('absent') != missing or value.get('present') is not None):
+                raise UpstreamError('Native/SDK target inventory disagrees; preserve prior bindings')
+        return dict(info, pages=[p for p in pages if not p.get('targetId') or p['targetId'] in targets])
 
     async def recovery_inventory(self, group_id):
         """Metadata only, including during conflicts; never reconcile or save bindings."""
@@ -209,7 +232,7 @@ class Bridge:
             raise UpstreamError('Bind the actual task UUID with workspace_cleanup begin before browser work')
         info = await self.inventory()
         self.task_state.checkpoint_session(self.tool_session)
-        candidates, conflicts = self.task_state.reconciliation(info['pages'], info['groups'], recovery=recovery)
+        candidates, conflicts = self.task_state.reconciliation(info['pages'], info['groups'], recovery=recovery, native_targets=info.get('targets'))
         if conflicts or (candidates and not claim):
             raise UpstreamError(f'Prior task tabs require ownership reconciliation: {conflicts}')
         for group_id in candidates:
@@ -250,7 +273,7 @@ class Bridge:
             if not expected.issubset({p['targetId'] for p in info['pages'] if p.get('ownership') == 'mine'}):
                 raise UpstreamError('Recorded group was not adopted; preserve it and inspect ownership')
         if recovery is not None:
-            remaining, conflicts = self.task_state.reconciliation(info['pages'], info['groups'], recovery=recovery)
+            remaining, conflicts = self.task_state.reconciliation(info['pages'], info['groups'], recovery=recovery, native_targets=info.get('targets'))
             if remaining or conflicts:
                 raise UpstreamError('Selected group recovery remains unverified; preserve prior bindings')
         self.task_prepared = True
@@ -259,7 +282,7 @@ class Bridge:
     async def remember_task(self):
         if self.task_state and self.task_state.task_id:
             info = await self.inventory()
-            candidates, conflicts = self.task_state.reconciliation(info['pages'], info['groups'])
+            candidates, conflicts = self.task_state.reconciliation(info['pages'], info['groups'], native_targets=info.get('targets'))
             if candidates or conflicts:
                 self.task_prepared = False
                 raise UpstreamError('Task ownership changed after the action; preserve prior bindings and reconcile before continuing')
