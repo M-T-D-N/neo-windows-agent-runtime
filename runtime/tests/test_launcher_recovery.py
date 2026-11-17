@@ -59,32 +59,152 @@ class ProfileIdentityTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         code = r'''
 . (Join-Path '__ROOT__' 'neo-runtime-common.ps1')
-function Test-NeoEndpointIdentity {param($Endpoint) return $true} # Explicit transport-only fixture; identity has separate tests.
 $plan=[pscustomobject]@{profile_root='D:/owned/profile'}
 $exe='D:\owned\chrome.exe';$browserExe=$exe;$profile='D:\owned\profile'
 function Get-CimInstance {param($ClassName,$Filter) $script:fixture}
 $cases=@(
  @{args="--user-data-dir=$profile --no-first-run";match=$true},
  @{args='--restart --user-data-dir="'+$profile+'"';match=$true},
+ @{args='--restart "--user-data-dir='+$profile+'"';match=$true},
+ @{args='--user-data-dir="'+$profile+'" ';match=$true},
+ @{args=('"--user-data-dir='+$profile+'"'+"`t");match=$true},
+ @{args='--restart "--user-data"-dir="'+$profile+'"';match=$true},
+ @{args='--user-data-dir="'+$profile+'" "--app=literal --user-data-dir=unrelated"';match=$true},
+ @{args='--restart "--user-data-dir='+$profile+'-other"';match=$false},
+ @{args='"--user-data-dir='+$profile+'" --user-data-dir='+$profile+'-other';match=$false},
+ @{args='--user-data-dir="'+$profile+'" "--user-data-dir='+$profile+'-other"';match=$false},
+ @{args='"--user-data-dir='+$profile+'-other" --user-data-dir="'+$profile+'"';match=$false},
+ @{args='"--user-data-dir='+$profile+'" --user-data-dir='+$profile;match=$false},
+ @{args='--user-data-dir --user-data-dir='+$profile;match=$false},
  @{args="--user-data-dir=$profile-other";match=$false},
  @{args='--user-data-dir="'+$profile+'-other"';match=$false},
  @{args="--user-data-dir=$profile --type=renderer";match=$false},
  @{args="--log-file=$profile";match=$false}
 )
+foreach($prefix in @('-user-data-dir=','/user-data-dir=','--USER-DATA-DIR=','-USER-DATA-DIR=','/USER-DATA-DIR=')){
+ foreach($suffix in @('','-other')){
+  $alias='"'+$prefix+$profile+$suffix+'"'
+  $cases+=@{args='"--user-data-dir='+$profile+'" '+$alias;match=$false}
+  $cases+=@{args=$alias+' "--user-data-dir='+$profile+'"';match=$false}
+  $cases+=@{args=$alias;match=$false}
+ }
+}
+$cases+=@{args='"--user-data-dir='+$profile+'" "--user-data"-dir="'+$profile+'-other"';match=$false}
+$cases+=@{args=('--user-data-dir="'+$profile+'" --app='+[char]::ConvertFromUtf32(0x1F642));match=$true}
+foreach($text in @(
+ ('-- --user-data-dir="'+$profile+'"'),
+ ('--user-data-dir="'+$profile+'" --'),
+ ('--user-data-dir="'+$profile+'" " --user-data-dir='+$profile+'-other "'),
+ ('--user-data-dir="'+$profile+'" " --type=renderer "'),
+ ('--single-argument --user-data-dir="'+$profile+'"'),
+ ('--user-data-dir="'+$profile+'" /SINGLE-ARGUMENT=value'),
+ '--user-data-dir=relative-profile'
+)){$cases+=@{args=$text;match=$false}}
 foreach($spec in @(@{file='start-neo.ps1';name='Get-DedicatedBrowser'},@{file='ensure-neo-mcp.ps1';name='Get-Browser'})){
  $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path '__ROOT__' $spec.file),[ref]$null,[ref]$null)
  $definition=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $spec.name},$true)
  Invoke-Expression $definition.Extent.Text
  foreach($case in $cases){
   $script:fixture=[pscustomobject]@{ExecutablePath=$exe;CommandLine='"'+$exe+'" '+$case.args}
-  $matches=@(& $spec.name).Count
+  try {$matches=@(& $spec.name).Count}
+  catch {if($case.match -or $_.Exception.Message -ne 'Unqualified Neo browser root is already running; preserve existing processes'){throw};$matches=0}
   if(($matches -eq 1) -ne $case.match){Write-Output $spec.file;exit 1}
  }
+}
+foreach($case in @(
+ @{args='--restart --user-data-dir="D:\owned\profile space"';match=$true},
+ @{args='--restart "--user-data-dir=D:\owned\profile space"';match=$true},
+ @{args='--restart "--user-data-dir=D:\owned\profile space-other"';match=$false}
+)){
+ $script:fixture=[pscustomobject]@{ExecutablePath=$exe;CommandLine='"'+$exe+'" '+$case.args}
+ try {$matches=@(Get-NeoDedicatedBrowser -Executable $exe -Profile 'D:\owned\profile space').Count}
+ catch {if($case.match -or $_.Exception.Message -ne 'Unqualified Neo browser root is already running; preserve existing processes'){throw};$matches=0}
+ if(($matches -eq 1) -ne $case.match){throw 'Quoted profile identity mismatch'}
 }
 exit 0
 '''.replace('__ROOT__', str(root))
         result = subprocess.run(['powershell.exe', '-NoProfile', '-Command', code], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+    def test_duplicate_profile_stops_bootstrap_before_readiness_or_record_write(self):
+        root=Path(__file__).resolve().parents[1]
+        code=r'''$ErrorActionPreference='Stop'
+$script:mutations=0
+function Get-Content {return '{"server_state_root":"D:/owned/server","profile_root":"D:/owned/profile space","proposed_runtime_root":"D:/owned/browser","runtime_mode":"DIRECT_LOOPBACK","mcp_endpoint":"http://127.0.0.1:9010/mcp","cdp_port":9111,"backend_port":9210,"server_override":{"enabled":false}}'}
+function Test-Path {return $false}
+function Get-CimInstance {return $script:fixture}
+function Start-Process {$script:mutations++;throw 'Unexpected server boot'}
+function Invoke-RestMethod {$script:mutations++;throw 'Unexpected HTTP'}
+function Invoke-WebRequest {$script:mutations++;throw 'Unexpected HTTP'}
+$profile='D:\owned\profile space'
+$bootstrapCases=@(
+ ('"--user-data-dir='+$profile+'" --user-data-dir="'+$profile+'-other"'),
+ ('--user-data-dir="'+$profile+'" "--user-data-dir='+$profile+'-other"'),
+ ('"--user-data-dir='+$profile+'-other" --user-data-dir="'+$profile+'"'),
+ ('--user-data-dir="'+$profile+'" "--user-data-dir='+$profile+'"')
+)
+foreach($prefix in @('-user-data-dir=','/user-data-dir=','--USER-DATA-DIR=','-USER-DATA-DIR=','/USER-DATA-DIR=')){
+ foreach($suffix in @('','-other')){
+  $alias='"'+$prefix+$profile+$suffix+'"'
+  $bootstrapCases+=('"--user-data-dir='+$profile+'" '+$alias)
+  $bootstrapCases+=($alias+' "--user-data-dir='+$profile+'"')
+ }
+}
+$bootstrapCases+=('"--user-data-dir='+$profile+'" "--user-data"-dir="'+$profile+'-other"')
+$bootstrapCases+=@(
+ ('-- --user-data-dir="'+$profile+'"'),
+ ('--user-data-dir="'+$profile+'" --'),
+ ('--user-data-dir="'+$profile+'" " --user-data-dir='+$profile+'-other "'),
+ ('--user-data-dir="'+$profile+'" " --type=renderer "'),
+ ('--single-argument --user-data-dir="'+$profile+'"'),
+ ('--user-data-dir="'+$profile+'" /SINGLE-ARGUMENT=value'),
+ '--user-data-dir=relative-profile'
+)
+$commandLines=@($bootstrapCases | ForEach-Object {'chrome.exe '+$_})
+$commandLines+=('--user-data-dir="'+$profile+'" --no-first-run')
+$commandLines+=(' chrome.exe --user-data-dir="'+$profile+'"')
+$commandLines+=('chrome.exe --user-data-dir="'+$profile+'-other"')
+$commandLines+=('chrome.exe "--user-data-dir='+$profile+' ')
+$commandLines+=('chrome.exe "--user-data-dir='+$profile+"`t")
+if($commandLines.Count -ne 37 -or @($commandLines | Select-Object -Unique).Count -ne 37){throw 'Bootstrap vectors must execute as 37 separate commands'}
+foreach($commandLine in $commandLines){
+ $script:fixture=[pscustomobject]@{ProcessId=11;ExecutablePath='D:\owned\browser\Chrome-bin\chrome.exe';CommandLine=$commandLine}
+ try {& (Join-Path '__ROOT__' 'ensure-neo-mcp.ps1');throw 'Duplicate profile was accepted'}
+ catch {if($_.Exception.Message -notin @('Exactly one dedicated browser is required for live MCP recovery','Unqualified Neo browser root is already running; preserve existing processes')){throw}}
+ if($script:mutations){throw 'Bootstrap touched runtime before rejecting duplicate profiles'}
+}
+exit 0
+'''.replace('__ROOT__',str(root))
+        result=subprocess.run(['powershell.exe','-NoProfile','-Command',code],capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+
+
+    def test_shutdown_preserves_live_recorded_browser_or_unknown_cdp_owner(self):
+        root=Path(__file__).resolve().parents[1]
+        code=r'''$ErrorActionPreference='Stop'
+$proxyPort=9010;$cdpPort=9111;$recordPath='fictional-record.json'
+$ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path '__ROOT__' 'ensure-neo-mcp.ps1'),[ref]$null,[ref]$null)
+$definition=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Stop-Recovery'},$true)
+Invoke-Expression $definition.Extent.Text
+function Get-Browser {}
+function Get-OwnedServer {if(-not $script:stopped){[pscustomobject]@{ProcessId=20}}}
+function Get-Content {'{"browser":{"ProcessId":11}}'}
+function Get-CimInstance {param($ClassName,$Filter) if($script:mode -eq 'record-live' -and $Filter -eq 'ProcessId=11'){[pscustomobject]@{ProcessId=11}}}
+function Get-NetTCPConnection {
+ [pscustomobject]@{LocalPort=9010;LocalAddress='127.0.0.1';OwningProcess=20}
+ if($script:mode -eq 'cdp-busy'){[pscustomobject]@{LocalPort=9111;LocalAddress='127.0.0.1';OwningProcess=99}}
+}
+function Invoke-RestMethod {$script:stopped=$true}
+foreach($script:mode in @('exact','record-live','cdp-busy')){
+ $script:stopped=$false
+ try {Stop-Recovery;if($script:mode -ne 'exact' -or -not $script:stopped){throw 'Unexpected shutdown result'}}
+ catch {if($script:mode -eq 'exact' -or $script:stopped -or $_.Exception.Message -notmatch 'preserve recovery server'){throw}}
+}
+exit 0
+'''.replace('__ROOT__',str(root))
+        result=subprocess.run(['powershell.exe','-NoProfile','-Command',code],capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
 
 
 @unittest.skipUnless(sys.platform == 'win32', 'Windows launcher')

@@ -30,6 +30,9 @@ function Stop-Recovery {
     $server=Get-OwnedServer
     if(-not $server){return}
     if(@(Get-Browser).Count){throw 'Browser is still running; preserve its recovery server'}
+    $record=Get-Content -Encoding UTF8 -LiteralPath $recordPath -Raw | ConvertFrom-Json
+    if(Get-CimInstance Win32_Process -Filter "ProcessId=$($record.browser.ProcessId)"){throw 'Recorded browser PID is still present; preserve recovery server'}
+    if(@(Get-NetTCPConnection -State Listen | Where-Object {$_.LocalPort -eq $cdpPort}).Count){throw 'CDP endpoint is still occupied; preserve recovery server'}
     $listeners=@(Get-NetTCPConnection -State Listen | Where-Object {$_.LocalPort -eq $proxyPort -and $_.OwningProcess -eq $server.ProcessId -and $_.LocalAddress -eq '127.0.0.1'})
     if($listeners.Count -ne 1){throw 'Recorded recovery server does not own the shutdown endpoint'}
     Invoke-RestMethod -Uri "http://127.0.0.1:$proxyPort/system/shutdown" -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 3 | Out-Null
@@ -37,6 +40,25 @@ function Stop-Recovery {
     while(Get-OwnedServer){
         if([DateTime]::UtcNow -gt $deadline){throw 'Recovery server did not stop normally'}
         Start-Sleep -Milliseconds 200
+    }
+}
+function Repair-RecoveryBrowserRecord {
+    # Same mutex as start-neo (reentrant in its PowerShell worker). A direct
+    # ensure invocation must not race the record writer of a competing launch.
+    $mutex=[Threading.Mutex]::new($false,('Local\NeoAgent.' + $plan.installation_id))
+    $locked=$false
+    try {
+        try {$locked=$mutex.WaitOne(15000)} catch [Threading.AbandonedMutexException] {$locked=$true}
+        if(-not $locked){throw 'Dedicated neo launcher is already busy; preserve identity record'}
+        $OutputEncoding=[Text.UTF8Encoding]::new($false)
+        $json=$plan | ConvertTo-Json -Depth 12 -Compress
+        $raw=$json | & $plan.python_executable -B -X utf8 (Join-Path $PSScriptRoot 'neo_endpoint_identity.py') --endpoint $plan.mcp_endpoint --rebind-browser
+        $exitCode=$LASTEXITCODE
+        $result=($raw -join "`n") | ConvertFrom-Json
+        if($exitCode -ne 0 -or $result.rebound -isnot [bool]){throw "Recovery browser record was preserved: $($result.reason)"}
+    } finally {
+        if($locked){$mutex.ReleaseMutex()}
+        $mutex.Dispose()
     }
 }
 function Stop-OrphanedManagedServer {
@@ -94,6 +116,11 @@ if($Check){
 }
 if($browser.Count -ne 1){throw 'Exactly one dedicated browser is required for live MCP recovery'}
 if(Test-McpReady){[pscustomobject]@{mcpReady=$true;recoveryServerPids=@($owned.ProcessId);recovered=$false};return}
+if($plan.runtime_mode -eq 'DIRECT_LOOPBACK' -and $owned){
+    Repair-RecoveryBrowserRecord
+    # Only readiness is repeated; no website action is replayed.
+    if(Test-McpReady){[pscustomobject]@{mcpReady=$true;recoveryServerPids=@($owned.ProcessId);recovered=$true};return}
+}
 # Cold startup is asynchronous. Do not interpret its temporary empty process
 # list or locked profile as a stopped manager, and do not launch a competitor.
 if($WaitForManagedStartup -and $plan.runtime_mode -ne 'DIRECT_LOOPBACK'){

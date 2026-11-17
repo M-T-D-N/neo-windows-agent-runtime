@@ -6,6 +6,38 @@ server 0.0.65**, not a claim to support the latest upstream version. DOT review 
 required before the first public upload. Current-PC isolated tests and other-PC
 tests are reported separately; the latter are deferred by the owner.
 
+## v0.1.4: identity records after a browser-only restart
+
+Equivalent absolute config paths use normalized comparison; relative config
+arguments, other files and additional arguments remain rejected. The launcher
+recognizes both `--user-data-dir="path with spaces"` and
+`"--user-data-dir=path with spaces"`, so it reuses the same dedicated browser.
+Exactly one profile switch is required, including when duplicate values are
+identical; conflicting or repeated profile switches never qualify a bootstrap.
+Process command lines use Windows `CommandLineToArgvW` via in-memory P/Invoke
+(no compiler files). Profile-switch aliases using `-`, `/` or different casing
+are counted together with `--`; only one canonical `--user-data-dir=value`
+qualifies. The endpoint guard, rebind and managed fallback share this rule.
+Automatic ownership accepts the dedicated launcher's unambiguous argument form:
+argv[0] is the program, profile paths must be absolute, and edge whitespace or
+control/format characters, empty arguments, `--` and `--single-argument` modes
+are left unqualified. An unqualified root of this installation blocks startup
+and shutdown instead of being treated as browser absence. A live recorded
+browser PID or any occupied CDP endpoint also preserves its recovery server.
+
+When the recorded browser has ended but its exact server survives, an explicit
+launcher invocation can refresh only the browser PID/time record. It requires a
+unique replacement using the dedicated executable/profile, the same Windows user
+and desktop session, exclusive ownership of the configured loopback CDP port,
+the exact recorded server/config/binary/listener and an unchanged final snapshot.
+A live or reused old PID, competing profile or unknown owner preserves the record.
+Read-only endpoint checks never repair state or start a browser. Normal server
+startup still uses its existing bounded readiness wait. No website action is
+replayed. Browser/server/dependency pins are unchanged.
+
+This is qualified on an isolated installation on the maintainer's current Windows
+PC, including a Unicode path with spaces; other-PC testing remains deferred.
+
 ## v0.1.3: AGY finish inspection after an administrator reset
 
 The independent CLI finish observer now locally binds the actual task before its

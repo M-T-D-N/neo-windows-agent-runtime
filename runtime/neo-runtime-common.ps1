@@ -1,11 +1,65 @@
 # Definitions only. Dot-sourcing must not inspect, start or modify the runtime.
+function Get-NeoCommandLineArguments {
+    param([string]$CommandLine)
+    if(-not ('WorkspaceNeo.NativeArguments' -as [type])){
+        # In-memory P/Invoke, with no Add-Type compiler/temp files. Use Windows'
+        # own quote/backslash rules instead of inspecting raw command-line text.
+        $assembly=[Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly([Reflection.AssemblyName]::new('WorkspaceNeo.Arguments'),[Reflection.Emit.AssemblyBuilderAccess]::Run)
+        $module=$assembly.DefineDynamicModule('Native')
+        $type=$module.DefineType('WorkspaceNeo.NativeArguments',[Reflection.TypeAttributes]'Public,Sealed,Abstract')
+        $method=$type.DefinePInvokeMethod('CommandLineToArgvW','shell32.dll',[Reflection.MethodAttributes]'Public,Static,PinvokeImpl',[Reflection.CallingConventions]::Standard,[IntPtr],@([string],[int].MakeByRefType()),[Runtime.InteropServices.CallingConvention]::Winapi,[Runtime.InteropServices.CharSet]::Unicode)
+        $method.SetImplementationFlags([Reflection.MethodImplAttributes]::PreserveSig)
+        $method=$type.DefinePInvokeMethod('LocalFree','kernel32.dll',[Reflection.MethodAttributes]'Public,Static,PinvokeImpl',[Reflection.CallingConventions]::Standard,[IntPtr],@([IntPtr]),[Runtime.InteropServices.CallingConvention]::Winapi,[Runtime.InteropServices.CharSet]::Unicode)
+        $method.SetImplementationFlags([Reflection.MethodImplAttributes]::PreserveSig)
+        [void]$type.CreateType()
+    }
+    $count=0
+    $memory=[WorkspaceNeo.NativeArguments]::CommandLineToArgvW($CommandLine,[ref]$count)
+    if($memory -eq [IntPtr]::Zero){throw 'Unable to parse native process arguments'}
+    try {
+        for($i=0;$i -lt $count;$i++){
+            [Runtime.InteropServices.Marshal]::PtrToStringUni([Runtime.InteropServices.Marshal]::ReadIntPtr($memory,$i*[IntPtr]::Size))
+        }
+    } finally {[void][WorkspaceNeo.NativeArguments]::LocalFree($memory)}
+}
+function Test-NeoStableArgument {
+    param([string]$Value)
+    if([string]::IsNullOrEmpty($Value)){return $false}
+    $end=$Value.Length-1
+    if($end -gt 0 -and [char]::IsLowSurrogate($Value[$end]) -and [char]::IsHighSurrogate($Value[$end-1])){$end--}
+    foreach($index in @(0,$end)){
+        if([char]::IsWhiteSpace($Value,$index) -or
+            [Globalization.CharUnicodeInfo]::GetUnicodeCategory($Value,$index).ToString() -match 'Separator$|^(Control|Format|Surrogate|PrivateUse|OtherNotAssigned)$'){return $false}
+    }
+    return $true
+}
 function Get-NeoDedicatedBrowser {
     param([string]$Executable,[string]$Profile)
-    @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object {
-        $_.ExecutablePath -eq $Executable -and $_.CommandLine -and
-        $_.CommandLine -match ('(?:^|\s)--user-data-dir=(?:"'+[regex]::Escape($Profile)+'"|'+[regex]::Escape($Profile)+'(?=\s|$))') -and
-        $_.CommandLine -notlike '*--type=*'
-    })
+    $found=@()
+    $unknown='Unqualified Neo browser root is already running; preserve existing processes'
+    foreach($process in @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'")){
+        if($process.ExecutablePath -ne $Executable){continue}
+        $raw=$process.CommandLine
+        # Only the raw boundary check tolerates trailing delimiters. Parse the
+        # original string, so an unmatched quote cannot hide argument whitespace.
+        $rawEdges=$raw
+        if($raw){$rawEdges=$raw.TrimEnd([char[]]" `t")}
+        if(-not(Test-NeoStableArgument $rawEdges)){throw $unknown}
+        $arguments=@(Get-NeoCommandLineArguments $raw)
+        if(@($arguments | Where-Object {-not(Test-NeoStableArgument $_)}).Count){throw $unknown}
+        $arguments=@($arguments | Select-Object -Skip 1)
+        if(@($arguments | Where-Object {$_ -eq '--' -or $_ -match '^(?:--|-|/)single-argument(?:=|$)'}).Count){throw $unknown}
+        $profiles=@($arguments | Where-Object {$_ -match '^(?:--|-|/)user-data-dir(?:=|$)'})
+        $types=@($arguments | Where-Object {$_ -match '^(?:--|-|/)type(?:=|$)'})
+        if($types.Count -eq 1 -and $types[0].StartsWith('--type=',[StringComparison]::Ordinal) -and $types[0].Length -gt 7){continue}
+        # Count every recognized alias/casing; only our canonical one-switch
+        # spelling qualifies. Noncanonical input is preserved, never adopted.
+        if($types.Count -or $profiles.Count -ne 1 -or -not $profiles[0].StartsWith('--user-data-dir=',[StringComparison]::Ordinal)){throw $unknown}
+        $value=$profiles[0].Substring(16).Replace('/','\')
+        if($value -notmatch '^(?:[A-Za-z]:\\|\\\\[^\\]+\\[^\\]+)' -or [IO.Path]::GetFullPath($value) -ne [IO.Path]::GetFullPath($Profile.Replace('/','\'))){throw $unknown}
+        $found+=$process
+    }
+    $found
 }
 function Test-NeoPublisherSignature {
     param($Signature,[string]$Publisher)

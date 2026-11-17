@@ -5,12 +5,57 @@ This never starts a process, changes ports/configuration, or retries a tool call
 import hashlib
 import json
 import os
+import ntpath
+import re
+import unicodedata
 from pathlib import Path
 from urllib.parse import urlsplit
 
 
 def _path(value):
-    return os.path.normcase(os.path.abspath(value))
+    return ntpath.normcase(ntpath.abspath(value))
+
+
+def absolute_path(value):
+    # On Windows these predicates coincide. Native absolute fixture paths also
+    # permit read-only pure-function review on a non-Windows host.
+    return ntpath.isabs(value) or os.path.isabs(value)
+
+
+def _browser_arguments(command):
+    # This is an ownership qualification contract, not a general Chromium CLI
+    # emulator. Our launcher never emits normalization-dependent argument edges,
+    # switch terminators or the raw-string single-argument mode. Preserve them
+    # as unknown rather than interpreting a profile differently from Chromium.
+    if not command or any(not isinstance(arg,str) or not arg or any(
+            ch.isspace() or unicodedata.category(ch)[0] in 'CZ' for ch in (arg[0],arg[-1])) for arg in command):
+        return None
+    arguments=command[1:]  # argv[0] is the program, never a profile switch.
+    if any(arg == '--' or re.match(r'^(?:--|-|/)single-argument(?:=|$)',arg,re.I) for arg in arguments):
+        return None
+    return arguments
+
+
+def browser_profile(command):
+    """Reject duplicate/alias Chromium profile switches, including on Windows.
+
+    The dedicated launcher emits exactly one canonical --user-data-dir=value.
+    Count other Chromium prefixes and casing too, rather than silently ignoring
+    a later alias that can change the effective profile. Inputs are OS argv.
+    """
+    arguments=_browser_arguments(command)
+    if arguments is None:
+        return None
+    values=[arg for arg in arguments if re.match(r'^(?:--|-|/)user-data-dir(?:=|$)',arg,re.I)]
+    if len(values) != 1 or not values[0].startswith('--user-data-dir='):
+        return None
+    value=values[0].split('=',1)[1]
+    return value if absolute_path(value) else None
+
+
+def browser_has_type(command):
+    arguments=_browser_arguments(command)
+    return arguments is None or any(re.match(r'^(?:--|-|/)type(?:=|$)',arg,re.I) for arg in arguments)
 
 
 def _option(command, name):
@@ -34,9 +79,9 @@ def select_backend(plan, processes, listeners, read_config, digest):
     browser_exe = _path(Path(plan['proposed_runtime_root']) / 'Chrome-bin/chrome.exe')
     profile = _path(plan['profile_root'])
     browsers = [p for p in processes if p.get('exe') and _path(p['exe']) == browser_exe
-                and _option(p['cmdline'], '--user-data-dir')
-                and _path(_option(p['cmdline'], '--user-data-dir')) == profile
-                and not any(arg.startswith('--type=') for arg in p['cmdline'])]
+                and browser_profile(p['cmdline'])
+                and _path(browser_profile(p['cmdline'])) == profile
+                and not browser_has_type(p['cmdline'])]
     if len(browsers) != 1:
         return None
     browser = browsers[0]

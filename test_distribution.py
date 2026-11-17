@@ -18,6 +18,27 @@ import httpx
 ROOT=Path(__file__).resolve().parent
 
 
+def unqualified_browser_commands(command,profile):
+    # Counterexamples from Chromium's post-argv semantics, plus conservative
+    # canonical-input boundaries. Fixtures have their profile at argv[2].
+    return {
+        'terminator-before':command[:2]+['--']+command[2:],
+        'terminator-after':command+['--'],
+        'spaced-profile':command+[' --user-data-dir='+profile+'-other '],
+        'spaced-type':command+[' --type=renderer '],
+        'single-before':command[:2]+['--single-argument']+command[2:],
+        'single-after':command+['--single-argument'],
+        'single-alias':command[:2]+['/SINGLE-ARGUMENT=value']+command[2:],
+        'program-only-profile':[command[2]]+command[1:2]+command[3:],
+        'empty-program':['']+command[1:],
+        'relative-profile':command[:2]+['--user-data-dir='+os.path.relpath(profile)]+command[3:],
+        'unicode-space-profile':command+['\u00a0--user-data-dir='+profile+'-other\u00a0'],
+        'format-profile':command+['\ufeff--user-data-dir='+profile+'-other\ufeff'],
+        'profile-value-space':command[:2]+[command[2]+' ']+command[3:],
+        'profile-value-tab':command[:2]+[command[2]+'\t']+command[3:],
+    }
+
+
 def load(name, filename):
     spec=importlib.util.spec_from_file_location(name,ROOT/filename)
     module=importlib.util.module_from_spec(spec)
@@ -100,11 +121,65 @@ class EndpointIdentityTests(unittest.TestCase):
             [('127.0.0.1',19010,20)] if listeners is None else listeners,self.config,'fixture-hash')
 
     def test_exact_installation_identity(self):self.validate()
+    def test_supplementary_symbol_in_other_argument_is_not_control(self):
+        self.browser['cmdline'].append('--app='+chr(0x1F642))
+        self.assertIs(self.validate(),True)
+    def test_equivalent_config_path_spelling_is_accepted(self):
+        value=self.server['cmdline'][1].split('=',1)[1]
+        for spelling in (value.upper(),value.replace('\\','/')):
+            with self.subTest(spelling=spelling):
+                self.server['cmdline'][1]='--config='+spelling
+                self.assertIs(self.validate(),True)
+
+    def test_different_or_additional_config_is_rejected(self):
+        command=list(self.server['cmdline'])
+        for args in ([command[0],command[1]+'-other'],command+[command[1]],
+                     [command[0],'--untrusted='+command[1].split('=',1)[1]]):
+            with self.subTest(args=args),self.assertRaises(ValueError):
+                self.server['cmdline']=args
+                self.validate()
+
+    def test_relative_config_does_not_borrow_identity_helper_cwd(self):
+        prior=Path.cwd()
+        with tempfile.TemporaryDirectory(dir=os.environ['WEB_AUTOMATION_TEST_ROOT']) as folder:
+            self.plan['server_state_root']=folder
+            self.server['cmdline'][1]='--config=recovery-server-config.json'
+            try:
+                os.chdir(folder)
+                self.assertEqual(self.identity.path('recovery-server-config.json'),self.identity.path(Path(folder)/'recovery-server-config.json'))
+                with self.assertRaises(ValueError):self.validate()
+            finally:os.chdir(prior)
     def test_foreign_listener_is_rejected(self):
         with self.assertRaises(ValueError):self.validate([('127.0.0.1',19010,99)])
     def test_other_profile_is_rejected(self):
         self.browser['cmdline'][-1]+='-other'
         with self.assertRaises(ValueError):self.validate()
+
+    def test_duplicate_profile_arguments_are_rejected_in_both_orders(self):
+        original=list(self.browser['cmdline'])
+        duplicate='--user-data-dir='+self.plan['profile_root']+'-other'
+        for args in (original+[duplicate],original[:2]+[duplicate]+original[2:],
+                     original+[original[-1]],original+['--user-data-dir']):
+            with self.subTest(args=args),self.assertRaises(ValueError):
+                self.browser['cmdline']=args
+                self.validate()
+
+    def test_all_profile_aliases_and_casings_are_counted(self):
+        original=list(self.browser['cmdline'])
+        for prefix in ('-user-data-dir=','/user-data-dir=','--USER-DATA-DIR=','-USER-DATA-DIR=','/USER-DATA-DIR='):
+            for suffix in ('','-other'):
+                alias=prefix+self.plan['profile_root']+suffix
+                for args in (original+[alias],original[:2]+[alias]+original[2:],original[:2]+[alias]):
+                    with self.subTest(prefix=prefix,suffix=suffix,args=args),self.assertRaises(ValueError):
+                        self.browser['cmdline']=args
+                        self.validate()
+
+    def test_ambiguous_chromium_modes_never_qualify_browser_identity(self):
+        original=list(self.browser['cmdline'])
+        for label,args in unqualified_browser_commands(original,self.plan['profile_root']).items():
+            with self.subTest(label=label),self.assertRaises(ValueError):
+                self.browser['cmdline']=args
+                self.validate()
 
     def test_reused_server_pid_is_rejected(self):
         self.server['create_time']+=1
@@ -117,6 +192,126 @@ class EndpointIdentityTests(unittest.TestCase):
     def test_stopped_browser_does_not_excuse_foreign_listener(self):
         self.browser=None
         with self.assertRaises(ValueError):self.validate([('127.0.0.1',19010,99)])
+
+
+class BrowserRecordRepairTests(unittest.TestCase):
+    """Real atomic record writes; OS observations are substituted, never live PCs."""
+    def setUp(self):
+        EndpointIdentityTests.setUp(self)
+        import copy
+        from types import SimpleNamespace
+        self.SimpleNamespace=SimpleNamespace
+        self.temp=tempfile.TemporaryDirectory(dir=os.environ['WEB_AUTOMATION_TEST_ROOT'])
+        self.addCleanup(self.temp.cleanup)
+        state=Path(self.temp.name)
+        self.plan.update(runtime_mode='DIRECT_LOOPBACK',server_state_root=str(state))
+        self.exe=state/'server.exe';self.exe.write_bytes(b'fictional executable, never launched')
+        self.plan['server_override']['executable']=str(self.exe)
+        self.plan['server_override']['sha256']=hashlib.sha256(self.exe.read_bytes()).hexdigest()
+        self.server.update(exe=str(self.exe),cmdline=[str(self.exe),'--config='+str(state/'recovery-server-config.json')])
+        self.replacement=copy.deepcopy(self.browser)
+        self.browser['ppid']=7
+        self.replacement.update(pid=11,ppid=7,create_time=self.browser['create_time']+60)
+        self.replacement['cmdline'].append('--browseros-cdp-port=19111')
+        self.server['ppid']=5
+        self.record_path=state/'recovery-server-process.json'
+        self.config_path=state/'recovery-server-config.json'
+        self.save()
+        self.rows=[self.replacement]
+        self.old_present=False
+        self.username='fixture-user'
+        self.current_session=1
+        self.change=None
+        self.connection_rows=[('127.0.0.1',19010,20),('127.0.0.1',19111,11)]
+
+    def save(self):
+        self.record_path.write_text(json.dumps(self.record),encoding='utf-8')
+        self.config_path.write_text(json.dumps(self.config),encoding='utf-8')
+
+    def repair(self):
+        import contextlib,copy
+        owner=self
+        class Process:
+            def __init__(self,pid=99):self.pid=pid
+            def as_dict(self,attrs):
+                row=owner.server if self.pid==20 else owner.browser if self.pid==10 else owner.replacement
+                if owner.change and self.pid==11:
+                    owner.change()
+                return {key:copy.deepcopy(row[key]) for key in attrs}
+            def username(self):return owner.username if self.pid==11 else 'fixture-user'
+        processes=[self.SimpleNamespace(info={'name':'chrome.exe'},as_dict=lambda attrs,row=row:copy.deepcopy(row)) for row in self.rows]
+        connections=[self.SimpleNamespace(status='LISTEN',laddr=self.SimpleNamespace(ip=ip,port=port),pid=pid) for ip,port,pid in self.connection_rows]
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(self.identity.psutil,'Process',Process))
+            stack.enter_context(patch.object(self.identity.psutil,'pid_exists',lambda pid:self.old_present))
+            stack.enter_context(patch.object(self.identity.psutil,'process_iter',lambda attrs:processes))
+            stack.enter_context(patch.object(self.identity.psutil,'net_connections',lambda **kw:connections))
+            stack.enter_context(patch.object(self.identity,'session_id',lambda pid:self.current_session if pid==11 else 1))
+            return self.identity.rebind_browser(self.plan)
+
+    def test_exact_restarted_browser_updates_only_browser_record(self):
+        self.assertTrue(self.repair())
+        changed=json.loads(self.record_path.read_text(encoding='utf-8'))
+        self.assertEqual(changed['server'],self.record['server'])
+        self.assertEqual(changed['browser']['ProcessId'],11)
+        self.assertTrue(self.identity.created(self.replacement,changed['browser']['CreationDateUtc']))
+
+    def test_live_record_is_not_rewritten_during_readiness_wait(self):
+        self.old_present=True
+        before=self.record_path.read_bytes()
+        self.assertIs(self.repair(),False)
+        self.assertEqual(self.record_path.read_bytes(),before)
+
+    def test_starting_server_without_listener_keeps_bounded_readiness_wait(self):
+        self.old_present=True
+        self.connection_rows=[]
+        before=self.record_path.read_bytes()
+        self.assertIs(self.repair(),False)
+        self.assertEqual(self.record_path.read_bytes(),before)
+
+    def test_uncertain_replacements_preserve_original_record(self):
+        import copy
+        original=copy.deepcopy(self.replacement)
+        cases=('foreign-mcp','foreign-cdp','server-pid-reuse','browser-pid-reuse','other-user',
+               'other-session','other-profile','ambiguous','duplicate-profile','config-changed')
+        for case in cases:
+            with self.subTest(case=case):
+                self.setUp()
+                before=self.record_path.read_bytes()
+                if case=='foreign-mcp':self.connection_rows[0]=('127.0.0.1',19010,88)
+                if case=='foreign-cdp':self.connection_rows[1]=('127.0.0.1',19111,88)
+                if case=='server-pid-reuse':self.server['create_time']+=1
+                if case=='browser-pid-reuse':self.old_present=True;self.browser['create_time']+=1
+                if case=='other-user':self.username='another-user'
+                if case=='other-session':self.current_session=2
+                if case=='other-profile':self.replacement['cmdline'][2]+='-other'
+                if case=='ambiguous':self.rows.append(copy.deepcopy(original))
+                if case=='duplicate-profile':self.replacement['cmdline'].append(self.replacement['cmdline'][2])
+                if case=='config-changed':self.change=lambda:self.config_path.write_text('{}',encoding='utf-8')
+                with self.assertRaises(ValueError):self.repair()
+                self.assertEqual(self.record_path.read_bytes(),before)
+
+    def test_alias_duplicates_never_rebind_or_write_record(self):
+        for prefix in ('-user-data-dir=','/user-data-dir=','--USER-DATA-DIR=','-USER-DATA-DIR=','/USER-DATA-DIR='):
+            for suffix in ('','-other'):
+                for first in (True,False):
+                    with self.subTest(prefix=prefix,suffix=suffix,first=first):
+                        self.setUp()
+                        alias=prefix+self.plan['profile_root']+suffix
+                        self.replacement['cmdline'].insert(1 if first else len(self.replacement['cmdline']),alias)
+                        before=self.record_path.read_bytes()
+                        with self.assertRaises(ValueError):self.repair()
+                        self.assertEqual(self.record_path.read_bytes(),before)
+
+    def test_ambiguous_modes_never_rebind_or_write_record(self):
+        cases=unqualified_browser_commands(list(self.replacement['cmdline']),self.plan['profile_root'])
+        for label in cases:
+            with self.subTest(label=label):
+                self.setUp()
+                self.replacement['cmdline']=unqualified_browser_commands(list(self.replacement['cmdline']),self.plan['profile_root'])[label]
+                before=self.record_path.read_bytes()
+                with self.assertRaises(ValueError):self.repair()
+                self.assertEqual(self.record_path.read_bytes(),before)
 
 
 class EgressTests(unittest.IsolatedAsyncioTestCase):

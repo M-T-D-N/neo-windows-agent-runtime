@@ -31,6 +31,19 @@ class ManagedTransportTests(unittest.TestCase):
         renderer=dict(browser,pid=11,ppid=10,cmdline=None)
         self.assertIsNotNone(select([browser,server,renderer],[listener]))
         self.assertIsNone(select([browser,server,dict(renderer,ppid=1)],[listener]))
+        for prefix in ('-user-data-dir=','/user-data-dir=','--USER-DATA-DIR=','-USER-DATA-DIR=','/USER-DATA-DIR='):
+            for suffix in ('','-other'):
+                alias=prefix+'D:/test/profile'+suffix
+                for command in (browser['cmdline']+[alias],browser['cmdline'][:1]+[alias]+browser['cmdline'][1:]):
+                    with self.subTest(command=command):
+                        self.assertIsNone(select([dict(browser,cmdline=command),server],[listener]))
+        for flag in ('-type=renderer','/type=renderer','--TYPE=renderer'):
+            self.assertIsNone(select([dict(browser,cmdline=browser['cmdline']+[flag]),server],[listener]))
+        command=browser['cmdline']
+        for args in (command[:1]+['--']+command[1:],command+[' --user-data-dir=D:/other '],
+                     command+[' --type=renderer '],command[:1]+['--single-argument']+command[1:],
+                     command[:1]+['/SINGLE-ARGUMENT=value']+command[1:],[command[1]]+command[2:]):
+            with self.subTest(args=args):self.assertIsNone(select([dict(browser,cmdline=args),server],[listener]))
 
 
 class BridgeFallbackTests(unittest.IsolatedAsyncioTestCase):
