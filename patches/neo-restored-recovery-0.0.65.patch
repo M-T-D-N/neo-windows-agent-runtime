@@ -1,0 +1,890 @@
+--- a/apps/claw-server-rust/src/db/session_tabs.rs
++++ b/apps/claw-server-rust/src/db/session_tabs.rs
+@@ -133,6 +133,38 @@
+         Ok(true)
+     }
+ 
++    pub async fn normal_owner_for_tabs(&self, prior_session: &str, tabs: &[(i64,String)])
++        -> AppResult<Option<(String,String)>> {
++        self.drain_writes().await;
++        closed_owner_in(self.db.connection(),prior_session,tabs,true).await
++    }
++
++    /// Restored tabs are new physical incarnations. Revalidate the old complete
++    /// final claim batch and reject any prior claim on a current target.
++    pub async fn record_restored_recovery(&self, prior_session: &str, current_session: &str,
++        current_owner: &str, old_owner: &str, client: &str,
++        prior_tabs: &[(i64,String)], current_tabs: &[(i64,String)]) -> AppResult<bool> {
++        let txn=self.db.connection().begin().await?;
++        if closed_owner_in(&txn,prior_session,prior_tabs,true).await?
++            != Some((old_owner.to_owned(),client.to_owned())) {return Ok(false)}
++        for (tab,target) in current_tabs {
++            if SessionTabs::find().filter(session_tabs::Column::OpenedTargetId.eq(target.clone()))
++                .one(&txn).await?.is_some() {return Ok(false)}
++            if SessionTabs::find().filter(session_tabs::Column::TabId.eq(*tab))
++                .order_by_desc(session_tabs::Column::Id).one(&txn).await?
++                .is_some_and(|r|r.released_at.is_none()) {return Ok(false)}
++        }
++        let claimed=now_epoch_ms();
++        for (tab,target) in current_tabs {
++            SessionTabs::insert(session_tabs::ActiveModel {
++                id:NotSet,session_id:Set(current_session.to_owned()),agent_id:Set(current_owner.to_owned()),
++                tab_id:Set(*tab),opened_target_id:Set(Some(target.clone())),claimed_at:Set(claimed),released_at:Set(None),
++            }).exec(&txn).await?;
++        }
++        txn.commit().await?;
++        Ok(true)
++    }
++
+     pub fn new(db: Database) -> Self {
+         let (claim_writes, receiver) = mpsc::unbounded_channel();
+         tokio::spawn(run_claim_writes(db.clone(), receiver));
+@@ -143,6 +175,12 @@
+ 
+ async fn idle_owner_in<C:ConnectionTrait>(conn:&C, prior_session:&str,
+     tabs:&[(i64,String)]) -> AppResult<Option<(String,String)>>
++{
++    closed_owner_in(conn,prior_session,tabs,false).await
++}
++
++async fn closed_owner_in<C:ConnectionTrait>(conn:&C, prior_session:&str,
++    tabs:&[(i64,String)], restored:bool) -> AppResult<Option<(String,String)>>
+ {
+         if tabs.is_empty()
+             || tabs.iter().map(|(tab, _)| tab).collect::<std::collections::BTreeSet<_>>().len() != tabs.len()
+@@ -156,10 +194,24 @@
+             .filter(agent_session_ends::Column::SessionId.eq(prior_session))
+             .all(conn).await?;
+         let ([start], [end]) = (starts.as_slice(), ends.as_slice()) else { return Ok(None) };
+-        if end.kind != "closed" || end.reason.as_deref() != Some("idle timeout")
++        let normal_reason=if restored {
++            matches!(end.reason.as_deref(),Some("idle timeout" | "server shutdown"))
++        } else {end.reason.as_deref()==Some("idle timeout")};
++        if end.kind != "closed" || !normal_reason
+             || end.created_at < start.created_at
+         {
+             return Ok(None);
++        }
++        if restored {
++            let rows=SessionTabs::find().filter(session_tabs::Column::SessionId.eq(prior_session))
++                .all(conn).await?;
++            if rows.iter().any(|r|r.released_at.is_none()) {return Ok(None)}
++            let final_release=rows.iter().filter_map(|r|r.released_at).max();
++            let final_targets:std::collections::BTreeSet<_>=rows.iter()
++                .filter(|r|r.released_at==final_release)
++                .map(|r|(r.tab_id,r.opened_target_id.clone())).collect();
++            let requested:std::collections::BTreeSet<_>=tabs.iter().map(|(id,t)|(*id,Some(t.clone()))).collect();
++            if final_release.is_none() || final_targets!=requested {return Ok(None)}
+         }
+         for (tab, target) in tabs {
+             let Some(last) = SessionTabs::find()
+--- a/apps/claw-server-rust/src/services/sessions/manager.rs
++++ b/apps/claw-server-rust/src/services/sessions/manager.rs
+@@ -481,7 +481,7 @@
+           if cancel.is_cancelled() || live.contains_key(&prior_session) || tabs.is_empty() || expected.len() < tabs.len() {
+             return Err("Prior task is active or recovery membership is incomplete".into());
+         }
+-        registry.ownership.reclaim_pages_if_unchanged(current.convo_id(), &expected, &group_ref, async {
++        registry.ownership.reclaim_pages_if_unchanged(current.convo_id(), &expected, &group_ref, false, async {
+             let (owner, client) = registry.session_tabs.idle_owner_for_tabs(prior_session.as_str(), &tabs)
+                 .await.map_err(|e| e.to_string())?.ok_or("No exact idle-expired task claim proof")?;
+             let owner = ConvoId::new(owner);
+@@ -500,6 +500,44 @@
+             Ok(())
+         }).await?;
+         Ok(())
++        }).await.map_err(|e|e.to_string())?
++    }
++
++    /// Explicitly selected restoration after the original physical group vanished.
++    /// The operator separately verifies normal browser shutdown/restoration; the
++    /// server proves session closure, complete prior claims and current admission.
++    pub async fn reclaim_restored_pages<F>(
++        self: &Arc<Self>, prior_session:&SessionId,current_session:&SessionId,
++        expected:&[(browseros_core::PageId,Option<ConvoId>)],
++        prior_tabs:&[(i64,String)],current_tabs:&[(i64,String)],group_ref:String,
++        cancel:CancellationToken,validate_physical:F,
++    ) -> Result<(),String>
++    where F:Future<Output=Result<(),String>>+Send+'static {
++        let registry=self.clone();let prior_session=prior_session.clone();
++        let current_session=current_session.clone();let expected=expected.to_vec();
++        let prior_tabs=prior_tabs.to_vec();let current_tabs=current_tabs.to_vec();
++        tokio::spawn(async move {
++            let live=registry.sessions.read().await;
++            let current=live.get(&current_session).ok_or("Recovery caller is not active")?;
++            if cancel.is_cancelled() || live.contains_key(&prior_session) || current_tabs.is_empty()
++                || expected.len()<current_tabs.len() || expected.iter().any(|(_,owner)|owner.is_some()) {
++                return Err("Restored targets are active, claimed or incomplete".into());
++            }
++            registry.ownership.reclaim_pages_if_unchanged(current.convo_id(),&expected,&group_ref,true,async {
++                let (owner,client)=registry.session_tabs.normal_owner_for_tabs(prior_session.as_str(),&prior_tabs)
++                    .await.map_err(|e|e.to_string())?.ok_or("No complete normally closed original task proof")?;
++                let owner=ConvoId::new(owner);
++                if current.client_name()!=client || live.values().any(|s|s.convo_id()==&owner) {
++                    return Err("Original owner is active or from another client".into());
++                }
++                validate_physical.await?;
++                if cancel.is_cancelled() {return Err("Recovery cancelled before commit".into())}
++                if !registry.session_tabs.record_restored_recovery(prior_session.as_str(),current_session.as_str(),
++                    current.convo_id().as_str(),owner.as_str(),&client,&prior_tabs,&current_tabs)
++                    .await.map_err(|e|e.to_string())? {return Err("Restored claim changed before commit".into())}
++                Ok(())
++            }).await?;
++            Ok(())
+         }).await.map_err(|e|e.to_string())?
+     }
+ 
+--- a/apps/claw-server-rust/src/services/sessions/tab_ownership.rs
++++ b/apps/claw-server-rust/src/services/sessions/tab_ownership.rs
+@@ -165,12 +165,14 @@
+         owner: &ConvoId,
+         expected: &[(PageId, Option<ConvoId>)],
+         group_ref: &str,
++        require_empty_owner: bool,
+         validate: F,
+     ) -> Result<(), String>
+     where F: std::future::Future<Output = Result<(), String>>,
+     {
+         let mut inner = self.inner.write().await;
+         if expected.is_empty()
++              || (require_empty_owner && inner.convos.get(owner).is_some_and(|convo|!convo.pages.is_empty()))
+             || expected.iter().map(|(page, _)| page).collect::<BTreeSet<_>>().len() != expected.len()
+             || expected.iter().any(|(page, prior)| inner.page_owners.get(page) != prior.as_ref())
+         {
+--- a/apps/claw-server-rust/src/api/mcp/effects/expired_recovery.rs
++++ b/apps/claw-server-rust/src/api/mcp/effects/expired_recovery.rs
+@@ -16,6 +16,85 @@
+     #[serde(rename = "priorSession")]
+     prior_session: String,
+     expected: Vec<browseros_mcp::tools::tabs::RecoveryTarget>,
++    #[serde(default, rename = "priorGroupId")]
++    prior_group_id: Option<String>,
++    #[serde(default)]
++    prior: Option<Vec<browseros_mcp::tools::tabs::PriorRecoveryTab>>,
++}
++
++async fn original_absent(
++    browser: &BrowserSession,
++    prior_group: &str,
++    current_group: &str,
++    prior: &BTreeSet<String>,
++) -> Result<(), String> {
++    let pages = browser.pages.list().await.map_err(|e| e.to_string())?;
++    if pages.iter().any(|p| {
++        prior.contains(p.target_id.as_str())
++            || (prior_group != current_group && p.group_id.as_deref() == Some(prior_group))
++    }) {
++        return Err("Original physical targets or a separate original group still exist".into());
++    }
++    let native = browser
++        .cdp("Target.getTargets", json!({}), None)
++        .await
++        .map_err(|e| e.to_string())?;
++    let targets = native
++        .get("targetInfos")
++        .and_then(Value::as_array)
++        .ok_or("Complete native target inventory unavailable")?;
++    if targets.iter().any(|p| {
++        p.get("targetId")
++            .and_then(Value::as_str)
++            .is_none_or(|id| id.is_empty())
++    }) {
++        return Err("Native target inventory is incomplete".into());
++    }
++    let native_ids: BTreeSet<_> = targets
++        .iter()
++        .filter_map(|p| p.get("targetId").and_then(Value::as_str))
++        .collect();
++    if native_ids.len() != targets.len()
++        || pages
++            .iter()
++            .any(|p| !native_ids.contains(p.target_id.as_str()))
++    {
++        return Err("Native target inventory is inconsistent".into());
++    }
++    if targets.iter().any(|p| {
++        p.get("targetId")
++            .and_then(Value::as_str)
++            .is_some_and(|id| prior.contains(id))
++    }) {
++        return Err("An original native target still exists".into());
++    }
++    if prior_group != current_group {
++        let native = browser
++            .cdp("Browser.getTabGroups", json!({}), None)
++            .await
++            .map_err(|e| e.to_string())?;
++        let groups = native
++            .get("groups")
++            .and_then(Value::as_array)
++            .ok_or("Native group inventory unavailable")?;
++        if groups.iter().any(|g| {
++            g.get("groupId")
++                .and_then(Value::as_str)
++                .is_none_or(|id| id.is_empty())
++                || g.get("tabIds").and_then(Value::as_array).is_none()
++        }) {
++            return Err("Native group inventory is incomplete".into());
++        }
++        if groups.iter().any(|g| {
++            g.get("groupId").and_then(Value::as_str) == Some(prior_group)
++                && g.get("tabIds")
++                    .and_then(Value::as_array)
++                    .is_none_or(|ids| !ids.is_empty())
++        }) {
++            return Err("Original native group still has members".into());
++        }
++    }
++    Ok(())
+ }
+ 
+ async fn exact_group(
+@@ -87,6 +166,9 @@
+     let [matched] = matched.as_slice() else {
+         return Err("Recovery group is absent or ambiguous".into());
+     };
++    if matched.get("windowId").and_then(Value::as_i64) != Some(window.0) {
++        return Err("Recovery group window changed".into());
++    }
+     let ids = matched
+         .get("tabIds")
+         .and_then(Value::as_array)
+@@ -110,7 +192,8 @@
+     let work = async {
+         let request: Request =
+             serde_json::from_value(call.raw_args.clone()).map_err(|e| e.to_string())?;
+-        if request.action != "reclaim_expired"
++        let restored = request.action == "reclaim_restored";
++        if (!restored && request.action != "reclaim_expired")
+             || request.group_id.is_empty()
+             || request.prior_session.is_empty()
+             || request.expected.is_empty()
+@@ -129,6 +212,45 @@
+         {
+             return Err("Duplicate or empty recovery target identity".into());
+         }
++        let mut prior_tabs = Vec::new();
++        let mut prior_targets = BTreeSet::new();
++        let mut prior_group = String::new();
++        if restored {
++            prior_group = request
++                .prior_group_id
++                .clone()
++                .filter(|g| !g.is_empty())
++                .ok_or("Explicit original group provenance is required")?;
++            let prior = request
++                .prior
++                .as_ref()
++                .filter(|p| !p.is_empty())
++                .ok_or("Complete original physical provenance is required")?;
++            let mut prior_urls = BTreeSet::new();
++            let mut prior_ids = BTreeSet::new();
++            for p in prior {
++                if p.target_id.is_empty()
++                    || p.url.is_empty()
++                    || !prior_targets.insert(p.target_id.clone())
++                    || !prior_ids.insert(p.tab_id)
++                    || !prior_urls.insert(p.url.clone())
++                {
++                    return Err("Original physical provenance is duplicate or ambiguous".into());
++                }
++                prior_tabs.push((p.tab_id, p.target_id.clone()));
++            }
++            let current_urls: BTreeSet<_> = expected.values().cloned().collect();
++            if current_urls.len() != expected.len()
++                || current_urls != prior_urls
++                || expected.keys().any(|id| prior_targets.contains(id))
++            {
++                return Err(
++                    "Restored URLs or original/current incarnation mapping disagree".into(),
++                );
++            }
++        } else if request.prior.is_some() || request.prior_group_id.is_some() {
++            return Err("Restored proof fields require explicit restored recovery".into());
++        }
+         let identity = call
+             .identity
+             .as_ref()
+@@ -139,6 +261,9 @@
+             .group_operation_lock(&identity.ownership_key)
+             .await;
+         let _guard = group_lock.lock().await;
++        if restored {
++            original_absent(browser, &prior_group, &request.group_id, &prior_targets).await?;
++        }
+         let pages = exact_group(browser, &request.group_id, &expected).await?;
+         let mut owners = Vec::new();
+         for page in &pages {
+@@ -166,48 +291,67 @@
+                 )
+             })
+             .collect();
+-        call.state
+-            .sessions
+-            .reclaim_idle_pages(
+-                &SessionId::new(request.prior_session),
+-                &call.session_id,
+-                &owners,
+-                &tabs,
+-                request.group_id.clone(),
+-                call.cancel.clone(),
+-                async move {
+-                    let current = tokio::time::timeout(
+-                        crate::api::mcp::timeouts::TAB_GROUP_OPERATION,
+-                        exact_group(&browser_check, &group_check, &expected),
++        let validate = async move {
++            let current =
++                tokio::time::timeout(crate::api::mcp::timeouts::TAB_GROUP_OPERATION, async {
++                    if restored {
++                        original_absent(&browser_check, &prior_group, &group_check, &prior_targets)
++                            .await?;
++                    }
++                    exact_group(&browser_check, &group_check, &expected).await
++                })
++                .await
++                .map_err(|_| "Recovery physical validation timed out".to_string())??;
++            let fingerprint: BTreeSet<_> = current
++                .iter()
++                .map(|p| {
++                    (
++                        p.page_id.0,
++                        p.tab_id.0,
++                        p.target_id.as_str().to_owned(),
++                        p.url.clone(),
++                        p.group_id.clone(),
++                        p.window_id.clone(),
+                     )
+-                    .await
+-                    .map_err(|_| "Recovery physical validation timed out".to_string())??;
+-                    let fingerprint: BTreeSet<_> = current
+-                        .iter()
+-                        .map(|p| {
+-                            (
+-                                p.page_id.0,
+-                                p.tab_id.0,
+-                                p.target_id.as_str().to_owned(),
+-                                p.url.clone(),
+-                                p.group_id.clone(),
+-                                p.window_id.clone(),
+-                            )
+-                        })
+-                        .collect();
+-                    if fingerprint != original {
+-                        return Err("Recovery physical incarnation changed".into());
+-                    }
+-                    Ok(())
+-                },
+-            )
+-            .await?;
++                })
++                .collect();
++            if fingerprint != original {
++                return Err("Recovery physical incarnation changed".into());
++            }
++            Ok(())
++        };
++        if restored {
++            call.state
++                .sessions
++                .reclaim_restored_pages(
++                    &SessionId::new(request.prior_session),
++                    &call.session_id,
++                    &owners,
++                    &prior_tabs,
++                    &tabs,
++                    request.group_id.clone(),
++                    call.cancel.clone(),
++                    validate,
++                )
++                .await?;
++        } else {
++            call.state
++                .sessions
++                .reclaim_idle_pages(
++                    &SessionId::new(request.prior_session),
++                    &call.session_id,
++                    &owners,
++                    &tabs,
++                    request.group_id.clone(),
++                    call.cancel.clone(),
++                    validate,
++                )
++                .await?;
++        }
+         Ok::<_, String>(ToolResult::text(
+-            "Verified idle-expired task ownership restored without page changes",
+-            Some(
+-                json!({"action":"reclaim_expired","groupId":request.group_id,
+-                "pages":pages.iter().map(|p|p.page_id.0).collect::<Vec<_>>()}),
+-            ),
++            "Verified closed task ownership restored without page changes",
++            Some(json!({"action":request.action,"groupId":request.group_id,
++                "pages":pages.iter().map(|p|p.page_id.0).collect::<Vec<_>>()})),
+         ))
+     };
+     match work.await {
+@@ -235,6 +379,9 @@
+         extra: bool,
+         change_url_after: AtomicUsize,
+         alias_fixture: AtomicBool,
++        restored: AtomicBool,
++        original_still_present: AtomicBool,
++        corrupt_inventory: AtomicUsize,
+     }
+     impl CdpConnection for MetadataBrowser {
+         fn send_raw_json<'a>(
+@@ -269,25 +416,48 @@
+                     .iter()
+                     .filter(|c| *c == "Browser.getTabs")
+                     .count();
++                let restored = self.restored.load(Ordering::SeqCst);
++                let tab = if restored { 202 } else { 101 };
++                let target = if restored {
++                    "restored-target"
++                } else {
++                    "writer-target"
++                };
++                let group = if restored {
++                    "restored-group"
++                } else {
++                    "saved-group"
++                };
+                 match method {
+                     "Browser.createTab" | "Browser.getTabInfo"
+                         if self.alias_fixture.load(Ordering::SeqCst) =>
+                     {
+-                        Ok(json!({"tab":{"tabId":101,"targetId":"writer-target",
++                        Ok(json!({"tab":{"tabId":tab,"targetId":target,
+                         "url":"https://example.com/editor","title":"unfinished editor","isActive":false,
+                         "isLoading":false,"loadProgress":1.0,"isPinned":false,"isHidden":false,"windowId":1,"index":0,
+-                        "groupId":"saved-group"}}))
++                        "groupId":group}}))
+                     }
+-                    "Browser.getTabs" => {
+-                        Ok(json!({"tabs":[{"tabId":101,"targetId":"writer-target",
++                    "Browser.getTabs" => Ok(json!({"tabs":[{"tabId":tab,"targetId":target,
+                         "url":if reads>=self.change_url_after.load(Ordering::SeqCst){"https://example.com/changed"}else{"https://example.com/editor"},"title":"unfinished editor","isActive":false,
+                         "isLoading":false,"loadProgress":1.0,"isPinned":false,"isHidden":false,"windowId":1,"index":0,
+-                        "groupId":"saved-group"}]}))
++                        "groupId":group}]})),
++                    "Browser.getTabGroups" => {
++                        let mut groups = vec![
++                            json!({"groupId":group,"windowId":if self.corrupt_inventory.load(Ordering::SeqCst)==3 {2}else{1},
++                        "tabIds":if self.extra {vec![tab,tab+1]}else{vec![tab]},"title":"task"}),
++                        ];
++                        if self.corrupt_inventory.load(Ordering::SeqCst) == 2 {
++                            groups.push(json!({}));
++                        }
++                        Ok(json!({"groups":groups}))
+                     }
+-                    "Browser.getTabGroups" => {
+-                        Ok(json!({"groups":[{"groupId":"saved-group","windowId":1,
+-                        "tabIds":if self.extra {vec![101,102]}else{vec![101]},"title":"task"}]}))
+-                    }
++                    "Target.getTargets" => Ok(
++                        json!({"targetInfos":if self.corrupt_inventory.load(Ordering::SeqCst)==1 {
++                        vec![json!({"type":"page"})]
++                    } else if self.original_still_present.load(Ordering::SeqCst) {
++                        vec![json!({"targetId":target}),json!({"targetId":"writer-target"})]
++                    } else {vec![json!({"targetId":target})]}}),
++                    ),
+                     _ => Err(CdpError::Protocol {
+                         code: -1,
+                         message: format!("Unexpected page mutation or command: {method}"),
+@@ -319,6 +489,9 @@
+             extra,
+             change_url_after: AtomicUsize::new(usize::MAX),
+             alias_fixture: AtomicBool::new(false),
++            restored: AtomicBool::new(false),
++            original_still_present: AtomicBool::new(false),
++            corrupt_inventory: AtomicUsize::new(0),
+         });
+         let browser = BrowserSession::new(recorder.clone(), BrowserSessionHooks::default());
+         let page = browser.pages.list().await?.remove(0);
+@@ -368,6 +541,326 @@
+         call.raw_args = json!({"action":"reclaim_expired","groupId":"saved-group","priorSession":"prior-task",
+             "expected":[{"targetId":"writer-target","url":"https://example.com/editor"}]});
+         Ok((call, recorder, page.page_id))
++    }
++
++    async fn restored_fixture(
++        kind: &str,
++        reason: Option<&str>,
++        claim: bool,
++        extra: bool,
++    ) -> anyhow::Result<(ToolCall, Arc<MetadataBrowser>)> {
++        let (mut call, recorder, _) = fixture(false, claim, extra).await?;
++        if let Some(reason) = reason {
++            call.state
++                .sessions
++                .remove(&SessionId::new("prior-task"), kind, Some(reason))
++                .await?;
++        }
++        recorder.restored.store(true, Ordering::SeqCst);
++        call.raw_args = json!({"action":"reclaim_restored","groupId":"restored-group",
++            "priorGroupId":"saved-group","priorSession":"prior-task",
++            "prior":[{"tabId":101,"targetId":"writer-target","url":"https://example.com/editor"}],
++            "expected":[{"targetId":"restored-target","url":"https://example.com/editor"}]});
++        Ok((call, recorder))
++    }
++
++    #[tokio::test]
++    async fn restored_recovery_admits_explicit_new_incarnation_for_normal_or_idle_receipt()
++    -> anyhow::Result<()> {
++        for reason in ["server shutdown", "idle timeout"] {
++            let (call, recorder) = restored_fixture("closed", Some(reason), true, false).await?;
++            let result = reclaim_enabled(&call).await;
++            assert!(!result.is_error, "{result:?}");
++            let page = call
++                .browser_session
++                .as_ref()
++                .unwrap()
++                .pages
++                .list()
++                .await?
++                .remove(0);
++            assert_eq!(page.target_id.as_str(), "restored-target");
++            assert_eq!(
++                call.state.sessions.owner_of_page(&page.page_id).await,
++                call.identity.as_ref().map(|i| i.ownership_key.clone())
++            );
++            let rows = call
++                .state
++                .session_tabs
++                .list_open_session_tabs(&[call.session_id.as_str().into()])
++                .await?;
++            assert_eq!(rows.len(), 1);
++            assert_eq!(rows[0].opened_target_id.as_deref(), Some("restored-target"));
++            assert!(recorder.calls.lock().unwrap().iter().all(|m| matches!(
++                m.as_str(),
++                "Browser.getTabs" | "Browser.getTabGroups" | "Target.getTargets"
++            )));
++        }
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn restored_recovery_rejects_incomplete_proof_live_owners_present_original_and_changed_membership()
++    -> anyhow::Result<()> {
++        for case in [
++            "live",
++            "operator",
++            "transport",
++            "user-no-proof",
++            "old-target",
++            "url",
++            "membership",
++            "late-url",
++            "claimed-alias",
++            "missing-designation",
++            "cancelled",
++            "malformed-targets",
++            "malformed-groups",
++            "window",
++            "caller-has-another-group",
++        ] {
++            let reason = match case {
++                "live" => None,
++                "operator" => Some("operator requested stop"),
++                "transport" => Some("transport closed"),
++                _ => Some("server shutdown"),
++            };
++            let (mut call, recorder) = restored_fixture(
++                if case == "operator" {
++                    "cancelled"
++                } else {
++                    "closed"
++                },
++                reason,
++                case != "user-no-proof",
++                case == "membership",
++            )
++            .await?;
++            if case == "cancelled" {
++                call.cancel.cancel();
++            }
++            if case == "malformed-targets" {
++                recorder.corrupt_inventory.store(1, Ordering::SeqCst);
++            }
++            if case == "malformed-groups" {
++                recorder.corrupt_inventory.store(2, Ordering::SeqCst);
++            }
++            if case == "window" {
++                recorder.corrupt_inventory.store(3, Ordering::SeqCst);
++            }
++            if case == "caller-has-another-group" {
++                call.state
++                    .sessions
++                    .ownership()
++                    .claim_page(
++                        call.identity.as_ref().unwrap().ownership_key.clone(),
++                        PageId(777),
++                    )
++                    .await;
++            }
++            if case == "old-target" {
++                recorder
++                    .original_still_present
++                    .store(true, Ordering::SeqCst);
++            }
++            if case == "url" {
++                call.raw_args["expected"][0]["url"] = json!("https://example.com/changed");
++            }
++            if case == "late-url" {
++                recorder.change_url_after.store(5, Ordering::SeqCst);
++            }
++            if case == "missing-designation" {
++                call.raw_args
++                    .as_object_mut()
++                    .unwrap()
++                    .remove("priorGroupId");
++            }
++            let current = call
++                .browser_session
++                .as_ref()
++                .unwrap()
++                .pages
++                .list()
++                .await?
++                .remove(0);
++            if case == "claimed-alias" {
++                call.state
++                    .sessions
++                    .ownership()
++                    .claim_page(
++                        call.identity.as_ref().unwrap().ownership_key.clone(),
++                        current.page_id.clone(),
++                    )
++                    .await;
++            }
++            let before = call.state.sessions.owner_of_page(&current.page_id).await;
++            assert!(reclaim_enabled(&call).await.is_error, "must reject {case}");
++            assert_eq!(
++                call.state.sessions.owner_of_page(&current.page_id).await,
++                before,
++                "preserve {case}"
++            );
++            assert!(
++                call.state
++                    .session_tabs
++                    .list_open_session_tabs(&[call.session_id.as_str().into()])
++                    .await?
++                    .is_empty()
++            );
++        }
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn restored_recovery_rejects_partial_original_batch_and_previously_claimed_new_target()
++    -> anyhow::Result<()> {
++        for subset in [true, false] {
++            let (mut call, recorder, _) = fixture(false, true, false).await?;
++            if subset {
++                let owner = call.state.sessions.owner_of_page(&PageId(1)).await.unwrap();
++                call.state.session_tabs.enqueue_claim_tab_for_session(
++                    102,
++                    Some("second-original".into()),
++                    "prior-task".into(),
++                    owner.as_str().into(),
++                    crate::clock::now_epoch_ms() - 1000,
++                );
++                call.state.session_tabs.drain_writes().await;
++            }
++            call.state
++                .sessions
++                .remove(
++                    &SessionId::new("prior-task"),
++                    "closed",
++                    Some("server shutdown"),
++                )
++                .await?;
++            recorder.restored.store(true, Ordering::SeqCst);
++            call.raw_args = json!({"action":"reclaim_restored","groupId":"restored-group",
++                "priorGroupId":"saved-group","priorSession":"prior-task",
++                "prior":[{"tabId":101,"targetId":"writer-target","url":"https://example.com/editor"}],
++                "expected":[{"targetId":"restored-target","url":"https://example.com/editor"}]});
++            if !subset {
++                call.state.session_tabs.enqueue_claim_tab_for_session(
++                    202,
++                    Some("restored-target".into()),
++                    "unrelated-history".into(),
++                    "other-owner".into(),
++                    crate::clock::now_epoch_ms() - 1000,
++                );
++                call.state
++                    .session_tabs
++                    .enqueue_release_tab_for_session(202, "unrelated-history".into());
++                call.state.session_tabs.drain_writes().await;
++            }
++            assert!(reclaim_enabled(&call).await.is_error);
++            assert!(
++                call.state
++                    .session_tabs
++                    .list_open_session_tabs(&[call.session_id.as_str().into()])
++                    .await?
++                    .is_empty()
++            );
++        }
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn restored_recovery_competing_callers_cannot_both_claim_new_incarnation()
++    -> anyhow::Result<()> {
++        let (call, _) = restored_fixture("closed", Some("server shutdown"), true, false).await?;
++        let other = call
++            .state
++            .sessions
++            .mint_with_id(
++                SessionId::new("rival"),
++                ClientIdentity::Ephemeral {
++                    slug: "codex".into(),
++                    label: "Codex".into(),
++                },
++                ClientInfo {
++                    name: "Codex".into(),
++                    version: "test".into(),
++                    title: None,
++                },
++            )
++            .await?;
++        let mut rival = call.clone();
++        rival.session_id = other.id().clone();
++        let identity = rival.identity.as_mut().unwrap();
++        identity.session = other.clone();
++        identity.ownership_key = other.convo_id().clone();
++        let (a, b) = tokio::join!(reclaim_enabled(&call), reclaim_enabled(&rival));
++        assert_ne!(a.is_error, b.is_error, "exactly one claimant must commit");
++        let rows = call
++            .state
++            .session_tabs
++            .list_open_session_tabs(&[call.session_id.as_str().into(), "rival".into()])
++            .await?;
++        assert_eq!(rows.len(), 1);
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn restored_recovery_all_aliases_commit_once_and_database_failure_preserves_binding()
++    -> anyhow::Result<()> {
++        use sea_orm::{ConnectionTrait, DbBackend, Statement};
++        for fail in [false, true] {
++            let (call, recorder) =
++                restored_fixture("closed", Some("server shutdown"), true, false).await?;
++            let current = call
++                .browser_session
++                .as_ref()
++                .unwrap()
++                .pages
++                .list()
++                .await?
++                .remove(0);
++            recorder.alias_fixture.store(true, Ordering::SeqCst);
++            let alias = call
++                .browser_session
++                .as_ref()
++                .unwrap()
++                .pages
++                .new_page(
++                    "https://example.com/editor",
++                    browseros_core::pages::NewPageOptions {
++                        window_id: Some(browseros_core::WindowId(1)),
++                        ..Default::default()
++                    },
++                )
++                .await?;
++            recorder.alias_fixture.store(false, Ordering::SeqCst);
++            recorder.calls.lock().unwrap().clear();
++            if fail {
++                call.state.session_tabs.connection().execute(Statement::from_string(DbBackend::Sqlite,
++                    "CREATE TRIGGER reject_restored BEFORE INSERT ON session_tabs WHEN NEW.session_id = 's1' BEGIN SELECT RAISE(ABORT, 'synthetic restored failure'); END".to_owned())).await?;
++            }
++            assert_eq!(reclaim_enabled(&call).await.is_error, fail);
++            let owner = if fail {
++                None
++            } else {
++                call.identity.as_ref().map(|i| i.ownership_key.clone())
++            };
++            assert_eq!(
++                call.state.sessions.owner_of_page(&current.page_id).await,
++                owner
++            );
++            assert_eq!(call.state.sessions.owner_of_page(&alias).await, owner);
++            assert_eq!(
++                call.state
++                    .session_tabs
++                    .list_open_session_tabs(&[call.session_id.as_str().into()])
++                    .await?
++                    .len(),
++                if fail { 0 } else { 1 }
++            );
++            assert!(recorder.calls.lock().unwrap().iter().all(|m| matches!(
++                m.as_str(),
++                "Browser.getTabs" | "Browser.getTabGroups" | "Target.getTargets"
++            )));
++        }
++        Ok(())
+     }
+ 
+     #[tokio::test]
+--- a/apps/claw-server-rust/src/api/mcp/dispatch.rs
++++ b/apps/claw-server-rust/src/api/mcp/dispatch.rs
+@@ -469,7 +469,7 @@
+                 inner_call_hook,
+                 preloaded_helpers,
+             });
+-            if call.tool().name == "tabs" && call.raw_args.get("action").and_then(Value::as_str) == Some("reclaim_expired") {
++            if call.tool().name == "tabs" && matches!(call.raw_args.get("action").and_then(Value::as_str), Some("reclaim_expired" | "reclaim_restored")) {
+                 effects::expired_recovery::reclaim(call).await
+             } else { match execute_tool(call.tool(), call.raw_args.clone(), &ctx).await {
+                 Ok(result) => result,
+--- a/crates/browseros-mcp/src/tools/tabs.rs
++++ b/crates/browseros-mcp/src/tools/tabs.rs
+@@ -31,11 +31,23 @@
+     Close,
+     #[serde(rename = "reclaim_expired")]
+     ReclaimExpired,
++    #[serde(rename = "reclaim_restored")]
++    ReclaimRestored,
+ }
+ 
+ #[derive(Debug, Clone, Deserialize, JsonSchema)]
+ #[serde(deny_unknown_fields)]
+ pub struct RecoveryTarget {
++    #[serde(rename = "targetId")]
++    pub target_id: String,
++    pub url: String,
++}
++
++#[derive(Debug, Clone, Deserialize, JsonSchema)]
++#[serde(deny_unknown_fields)]
++pub struct PriorRecoveryTab {
++    #[serde(rename = "tabId")]
++    pub tab_id: i64,
+     #[serde(rename = "targetId")]
+     pub target_id: String,
+     pub url: String,
+@@ -65,6 +77,10 @@
+     prior_session: Option<String>,
+     #[serde(default)]
+     expected: Option<Vec<RecoveryTarget>>,
++    #[serde(default, rename = "priorGroupId")]
++    prior_group_id: Option<String>,
++    #[serde(default)]
++    prior: Option<Vec<PriorRecoveryTab>>,
+ }
+ 
+ pub fn definition() -> crate::framework::ToolDef {
+@@ -104,9 +120,10 @@
+ ) -> BoxFuture<'a, ToolExecResult<Option<ToolResult>>> {
+     Box::pin(async move {
+         let args: TabsArgs = parse_args(raw)?;
+-        let _ = (&args.prior_session, &args.expected);
++        let _ = (&args.prior_session, &args.expected, &args.prior_group_id, &args.prior);
+         let result = match args.action {
+             TabsAction::ReclaimExpired => error_result("reclaim_expired requires the Workspace task dispatcher"),
++            TabsAction::ReclaimRestored => error_result("reclaim_restored requires explicit Workspace task recovery"),
+             TabsAction::List => {
+                 let pages = ctx.session.pages.list().await?;
+                 let lines = pages.iter().map(format_page_line).collect::<Vec<_>>();

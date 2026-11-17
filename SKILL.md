@@ -35,9 +35,12 @@ or change permissions.
    and call `workspace_cleanup check`. Preserve unsaved/pending work and concrete
    next-use pages, giving a reason with retain/defer. Check registered used pages
    as well as mine. A successful transport disconnect is not task completion.
-7. Keep a shared browser open while other tasks use it. Close an exclusively owned
-   browser window normally only after all its task work and unsaved checks finish.
-   Never close someone else's window or all tabs by pattern.
+7. Keep a shared browser open while other tasks use it. Close individually
+   authorized physical tabs after unsaved/pending checks. `windows close` returns
+   a nonexecuting cleanup plan; it grants no close rights, including blank tabs.
+   When the last authorized tab ends the browser, verify exact process exit using
+   the read-only runtime check; connection loss alone is not proof. Do not relaunch
+   merely to verify exit, or close someone else's window/all tabs by pattern.
 8. Keep posting operations in the local intent ledger where the workflow supports
    it; it does not coordinate independent PCs. Verify saved content and public
    reader-page results independently of editor success.
@@ -45,3 +48,15 @@ or change permissions.
 The optional Stop hook requires compatible host support. If unavailable, perform
 the completion check explicitly. This package does not add Codex host restart tools,
 grant automatic approvals, or install global scheduling.
+
+Minimized/hidden input, navigation and tab closure restore the same existing native
+window behind the foreground app without activation. Reads do not restore it.
+Ambiguous/replaced windows or failed validation prevent the original action; do
+not bypass this by creating or activating a window. After an incarnation/snapshot
+session mismatch, inspect current inventory and obtain a fresh snapshot before a
+new request. Same-HWND hiding is tested separately from a tray replacing the HWND;
+first browser launch is outside this restoration guarantee.
+
+The `CleanupPlan:` JSON is included in MCP text. This tool has no output schema,
+so wire conversion omits `structuredContent`; do not depend on that field. The
+plan grants no closure rights and executes no window/tab close.

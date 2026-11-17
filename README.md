@@ -6,6 +6,66 @@ server 0.0.65**, not a claim to support the latest upstream version. DOT review 
 required before the first public upload. Current-PC isolated tests and other-PC
 tests are reported separately; the latter are deferred by the owner.
 
+## v0.1.6: one physical tab and background restoration
+
+Tab creation reuses a handle registered by a concurrent inventory. Existing
+physical aliases keep their IDs and ownership while URL, title, loading, group
+and window metadata are synchronized. No group is adopted based on its URL.
+
+The server includes the same protected expired/restored recovery patch chain as
+the qualified Workspace runtime. Recovery still requires the original evidence,
+complete current inventory and native ownership; it never recreates business tabs
+or treats matching URLs as ownership.
+
+After a backend-only restart, `workspace_cleanup resume` can reclaim the original
+physical tabs without manual selection when the previous claim, exact group
+membership and current owner checks agree. Close disposable tabs individually
+after checking for pending or unsaved work. A different physical tab still needs
+the explicit restored-group procedure and evidence of a normal shutdown.
+
+To stop the dedicated browser when it is safe to interrupt, run
+`.venv\Scripts\python.exe -B -X utf8 runtime\stop-neo.py --confirmed-safe`
+from the installation root. Verify there is no unsaved or in-progress work
+before running it. Shutdown ends open MCP event streams, verifies the durable
+session and claim records, then requests a normal browser quit without focusing
+Neo. `runtime\start-neo.ps1 -Background` starts it in the background again.
+
+Chromium can dismiss a beforeunload guard while a native window is minimized.
+Before explicit input (including fill), navigation/history/reload or tab closure,
+this build checks the target window. A minimized or hidden Windows window is
+restored without activation, BEHIND the current foreground app. It derives the
+browser PID from the same CDP connection, requires one existing normal browser
+window and one ownerless native Chrome window for that PID, preserves an open
+process handle, and verifies foreground, Z-order, visibility and the same CDP
+window after restoration. Unknown/multiple windows, an unavailable foreground,
+a topmost window or failed validation prevent the original action. No new window,
+window activation, SetForegroundWindow or global setting change is used.
+
+DOM reads do not restore windows. Dialog decisions remain explicit; saved-content
+readback is still required. Concurrent user changes after the check and arbitrary
+navigation scripts through evaluate/raw CDP are outside this guard. Inspect their
+outcomes and never retry an uncertain save or submission. A system-tray mode that
+replaces the native window is not claimed equivalent to hiding the same HWND.
+
+Guarded operations carry the exact target, tab, connection epoch and original
+CDP session through input/ref/frame resolution, navigation and target-session
+`Page.close`. A rebind during preparation or a snapshot from another root session
+is rejected before input. Prepared input never retries on a newly resolved target.
+
+Blanket `Browser.closeWindow` is disabled. `windows close` is a nonexecuting
+per-tab cleanup plan with `requestedActionExecuted=false`; it never closes even
+internal new-tab anchors and grants no close rights. Close only individually
+authorized physical tabs after unsaved/pending checks. If the last permitted tab
+ends the browser, verify the exact process identity has exited using the runtime's
+read-only check. CDP loss alone is insufficient, and checking must not relaunch
+Neo. Unknown/user tabs remain unless their closure is explicitly authorized.
+
+Tab closure validates every target identity and atomically compares its original
+incarnation before removing a binding. A delayed move reply cannot recreate a
+closed handle or overwrite a changed binding.
+
+The browser stays at 0.51.0/server 0.0.65. Other-PC testing remains deferred.
+
 ## v0.1.5: reconnect initialization shared by Codex and AGY
 
 Binding the actual task UUID performs local initialization without a redundant
@@ -175,11 +235,20 @@ returned `inventory_receipt`. Initialization never starts an off browser, adopts
 groups, or replays a save/upload/post. Failed inventory/delivery and previously
 queued requests cannot authorize page operations.
 
+For a managed restart that preserves task tabs, check active requests and unsaved
+input, then run the installed runtime's `stop-neo.py --confirmed-safe` with its
+private Python. The command verifies the dedicated process and loopback identity,
+waits for a successful server exit and durable session ends and claim releases,
+then quits that same browser. An unresolved drain or unknown session end blocks
+closure. Use the installed `start-neo.ps1 -Background` for a nonactivating
+automation restart. The interactive shortcut uses a normal foreground launch.
+
 For a whole-browser restart that must preserve task bindings, quit the browser
 application normally (Exit / supported `Browser.close`) after inspecting pending
-and unsaved work. Programmatic `windows close` is a window-removal action: its
-success can clear the task's closed-tab record, even when Chromium later restores
-the old window as user tabs. Do not use window removal as a restart shortcut.
+and unsaved work. `windows close` only returns a nonexecuting cleanup plan. It is neither a normal
+application quit nor a restart shortcut. Close only authorized individual tabs
+when their work is complete; use an explicitly authorized normal application quit
+when preserving active tabs for a whole-browser restart.
 
 `runtime/update-runtime.py` checks the official signed feed and can prepare a
 candidate in `local/scratch/<owned-task>`. It does not promote a new version.
@@ -217,3 +286,7 @@ CPU-only browser/HTTP/file I/O; GPU/JIT/TensorRT acceleration is not applicable.
 Release notes must distinguish mock regression tests, isolated real-browser tests,
 client-host tests and cross-PC tests. A test client is not proof that another
 client's currently loaded MCP connection works.
+
+The `CleanupPlan:` JSON is included in MCP text. This tool has no output schema,
+so wire conversion omits `structuredContent`; do not depend on that field. The
+plan grants no closure rights and executes no window/tab close.

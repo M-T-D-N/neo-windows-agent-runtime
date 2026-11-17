@@ -1,0 +1,994 @@
+--- a/apps/claw-server-rust/src/db/session_tabs.rs
++++ b/apps/claw-server-rust/src/db/session_tabs.rs
+@@ -6,15 +6,15 @@
+     db::{
+         Database,
+         entities::{
+-            prelude::{SessionTabs, TabClaims},
+-            session_tabs, tab_claims,
++            prelude::{AgentSessionEnds, AgentSessionStarts, SessionTabs, TabClaims},
++            agent_session_ends, agent_session_starts, session_tabs, tab_claims,
+         },
+     },
+     error::AppResult,
+ };
+ use sea_orm::{
+     ActiveValue::{NotSet, Set},
+-    ColumnTrait, DbBackend, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Statement,
++    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Statement,
+     TransactionTrait,
+     sea_query::Expr,
+ };
+@@ -103,12 +103,80 @@
+ }
+ 
+ impl SessionTabLedger {
++    /// Positive continuation proof, not absence from an in-memory live snapshot.
++    /// Caller also holds the live-session and ownership locks while admitting.
++    pub async fn idle_owner_for_tabs(
++        &self,
++        prior_session: &str,
++        tabs: &[(i64, String)],
++    ) -> AppResult<Option<(String, String)>> {
++        self.drain_writes().await;
++        idle_owner_in(self.db.connection(), prior_session, tabs).await
++    }
++
++    /// Write the complete new claim set in one transaction and propagate failure.
++    pub async fn record_idle_recovery(&self, prior_session: &str, current_session: &str,
++        current_owner: &str, old_owner: &str, client: &str, tabs: &[(i64,String)]) -> AppResult<bool>
++    {
++        let txn=self.db.connection().begin().await?;
++        if idle_owner_in(&txn,prior_session,tabs).await? != Some((old_owner.to_owned(),client.to_owned())) {
++            return Ok(false);
++        }
++        let claimed=now_epoch_ms();
++        for (tab,target) in tabs {
++            SessionTabs::insert(session_tabs::ActiveModel {
++                id:NotSet, session_id:Set(current_session.to_owned()),agent_id:Set(current_owner.to_owned()),
++                tab_id:Set(*tab),opened_target_id:Set(Some(target.clone())),claimed_at:Set(claimed),released_at:Set(None),
++            }).exec(&txn).await?;
++        }
++        txn.commit().await?;
++        Ok(true)
++    }
++
+     pub fn new(db: Database) -> Self {
+         let (claim_writes, receiver) = mpsc::unbounded_channel();
+         tokio::spawn(run_claim_writes(db.clone(), receiver));
+         Self { db, claim_writes }
+     }
+ 
++}
++
++async fn idle_owner_in<C:ConnectionTrait>(conn:&C, prior_session:&str,
++    tabs:&[(i64,String)]) -> AppResult<Option<(String,String)>>
++{
++        if tabs.is_empty()
++            || tabs.iter().map(|(tab, _)| tab).collect::<std::collections::BTreeSet<_>>().len() != tabs.len()
++        {
++            return Ok(None);
++        }
++        let starts = AgentSessionStarts::find()
++            .filter(agent_session_starts::Column::SessionId.eq(prior_session))
++            .all(conn).await?;
++        let ends = AgentSessionEnds::find()
++            .filter(agent_session_ends::Column::SessionId.eq(prior_session))
++            .all(conn).await?;
++        let ([start], [end]) = (starts.as_slice(), ends.as_slice()) else { return Ok(None) };
++        if end.kind != "closed" || end.reason.as_deref() != Some("idle timeout")
++            || end.created_at < start.created_at
++        {
++            return Ok(None);
++        }
++        for (tab, target) in tabs {
++            let Some(last) = SessionTabs::find()
++                .filter(session_tabs::Column::TabId.eq(*tab))
++                .order_by_desc(session_tabs::Column::Id)
++                .one(conn).await? else { return Ok(None) };
++            if target.is_empty() || last.session_id != prior_session || last.agent_id != start.agent_id
++                || last.opened_target_id.as_deref() != Some(target.as_str())
++                || last.released_at.is_none_or(|released| released < last.claimed_at || released > end.created_at)
++            {
++                return Ok(None);
++            }
++        }
++        Ok(Some((start.agent_id.clone(), start.client_name.clone())))
++    }
++
++impl SessionTabLedger {
+     #[cfg(test)]
+     pub(crate) fn connection(&self) -> &sea_orm::DatabaseConnection {
+         self.db.connection()
+--- a/apps/claw-server-rust/src/services/sessions/manager.rs
++++ b/apps/claw-server-rust/src/services/sessions/manager.rs
+@@ -455,6 +455,54 @@
+         }
+     }
+ 
++    /// A previous opaque task handle plus its final released claims proves provenance.
++    /// Keep lifecycle admission stable through the ownership CAS: a same-client live
++    /// conversation is just as protected as a different-client conversation.
++    pub async fn reclaim_idle_pages<F>(
++        self: &Arc<Self>,
++        prior_session: &SessionId,
++        current_session: &SessionId,
++        expected: &[(browseros_core::PageId, Option<ConvoId>)],
++        tabs: &[(i64, String)],
++        group_ref: String,
++        cancel: CancellationToken,
++        validate_physical: F,
++    ) -> Result<(), String>
++    where F: Future<Output = Result<(), String>> + Send + 'static,
++    {
++        let registry=self.clone();let prior_session=prior_session.clone();
++        let current_session=current_session.clone();let expected=expected.to_vec();let tabs=tabs.to_vec();
++        // Once the durable claim transaction starts, finish its matching memory
++        // update even if the HTTP waiter disappears. Cancellation before that
++        // boundary makes no changes; after it, the caller must reconcile.
++        tokio::spawn(async move {
++        let live = registry.sessions.read().await;
++        let current = live.get(&current_session).ok_or("Recovery caller is not active")?;
++          if cancel.is_cancelled() || live.contains_key(&prior_session) || tabs.is_empty() || expected.len() < tabs.len() {
++            return Err("Prior task is active or recovery membership is incomplete".into());
++        }
++        registry.ownership.reclaim_pages_if_unchanged(current.convo_id(), &expected, &group_ref, async {
++            let (owner, client) = registry.session_tabs.idle_owner_for_tabs(prior_session.as_str(), &tabs)
++                .await.map_err(|e| e.to_string())?.ok_or("No exact idle-expired task claim proof")?;
++            let owner = ConvoId::new(owner);
++            if current.client_name() != client
++                || expected.iter().any(|(_, prior)| prior.as_ref().is_some_and(|prior|prior != &owner))
++                || live.values().any(|session| session.convo_id() == &owner)
++            {
++                return Err("Recovery owner is active, unknown, unclaimed or from another client".into());
++            }
++            validate_physical.await?;
++            if cancel.is_cancelled() {return Err("Recovery cancelled before commit".into())}
++            if !registry.session_tabs.record_idle_recovery(prior_session.as_str(),current_session.as_str(),
++                current.convo_id().as_str(),owner.as_str(),&client,&tabs).await.map_err(|e|e.to_string())? {
++                return Err("Recovery claim changed before commit".into());
++            }
++            Ok(())
++        }).await?;
++        Ok(())
++        }).await.map_err(|e|e.to_string())?
++    }
++
+     pub async fn owner_of_page(&self, page_id: &browseros_core::PageId) -> Option<ConvoId> {
+         self.ownership.owner_of_page(page_id).await
+     }
+--- a/apps/claw-server-rust/src/services/sessions/tab_ownership.rs
++++ b/apps/claw-server-rust/src/services/sessions/tab_ownership.rs
+@@ -157,6 +157,42 @@
+             .pages
+             .insert(page_id);
+         inner.remove_empty_convos();
++    }
++
++    /// Admission, final physical validation and all ownership-index updates are one CAS.
++    pub async fn reclaim_pages_if_unchanged<F>(
++        &self,
++        owner: &ConvoId,
++        expected: &[(PageId, Option<ConvoId>)],
++        group_ref: &str,
++        validate: F,
++    ) -> Result<(), String>
++    where F: std::future::Future<Output = Result<(), String>>,
++    {
++        let mut inner = self.inner.write().await;
++        if expected.is_empty()
++            || expected.iter().map(|(page, _)| page).collect::<BTreeSet<_>>().len() != expected.len()
++            || expected.iter().any(|(page, prior)| inner.page_owners.get(page) != prior.as_ref())
++        {
++            return Err("Recovery ownership changed during admission".into());
++        }
++        validate.await?;
++        for (page, _) in expected {
++            if let Some(previous) = inner.page_owners.insert(page.clone(), owner.clone())
++                && previous != *owner
++                && let Some(convo) = inner.convos.get_mut(&previous)
++            {
++                convo.pages.remove(page);
++                if convo.group.as_ref().and_then(|g|g.group_ref.as_deref()) == Some(group_ref) {
++                    convo.group = None;
++                }
++            }
++            inner.convos.entry(owner.clone()).or_default().pages.insert(page.clone());
++        }
++        inner.convos.entry(owner.clone()).or_default().group.get_or_insert_default()
++            .group_ref=Some(group_ref.to_owned());
++        inner.remove_empty_convos();
++        Ok(())
+     }
+ 
+     pub async fn remove_page(&self, page_id: &PageId) -> Option<ConvoId> {
+--- /dev/null
++++ b/apps/claw-server-rust/src/api/mcp/effects/expired_recovery.rs
+@@ -0,0 +1,718 @@
++//! Explicit Workspace continuation of one positively proven idle-expired task.
++//! Never opens, activates, reloads, focuses or edits a page.
++use crate::{api::mcp::dispatch::ToolCall, ids::SessionId};
++use browseros_core::{BrowserSession, pages::PageInfo};
++use browseros_mcp::ToolResult;
++use serde::Deserialize;
++use serde_json::{Value, json};
++use std::collections::{BTreeMap, BTreeSet};
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Request {
++    action: String,
++    #[serde(rename = "groupId")]
++    group_id: String,
++    #[serde(rename = "priorSession")]
++    prior_session: String,
++    expected: Vec<browseros_mcp::tools::tabs::RecoveryTarget>,
++}
++
++async fn exact_group(
++    browser: &BrowserSession,
++    group: &str,
++    expected: &BTreeMap<String, String>,
++) -> Result<Vec<PageInfo>, String> {
++    let inventory = browser.pages.list().await.map_err(|e| e.to_string())?;
++    // The SDK can retain multiple handles for one physical target. Validate
++    // every alias, including one whose stale group label differs, and CAS all
++    // of their owners. Never hide a conflicting alias by choosing one handle.
++    let relevant_tabs: BTreeSet<_> = inventory
++        .iter()
++        .filter(|p| expected.contains_key(p.target_id.as_str()))
++        .map(|p| p.tab_id.0)
++        .collect();
++    let pages: Vec<_> = inventory
++        .into_iter()
++        .filter(|p| {
++            p.group_id.as_deref() == Some(group)
++                || expected.contains_key(p.target_id.as_str())
++                || relevant_tabs.contains(&p.tab_id.0)
++        })
++        .collect();
++    let actual: BTreeMap<_, _> = pages
++        .iter()
++        .map(|p| (p.target_id.as_str().to_owned(), p.url.clone()))
++        .collect();
++    if actual != *expected
++        || pages.iter().any(|p| {
++            p.group_id.as_deref() != Some(group)
++                || expected.get(p.target_id.as_str()) != Some(&p.url)
++        })
++    {
++        return Err("Recovery group membership or URL changed".into());
++    }
++    let mut physical_targets = BTreeMap::new();
++    let mut physical_tabs = BTreeMap::new();
++    for p in &pages {
++        if physical_targets
++            .insert(p.target_id.as_str(), p.tab_id.0)
++            .is_some_and(|id| id != p.tab_id.0)
++            || physical_tabs
++                .insert(p.tab_id.0, p.target_id.as_str())
++                .is_some_and(|id| id != p.target_id.as_str())
++        {
++            return Err("Recovery physical aliases disagree".into());
++        }
++    }
++    let window = pages
++        .first()
++        .and_then(|p| p.window_id.clone())
++        .ok_or("Recovery group has no window")?;
++    if pages.iter().any(|p| p.window_id.as_ref() != Some(&window)) {
++        return Err("Recovery group spans windows".into());
++    }
++    let native = browser
++        .cdp("Browser.getTabGroups", json!({}), None)
++        .await
++        .map_err(|e| e.to_string())?;
++    let groups = native
++        .get("groups")
++        .and_then(Value::as_array)
++        .ok_or("Recovery native group inventory is unavailable")?;
++    let matched: Vec<_> = groups
++        .iter()
++        .filter(|g| g.get("groupId").and_then(Value::as_str) == Some(group))
++        .collect();
++    let [matched] = matched.as_slice() else {
++        return Err("Recovery group is absent or ambiguous".into());
++    };
++    let ids = matched
++        .get("tabIds")
++        .and_then(Value::as_array)
++        .ok_or("Recovery native group members are unavailable")?;
++    let physical: Option<BTreeSet<_>> = ids.iter().map(Value::as_i64).collect();
++    let wanted: BTreeSet<_> = pages.iter().map(|p| p.tab_id.0).collect();
++    if physical.as_ref() != Some(&wanted) || ids.len() != wanted.len() {
++        return Err("Recovery group has extra or missing native members".into());
++    }
++    Ok(pages)
++}
++
++pub async fn reclaim(call: &ToolCall) -> ToolResult {
++    if !crate::config::workspace_manual_tab_cleanup() {
++        return ToolResult::error("Workspace expired-task recovery is not enabled");
++    }
++    reclaim_enabled(call).await
++}
++
++async fn reclaim_enabled(call: &ToolCall) -> ToolResult {
++    let work = async {
++        let request: Request =
++            serde_json::from_value(call.raw_args.clone()).map_err(|e| e.to_string())?;
++        if request.action != "reclaim_expired"
++            || request.group_id.is_empty()
++            || request.prior_session.is_empty()
++            || request.expected.is_empty()
++        {
++            return Err("Exact task handle and nonempty recovery membership are required".into());
++        }
++        let expected: BTreeMap<_, _> = request
++            .expected
++            .iter()
++            .map(|p| (p.target_id.clone(), p.url.clone()))
++            .collect();
++        if expected.len() != request.expected.len()
++            || expected
++                .iter()
++                .any(|(target, url)| target.is_empty() || url.is_empty())
++        {
++            return Err("Duplicate or empty recovery target identity".into());
++        }
++        let identity = call
++            .identity
++            .as_ref()
++            .ok_or("Recovery requires a task identity")?;
++        let browser = call.browser_session.as_ref().ok_or("Browser unavailable")?;
++        let ownership = call.state.sessions.ownership();
++        let group_lock = ownership
++            .group_operation_lock(&identity.ownership_key)
++            .await;
++        let _guard = group_lock.lock().await;
++        let pages = exact_group(browser, &request.group_id, &expected).await?;
++        let mut owners = Vec::new();
++        for page in &pages {
++            let owner = ownership.owner_of_page(&page.page_id).await;
++            owners.push((page.page_id.clone(), owner));
++        }
++        let tabs: Vec<_> = pages
++            .iter()
++            .map(|p| (p.tab_id.0, p.target_id.as_str().to_owned()))
++            .collect::<BTreeSet<_>>()
++            .into_iter()
++            .collect();
++        let browser_check = browser.clone();
++        let group_check = request.group_id.clone();
++        let original: BTreeSet<_> = pages
++            .iter()
++            .map(|p| {
++                (
++                    p.page_id.0,
++                    p.tab_id.0,
++                    p.target_id.as_str().to_owned(),
++                    p.url.clone(),
++                    p.group_id.clone(),
++                    p.window_id.clone(),
++                )
++            })
++            .collect();
++        call.state
++            .sessions
++            .reclaim_idle_pages(
++                &SessionId::new(request.prior_session),
++                &call.session_id,
++                &owners,
++                &tabs,
++                request.group_id.clone(),
++                call.cancel.clone(),
++                async move {
++                    let current = tokio::time::timeout(
++                        crate::api::mcp::timeouts::TAB_GROUP_OPERATION,
++                        exact_group(&browser_check, &group_check, &expected),
++                    )
++                    .await
++                    .map_err(|_| "Recovery physical validation timed out".to_string())??;
++                    let fingerprint: BTreeSet<_> = current
++                        .iter()
++                        .map(|p| {
++                            (
++                                p.page_id.0,
++                                p.tab_id.0,
++                                p.target_id.as_str().to_owned(),
++                                p.url.clone(),
++                                p.group_id.clone(),
++                                p.window_id.clone(),
++                            )
++                        })
++                        .collect();
++                    if fingerprint != original {
++                        return Err("Recovery physical incarnation changed".into());
++                    }
++                    Ok(())
++                },
++            )
++            .await?;
++        Ok::<_, String>(ToolResult::text(
++            "Verified idle-expired task ownership restored without page changes",
++            Some(
++                json!({"action":"reclaim_expired","groupId":request.group_id,
++                "pages":pages.iter().map(|p|p.page_id.0).collect::<Vec<_>>()}),
++            ),
++        ))
++    };
++    match work.await {
++        Ok(result) => result,
++        Err(error) => ToolResult::error(format!("reclaim_expired: {error}")),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::identity::{ClientIdentity, ClientInfo};
++    use browseros_cdp::{CdpError, CdpEvent};
++    use browseros_core::{BrowserSessionHooks, CdpConnection, PageId};
++    use futures_util::future::BoxFuture;
++    use std::sync::{
++        Arc, Mutex,
++        atomic::{AtomicBool, AtomicUsize, Ordering},
++    };
++    use tokio::sync::broadcast;
++
++    struct MetadataBrowser {
++        calls: Mutex<Vec<String>>,
++        sender: broadcast::Sender<CdpEvent>,
++        extra: bool,
++        change_url_after: AtomicUsize,
++        alias_fixture: AtomicBool,
++    }
++    impl CdpConnection for MetadataBrowser {
++        fn send_raw_json<'a>(
++            &'a self,
++            method: &'a str,
++            params: &'a str,
++            session: Option<&'a browseros_core::SessionId>,
++        ) -> BoxFuture<'a, Result<String, CdpError>> {
++            Box::pin(async move {
++                let result = self
++                    .send(
++                        method,
++                        serde_json::from_str(params).expect("valid test params"),
++                        session,
++                    )
++                    .await?;
++                Ok(result.to_string())
++            })
++        }
++        fn send<'a>(
++            &'a self,
++            method: &'a str,
++            _params: Value,
++            _session: Option<&'a browseros_core::SessionId>,
++        ) -> BoxFuture<'a, Result<Value, CdpError>> {
++            Box::pin(async move {
++                self.calls.lock().unwrap().push(method.into());
++                let reads = self
++                    .calls
++                    .lock()
++                    .unwrap()
++                    .iter()
++                    .filter(|c| *c == "Browser.getTabs")
++                    .count();
++                match method {
++                    "Browser.createTab" | "Browser.getTabInfo"
++                        if self.alias_fixture.load(Ordering::SeqCst) =>
++                    {
++                        Ok(json!({"tab":{"tabId":101,"targetId":"writer-target",
++                        "url":"https://example.com/editor","title":"unfinished editor","isActive":false,
++                        "isLoading":false,"loadProgress":1.0,"isPinned":false,"isHidden":false,"windowId":1,"index":0,
++                        "groupId":"saved-group"}}))
++                    }
++                    "Browser.getTabs" => {
++                        Ok(json!({"tabs":[{"tabId":101,"targetId":"writer-target",
++                        "url":if reads>=self.change_url_after.load(Ordering::SeqCst){"https://example.com/changed"}else{"https://example.com/editor"},"title":"unfinished editor","isActive":false,
++                        "isLoading":false,"loadProgress":1.0,"isPinned":false,"isHidden":false,"windowId":1,"index":0,
++                        "groupId":"saved-group"}]}))
++                    }
++                    "Browser.getTabGroups" => {
++                        Ok(json!({"groups":[{"groupId":"saved-group","windowId":1,
++                        "tabIds":if self.extra {vec![101,102]}else{vec![101]},"title":"task"}]}))
++                    }
++                    _ => Err(CdpError::Protocol {
++                        code: -1,
++                        message: format!("Unexpected page mutation or command: {method}"),
++                    }),
++                }
++            })
++        }
++        fn events(&self) -> broadcast::Receiver<CdpEvent> {
++            self.sender.subscribe()
++        }
++        fn is_connected(&self) -> bool {
++            true
++        }
++        fn connection_epoch(&self) -> u64 {
++            1
++        }
++    }
++
++    async fn fixture(
++        expire: bool,
++        claim: bool,
++        extra: bool,
++    ) -> anyhow::Result<(ToolCall, Arc<MetadataBrowser>, PageId)> {
++        let mut call = crate::api::mcp::test_support::tool_call("tabs", json!({})).await?;
++        let (sender, _) = broadcast::channel(8);
++        let recorder = Arc::new(MetadataBrowser {
++            calls: Mutex::new(vec![]),
++            sender,
++            extra,
++            change_url_after: AtomicUsize::new(usize::MAX),
++            alias_fixture: AtomicBool::new(false),
++        });
++        let browser = BrowserSession::new(recorder.clone(), BrowserSessionHooks::default());
++        let page = browser.pages.list().await?.remove(0);
++        let prior = call
++            .state
++            .sessions
++            .mint_with_id(
++                SessionId::new("prior-task"),
++                ClientIdentity::Ephemeral {
++                    slug: "codex".into(),
++                    label: "Codex".into(),
++                },
++                ClientInfo {
++                    name: "Codex".into(),
++                    version: "test".into(),
++                    title: None,
++                },
++            )
++            .await?;
++        if claim {
++            call.state
++                .sessions
++                .ownership()
++                .claim_page(prior.convo_id().clone(), page.page_id.clone())
++                .await;
++            call.state
++                .sessions
++                .ownership()
++                .set_tab_group_ref(prior.convo_id().clone(), Some("saved-group".into()))
++                .await;
++            call.state.session_tabs.enqueue_claim_tab_for_session(
++                101,
++                Some("writer-target".into()),
++                prior.id().as_str().into(),
++                prior.convo_id().as_str().into(),
++                crate::clock::now_epoch_ms() - 1000,
++            );
++        }
++        call.state.session_tabs.drain_writes().await;
++        if expire {
++            call.state
++                .sessions
++                .remove(prior.id(), "closed", Some("idle timeout"))
++                .await?;
++        }
++        call.browser_session = Some(browser);
++        call.raw_args = json!({"action":"reclaim_expired","groupId":"saved-group","priorSession":"prior-task",
++            "expected":[{"targetId":"writer-target","url":"https://example.com/editor"}]});
++        Ok((call, recorder, page.page_id))
++    }
++
++    #[tokio::test]
++    async fn expired_recovery_checks_and_transfers_every_physical_alias() -> anyhow::Result<()> {
++        for conflict in [false, true] {
++            let (call, recorder, original) = fixture(true, true, false).await?;
++            recorder.alias_fixture.store(true, Ordering::SeqCst);
++            let alias = call
++                .browser_session
++                .as_ref()
++                .unwrap()
++                .pages
++                .new_page(
++                    "https://example.com/editor",
++                    browseros_core::pages::NewPageOptions {
++                        window_id: Some(browseros_core::WindowId(1)),
++                        ..Default::default()
++                    },
++                )
++                .await?;
++            recorder.alias_fixture.store(false, Ordering::SeqCst);
++            recorder.calls.lock().unwrap().clear();
++            assert_ne!(alias, original);
++            if conflict {
++                // A second alias belonging to another live task must veto the whole transfer.
++                call.state
++                    .sessions
++                    .ownership()
++                    .claim_page(
++                        call.identity.as_ref().unwrap().ownership_key.clone(),
++                        alias.clone(),
++                    )
++                    .await;
++            }
++            let before = call.state.sessions.owner_of_page(&original).await;
++            let result = reclaim_enabled(&call).await;
++            assert_eq!(result.is_error, conflict, "{result:?}");
++            if conflict {
++                assert_eq!(call.state.sessions.owner_of_page(&original).await, before);
++                assert!(
++                    call.state
++                        .session_tabs
++                        .list_open_session_tabs(&[call.session_id.as_str().into()])
++                        .await?
++                        .is_empty()
++                );
++            } else {
++                let mine = call.identity.as_ref().map(|i| i.ownership_key.clone());
++                assert_eq!(call.state.sessions.owner_of_page(&original).await, mine);
++                assert_eq!(call.state.sessions.owner_of_page(&alias).await, mine);
++                assert_eq!(
++                    call.state
++                        .session_tabs
++                        .list_open_session_tabs(&[call.session_id.as_str().into()])
++                        .await?
++                        .len(),
++                    1
++                );
++            }
++            assert!(
++                recorder
++                    .calls
++                    .lock()
++                    .unwrap()
++                    .iter()
++                    .all(|m| m == "Browser.getTabs" || m == "Browser.getTabGroups")
++            );
++        }
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn expired_recovery_restores_only_proven_task_without_touching_unsaved_page()
++    -> anyhow::Result<()> {
++        let (call, browser, page) = fixture(true, true, false).await?;
++        let previous = call.state.sessions.owner_of_page(&page).await.unwrap();
++        let result = reclaim_enabled(&call).await;
++        assert!(!result.is_error, "{result:?}");
++        assert_eq!(
++            call.state.sessions.owner_of_page(&page).await,
++            call.identity.as_ref().map(|i| i.ownership_key.clone())
++        );
++        assert_eq!(
++            call.state
++                .sessions
++                .ownership()
++                .tab_group_ref(&previous)
++                .await,
++            None
++        );
++        assert_eq!(
++            call.state
++                .sessions
++                .ownership()
++                .tab_group_ref(&call.identity.as_ref().unwrap().ownership_key)
++                .await
++                .as_deref(),
++            Some("saved-group")
++        );
++        assert!(
++            browser
++                .calls
++                .lock()
++                .unwrap()
++                .iter()
++                .all(|c| c == "Browser.getTabs" || c == "Browser.getTabGroups")
++        );
++        let rows = call
++            .state
++            .session_tabs
++            .list_open_session_tabs(&[call.session_id.as_str().to_owned()])
++            .await?;
++        assert_eq!(rows.len(), 1);
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn expired_recovery_rejects_live_same_client_user_pages_changed_url_and_extra_members()
++    -> anyhow::Result<()> {
++        for case in ["live", "user", "url", "membership", "unknown-handle"] {
++            let (mut call, _, page) =
++                fixture(case != "live", case != "user", case == "membership").await?;
++            if case == "url" {
++                call.raw_args["expected"][0]["url"] = json!("https://example.com/changed");
++            }
++            if case == "unknown-handle" {
++                call.raw_args["priorSession"] = json!("not-the-original-task");
++            }
++            let before = call.state.sessions.owner_of_page(&page).await;
++            assert!(reclaim_enabled(&call).await.is_error, "must reject {case}");
++            assert_eq!(
++                call.state.sessions.owner_of_page(&page).await,
++                before,
++                "preserve {case}"
++            );
++        }
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn expired_recovery_only_one_competing_caller_can_adopt() -> anyhow::Result<()> {
++        let (call, _, page) = fixture(true, true, false).await?;
++        let other = call
++            .state
++            .sessions
++            .mint_with_id(
++                SessionId::new("other-current-task"),
++                ClientIdentity::Ephemeral {
++                    slug: "codex".into(),
++                    label: "Codex".into(),
++                },
++                ClientInfo {
++                    name: "Codex".into(),
++                    version: "test".into(),
++                    title: None,
++                },
++            )
++            .await?;
++        let mut rival = call.clone();
++        rival.session_id = other.id().clone();
++        let identity = rival.identity.as_mut().unwrap();
++        identity.session = other.clone();
++        identity.ownership_key = other.convo_id().clone();
++        let (a, b) = tokio::join!(reclaim_enabled(&call), reclaim_enabled(&rival));
++        assert_ne!(a.is_error, b.is_error);
++        let owner = call.state.sessions.owner_of_page(&page).await.unwrap();
++        assert!(
++            owner == call.identity.as_ref().unwrap().ownership_key || &owner == other.convo_id()
++        );
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn expired_recovery_unclaimed_after_backend_restart_still_requires_prior_task_receipt()
++    -> anyhow::Result<()> {
++        let (call, _, page) = fixture(true, true, false).await?;
++        call.state.sessions.ownership().remove_page(&page).await;
++        assert!(!reclaim_enabled(&call).await.is_error);
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn expired_recovery_failed_database_commit_preserves_prior_owner() -> anyhow::Result<()> {
++        use sea_orm::{ConnectionTrait, DbBackend, Statement};
++        let (call, _, page) = fixture(true, true, false).await?;
++        let before = call.state.sessions.owner_of_page(&page).await;
++        call.state.session_tabs.connection().execute(Statement::from_string(DbBackend::Sqlite,
++            "CREATE TRIGGER reject_recovery BEFORE INSERT ON session_tabs WHEN NEW.session_id = 's1' BEGIN SELECT RAISE(ABORT, 'synthetic recovery write failure'); END".to_string())).await?;
++        assert!(reclaim_enabled(&call).await.is_error);
++        assert_eq!(call.state.sessions.owner_of_page(&page).await, before);
++        assert!(
++            call.state
++                .session_tabs
++                .list_open_session_tabs(&["s1".into()])
++                .await?
++                .is_empty()
++        );
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn expired_recovery_url_changed_during_admission_preserves_both_claims()
++    -> anyhow::Result<()> {
++        let (call, browser, page) = fixture(true, true, false).await?;
++        let before = call.state.sessions.owner_of_page(&page).await;
++        browser.change_url_after.store(3, Ordering::SeqCst);
++        assert!(reclaim_enabled(&call).await.is_error);
++        assert_eq!(call.state.sessions.owner_of_page(&page).await, before);
++        assert!(
++            call.state
++                .session_tabs
++                .list_open_session_tabs(&["s1".into()])
++                .await?
++                .is_empty()
++        );
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn expired_recovery_cancelled_before_commit_changes_no_ownership() -> anyhow::Result<()> {
++        let (call, _, page) = fixture(true, true, false).await?;
++        let before = call.state.sessions.owner_of_page(&page).await;
++        call.cancel.cancel();
++        assert!(reclaim_enabled(&call).await.is_error);
++        assert_eq!(call.state.sessions.owner_of_page(&page).await, before);
++        assert!(
++            call.state
++                .session_tabs
++                .list_open_session_tabs(&["s1".into()])
++                .await?
++                .is_empty()
++        );
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn expired_recovery_rejects_later_claim_and_other_active_owner() -> anyhow::Result<()> {
++        let (call, _, page) = fixture(true, true, false).await?;
++        let other = call
++            .state
++            .sessions
++            .mint_with_id(
++                SessionId::new("other-client-live"),
++                ClientIdentity::Ephemeral {
++                    slug: "other".into(),
++                    label: "Other".into(),
++                },
++                ClientInfo {
++                    name: "Other".into(),
++                    version: "test".into(),
++                    title: None,
++                },
++            )
++            .await?;
++        call.state
++            .sessions
++            .ownership()
++            .claim_page(other.convo_id().clone(), page.clone())
++            .await;
++        call.state.session_tabs.enqueue_claim_tab_for_session(
++            101,
++            Some("writer-target".into()),
++            other.id().as_str().into(),
++            other.convo_id().as_str().into(),
++            crate::clock::now_epoch_ms(),
++        );
++        call.state.session_tabs.drain_writes().await;
++        assert!(reclaim_enabled(&call).await.is_error);
++        assert_eq!(
++            call.state.sessions.owner_of_page(&page).await,
++            Some(other.convo_id().clone())
++        );
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn expired_recovery_lifecycle_reactivation_cannot_cross_admission() -> anyhow::Result<()>
++    {
++        use crate::identity::ConversationIdentity;
++        use crate::services::sessions::Session;
++        use tokio::sync::Semaphore;
++        let (call, _, page) = fixture(true, true, false).await?;
++        let prior = call.state.sessions.owner_of_page(&page).await.unwrap();
++        let entered = Arc::new(Semaphore::new(0));
++        let release = Arc::new(Semaphore::new(0));
++        let registry = call.state.sessions.clone();
++        let current = call.session_id.clone();
++        let expected = vec![(page.clone(), Some(prior.clone()))];
++        let entered_work = entered.clone();
++        let release_work = release.clone();
++        let recovery = tokio::spawn(async move {
++            registry
++                .reclaim_idle_pages(
++                    &SessionId::new("prior-task"),
++                    &current,
++                    &expected,
++                    &[(101, "writer-target".into())],
++                    "saved-group".into(),
++                    tokio_util::sync::CancellationToken::new(),
++                    async move {
++                        entered_work.add_permits(1);
++                        release_work
++                            .acquire()
++                            .await
++                            .map_err(|e| e.to_string())?
++                            .forget();
++                        Ok(())
++                    },
++                )
++                .await
++        });
++        tokio::time::timeout(std::time::Duration::from_secs(2), entered.acquire())
++            .await??
++            .forget();
++        let reactivated = Session::new(
++            SessionId::new("reactivated"),
++            ClientIdentity::Ephemeral {
++                slug: "codex".into(),
++                label: "Codex".into(),
++            },
++            ConversationIdentity::new(
++                "codex",
++                prior.as_str().strip_prefix("codex-").unwrap().to_owned(),
++            ),
++            "Codex".into(),
++            tokio::time::Instant::now(),
++        );
++        let registry = call.state.sessions.clone();
++        let attempted = Arc::new(Semaphore::new(0));
++        let attempted_work = attempted.clone();
++        let activation = tokio::spawn(async move {
++            attempted_work.add_permits(1);
++            registry.insert_for_testing(reactivated).await;
++        });
++        tokio::time::timeout(std::time::Duration::from_secs(2), attempted.acquire())
++            .await??
++            .forget();
++        assert!(!activation.is_finished());
++        release.add_permits(1);
++        assert!(recovery.await?.is_ok());
++        activation.await?;
++        assert_eq!(
++            call.state.sessions.owner_of_page(&page).await,
++            call.identity.as_ref().map(|i| i.ownership_key.clone())
++        );
++        Ok(())
++    }
++}
+--- a/apps/claw-server-rust/src/api/mcp/effects/mod.rs
++++ b/apps/claw-server-rust/src/api/mcp/effects/mod.rs
+@@ -1,4 +1,5 @@
+ pub mod ownership_claims;
++pub mod expired_recovery;
+ pub mod page_ownership_notice;
+ pub mod session_naming;
+ pub mod tab_activity;
+--- a/apps/claw-server-rust/src/api/mcp/dispatch.rs
++++ b/apps/claw-server-rust/src/api/mcp/dispatch.rs
+@@ -469,13 +469,15 @@
+                 inner_call_hook,
+                 preloaded_helpers,
+             });
+-            match execute_tool(call.tool(), call.raw_args.clone(), &ctx).await {
++            if call.tool().name == "tabs" && call.raw_args.get("action").and_then(Value::as_str) == Some("reclaim_expired") {
++                effects::expired_recovery::reclaim(call).await
++            } else { match execute_tool(call.tool(), call.raw_args.clone(), &ctx).await {
+                 Ok(result) => result,
+                 Err(browseros_mcp::framework::ToolError::Cancelled) => {
+                     ToolResult::error(format!("{} failed: cancelled", call.tool().name))
+                 }
+                 Err(error) => ToolResult::error(format!("{} failed: {error}", call.tool().name)),
+-            }
++            } }
+         }
+         None => ToolResult::error(browser_unavailable_message(&call.state).await),
+     };
+--- a/crates/browseros-mcp/src/tools/tabs.rs
++++ b/crates/browseros-mcp/src/tools/tabs.rs
+@@ -29,6 +29,16 @@
+     Active,
+     New,
+     Close,
++    #[serde(rename = "reclaim_expired")]
++    ReclaimExpired,
++}
++
++#[derive(Debug, Clone, Deserialize, JsonSchema)]
++#[serde(deny_unknown_fields)]
++pub struct RecoveryTarget {
++    #[serde(rename = "targetId")]
++    pub target_id: String,
++    pub url: String,
+ }
+ 
+ #[derive(Debug, Clone, Deserialize, JsonSchema)]
+@@ -50,6 +60,11 @@
+     /// to keep continuing work in the same group; omit it to use your own group.
+     #[serde(default, rename = "groupId")]
+     group_id: Option<String>,
++    /// Internal Workspace resume proof; public callers use workspace_cleanup resume.
++    #[serde(default, rename = "priorSession")]
++    prior_session: Option<String>,
++    #[serde(default)]
++    expected: Option<Vec<RecoveryTarget>>,
+ }
+ 
+ pub fn definition() -> crate::framework::ToolDef {
+@@ -89,7 +104,9 @@
+ ) -> BoxFuture<'a, ToolExecResult<Option<ToolResult>>> {
+     Box::pin(async move {
+         let args: TabsArgs = parse_args(raw)?;
++        let _ = (&args.prior_session, &args.expected);
+         let result = match args.action {
++            TabsAction::ReclaimExpired => error_result("reclaim_expired requires the Workspace task dispatcher"),
+             TabsAction::List => {
+                 let pages = ctx.session.pages.list().await?;
+                 let lines = pages.iter().map(format_page_line).collect::<Vec<_>>();

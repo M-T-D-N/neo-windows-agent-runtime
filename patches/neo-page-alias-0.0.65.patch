@@ -1,0 +1,382 @@
+--- a/crates/browseros-core/src/pages.rs
++++ b/crates/browseros-core/src/pages.rs
+@@ -105,17 +105,7 @@
+             let existing_page_id = find_by_target(&state.pages, &target_id)
+                 .or_else(|| find_by_tab(&state.pages, TabId(tab.tab_id)));
+             if let Some(page_id) = existing_page_id {
+-                let mut stale_target = None;
+-                if let Some(existing) = state.pages.get_mut(&page_id) {
+-                    if existing.target_id != target_id {
+-                        stale_target = Some(existing.target_id.clone());
+-                    }
+-                    let prior_window = existing.window_id.clone();
+-                    *existing = page_info_from_tab(page_id.clone(), tab, prior_window);
+-                }
+-                if let Some(stale_target) = stale_target {
+-                    state.sessions.remove(&stale_target);
+-                }
++                sync_physical_aliases(&mut state, page_id, tab);
+             } else {
+                 let page_id = PageId(state.next_page_id);
+                 state.next_page_id += 1;
+@@ -252,8 +242,6 @@
+             .await;
+         match refreshed {
+             Ok(result) => {
+-                let updated =
+-                    page_info_from_tab(page_id.clone(), result.tab, info.window_id.clone());
+                 let mut state = self.state.lock().await;
+                 let Some(current) = state.pages.get(&page_id) else {
+                     return Ok(None);
+@@ -262,11 +250,10 @@
+                 if current != &info {
+                     return Ok(Some(current.clone()));
+                 }
+-                if updated.target_id != info.target_id {
+-                    state.sessions.remove(&info.target_id);
+-                }
+-                state.pages.insert(page_id, updated.clone());
+-                Ok(Some(updated))
++                // Preserve old PageIds while refreshing their shared physical
++                // document, including aliases created by older versions.
++                let tab = result.tab;
++                Ok(Some(sync_physical_aliases(&mut state, page_id, tab)))
+             }
+             Err(_err) => {
+                 self.list().await?;
+@@ -376,15 +363,19 @@
+         }
+ 
+         let mut state = self.state.lock().await;
+-        let page_id = PageId(state.next_page_id);
+-        state.next_page_id += 1;
++        // A concurrent list may have registered this tab while createTab was
++        // awaiting readiness/grouping. Reuse its handle under the same lock.
++        let page_id = find_by_target(&state.pages, &TargetId(tab.target_id.clone()))
++            .or_else(|| find_by_tab(&state.pages, TabId(tab.tab_id)))
++            .unwrap_or_else(|| {
++                let id = PageId(state.next_page_id);
++                state.next_page_id += 1;
++                id
++            });
+         if tab.url.is_empty() {
+             tab.url = url.to_string();
+         }
+-        state.pages.insert(
+-            page_id.clone(),
+-            page_info_from_tab(page_id.clone(), tab, None),
+-        );
++        sync_physical_aliases(&mut state, page_id.clone(), tab);
+         state.agent_created.insert(page_id.clone());
+         Ok(page_id)
+     }
+@@ -561,20 +552,8 @@
+         page_id: PageId,
+         tab: browser::TabInfo,
+     ) -> Result<PageInfo, CoreError> {
+-        let prior_window = self
+-            .state
+-            .lock()
+-            .await
+-            .pages
+-            .get(&page_id)
+-            .and_then(|info| info.window_id.clone());
+-        let updated = page_info_from_tab(page_id.clone(), tab, prior_window);
+-        self.state
+-            .lock()
+-            .await
+-            .pages
+-            .insert(page_id, updated.clone());
+-        Ok(updated)
++        let mut state = self.state.lock().await;
++        Ok(sync_physical_aliases(&mut state, page_id, tab))
+     }
+ }
+ 
+@@ -612,17 +591,50 @@
+     }
+ }
+ 
++// Alias handles remain valid; only their current physical metadata is shared.
++// Ownership/claims and detach hooks are deliberately untouched.
++fn sync_physical_aliases(
++    state: &mut PageState,
++    page_id: PageId,
++    tab: browser::TabInfo,
++) -> PageInfo {
++    let prior_window = state.pages.get(&page_id).and_then(|p| p.window_id.clone());
++    let updated = page_info_from_tab(page_id.clone(), tab, prior_window);
++    let aliases = state
++        .pages
++        .values()
++        .filter(|p| {
++            p.page_id == page_id || p.target_id == updated.target_id || p.tab_id == updated.tab_id
++        })
++        .map(|p| p.page_id.clone())
++        .chain(std::iter::once(page_id.clone()))
++        .collect::<HashSet<_>>();
++    for id in aliases {
++        if let Some(prior) = state.pages.get(&id) {
++            if prior.target_id != updated.target_id {
++                state.sessions.remove(&prior.target_id);
++            }
++        }
++        let mut info = updated.clone();
++        info.page_id = id.clone();
++        state.pages.insert(id, info);
++    }
++    updated
++}
++
+ fn find_by_target(pages: &HashMap<PageId, PageInfo>, target_id: &TargetId) -> Option<PageId> {
+     pages
+         .values()
+-        .find(|info| &info.target_id == target_id)
++        .filter(|info| &info.target_id == target_id)
++        .min_by_key(|info| info.page_id.0)
+         .map(|info| info.page_id.clone())
+ }
+ 
+ fn find_by_tab(pages: &HashMap<PageId, PageInfo>, tab_id: TabId) -> Option<PageId> {
+     pages
+         .values()
+-        .find(|info| info.tab_id == tab_id)
++        .filter(|info| info.tab_id == tab_id)
++        .min_by_key(|info| info.page_id.0)
+         .map(|info| info.page_id.clone())
+ }
+ 
+@@ -882,4 +894,208 @@
+         );
+         Ok(())
+     }
+-}
++
++    struct InterleavedConnection {
++        inner: std::sync::Arc<TestConnection>,
++        ready: tokio::sync::Notify,
++        resume: tokio::sync::Notify,
++    }
++    impl crate::CdpConnection for InterleavedConnection {
++        fn send<'a>(
++            &'a self,
++            method: &'a str,
++            params: Value,
++            session: Option<&'a crate::SessionId>,
++        ) -> futures_util::future::BoxFuture<'a, Result<Value, browseros_cdp::CdpError>> {
++            Box::pin(async move {
++                if method == "Browser.getTabInfo" {
++                    self.ready.notify_one();
++                    self.resume.notified().await;
++                }
++                self.inner.send(method, params, session).await
++            })
++        }
++        fn send_raw_json<'a>(
++            &'a self,
++            method: &'a str,
++            params: &'a str,
++            session: Option<&'a crate::SessionId>,
++        ) -> futures_util::future::BoxFuture<'a, Result<String, browseros_cdp::CdpError>> {
++            Box::pin(async move {
++                let v = self
++                    .send(method, serde_json::from_str(params)?, session)
++                    .await?;
++                Ok(serde_json::to_string(&v)?)
++            })
++        }
++        fn events(&self) -> tokio::sync::broadcast::Receiver<browseros_cdp::CdpEvent> {
++            self.inner.events()
++        }
++        fn is_connected(&self) -> bool {
++            true
++        }
++        fn connection_epoch(&self) -> u64 {
++            1
++        }
++    }
++
++    #[tokio::test]
++    async fn alias_creation_racing_list_reuses_the_existing_page_id() -> Result<(), Box<dyn Error>>
++    {
++        let connection = std::sync::Arc::new(InterleavedConnection {
++            inner: TestConnection::new([
++                (
++                    "Browser.getWindows",
++                    json!({"windows":[window_json(3,"normal",true,false)]}),
++                ),
++                ("Browser.createTab", json!({"tab":tab_json(7,"target-7")})),
++                ("Browser.getTabInfo", json!({"tab":tab_json(7,"target-7")})),
++                ("Browser.getTabs", json!({"tabs":[tab_json(7,"target-7")]})),
++            ]),
++            ready: Default::default(),
++            resume: Default::default(),
++        });
++        let manager = std::sync::Arc::new(PageManager::new(
++            connection.clone(),
++            PageManagerHooks::default(),
++        ));
++        let producer = manager.clone();
++        let pending = tokio::spawn(async move {
++            producer
++                .new_page("https://example.com", NewPageOptions::default())
++                .await
++        });
++        tokio::time::timeout(
++            std::time::Duration::from_secs(2),
++            connection.ready.notified(),
++        )
++        .await?;
++        let listed = manager.list().await?;
++        let earlier = listed[0].page_id.clone();
++        connection.resume.notify_one();
++        let created = pending.await??;
++        assert_eq!(created, earlier);
++        let state = manager.state.lock().await;
++        assert_eq!(state.pages.len(), 1);
++        assert!(state.agent_created.contains(&earlier));
++        Ok(())
++    }
++
++    async fn aliases(responses: Vec<(&'static str, Value)>) -> PageManager {
++        let manager = PageManager::new(TestConnection::new(responses), PageManagerHooks::default());
++        let old: browseros_cdp::browser::TabInfo =
++            serde_json::from_value(tab_json(7, "target-7")).unwrap();
++        let mut state = manager.state.lock().await;
++        for id in [1, 2] {
++            state.pages.insert(
++                crate::PageId(id),
++                super::page_info_from_tab(crate::PageId(id), old.clone(), None),
++            );
++        }
++        let other = serde_json::from_value(tab_json(8, "unrelated-target")).unwrap();
++        state.pages.insert(
++            crate::PageId(3),
++            super::page_info_from_tab(crate::PageId(3), other, None),
++        );
++        state.next_page_id = 4;
++        drop(state);
++        manager
++    }
++    fn changed_tab() -> Value {
++        let mut tab = tab_json(7, "target-7");
++        tab["url"] = json!("https://example.org/new");
++        tab["title"] = json!("New document");
++        tab["groupId"] = json!("new-group");
++        tab["windowId"] = json!(9);
++        tab["isLoading"] = json!(true);
++        tab["loadProgress"] = json!(0.4);
++        tab
++    }
++    async fn assert_aliases_current(manager: &PageManager) {
++        let state = manager.state.lock().await;
++        for id in [1, 2] {
++            let p = &state.pages[&crate::PageId(id)];
++            assert_eq!(p.url, "https://example.org/new");
++            assert_eq!(p.title, "New document");
++            assert_eq!(p.group_id.as_deref(), Some("new-group"));
++            assert_eq!(p.window_id, Some(crate::WindowId(9)));
++            assert!(p.is_loading);
++            assert_eq!(p.load_progress, 0.4);
++        }
++        assert_eq!(state.pages[&crate::PageId(3)].url, "https://example.com");
++        assert_eq!(state.pages.len(), 3);
++    }
++    #[tokio::test]
++    async fn alias_list_updates_all_old_handles_and_keeps_unrelated_pages()
++    -> Result<(), Box<dyn Error>> {
++        let manager = aliases(vec![(
++            "Browser.getTabs",
++            json!({"tabs":[changed_tab(),tab_json(8,"unrelated-target")]}),
++        )])
++        .await;
++        let pages = manager.list().await?;
++        assert_eq!(pages.len(), 3);
++        assert_aliases_current(&manager).await;
++        Ok(())
++    }
++    #[tokio::test]
++    async fn alias_refresh_updates_all_old_handles() -> Result<(), Box<dyn Error>> {
++        let manager = aliases(vec![("Browser.getTabInfo", json!({"tab":changed_tab()}))]).await;
++        manager.refresh(crate::PageId(2)).await?;
++        assert_aliases_current(&manager).await;
++        Ok(())
++    }
++    #[tokio::test]
++    async fn alias_move_update_updates_all_old_handles() -> Result<(), Box<dyn Error>> {
++        let manager = aliases(vec![]).await;
++        manager
++            .update_from_tab(crate::PageId(2), serde_json::from_value(changed_tab())?)
++            .await?;
++        assert_aliases_current(&manager).await;
++        Ok(())
++    }
++    #[tokio::test]
++    async fn alias_target_rebind_invalidates_only_the_previous_session()
++    -> Result<(), Box<dyn Error>> {
++        let mut tab = changed_tab();
++        tab["targetId"] = json!("replacement-target");
++        let manager = aliases(vec![(
++            "Browser.getTabs",
++            json!({"tabs":[tab,tab_json(8,"unrelated-target")]}),
++        )])
++        .await;
++        {
++            let mut state = manager.state.lock().await;
++            state.sessions.insert(
++                crate::TargetId("target-7".into()),
++                crate::SessionId::from("old-session"),
++            );
++            state.sessions.insert(
++                crate::TargetId("unrelated-target".into()),
++                crate::SessionId::from("other-session"),
++            );
++            state.agent_created.insert(crate::PageId(2));
++        }
++        manager.list().await?;
++        assert_aliases_current(&manager).await;
++        let state = manager.state.lock().await;
++        for id in [1, 2] {
++            assert_eq!(
++                state.pages[&crate::PageId(id)].target_id,
++                crate::TargetId("replacement-target".into())
++            );
++        }
++        assert!(
++            !state
++                .sessions
++                .contains_key(&crate::TargetId("target-7".into()))
++        );
++        assert!(
++            state
++                .sessions
++                .contains_key(&crate::TargetId("unrelated-target".into()))
++        );
++        assert!(state.agent_created.contains(&crate::PageId(2)));
++        Ok(())
++    }
++}
+--- a/apps/claw-server-rust/src/api/mcp/effects/expired_recovery.rs
++++ b/apps/claw-server-rust/src/api/mcp/effects/expired_recovery.rs
+@@ -864,7 +864,7 @@
+     }
+ 
+     #[tokio::test]
+-    async fn expired_recovery_checks_and_transfers_every_physical_alias() -> anyhow::Result<()> {
++    async fn expired_recovery_reuses_physical_handle_and_preserves_owner_conflicts() -> anyhow::Result<()> {
+         for conflict in [false, true] {
+             let (call, recorder, original) = fixture(true, true, false).await?;
+             recorder.alias_fixture.store(true, Ordering::SeqCst);
+@@ -883,9 +883,10 @@
+                 .await?;
+             recorder.alias_fixture.store(false, Ordering::SeqCst);
+             recorder.calls.lock().unwrap().clear();
+-            assert_ne!(alias, original);
++            // new_page must reuse the handle a prior list already registered.
++            assert_eq!(alias, original);
+             if conflict {
+-                // A second alias belonging to another live task must veto the whole transfer.
++                // A live owner on that physical handle must still veto transfer.
+                 call.state
+                     .sessions
+                     .ownership()

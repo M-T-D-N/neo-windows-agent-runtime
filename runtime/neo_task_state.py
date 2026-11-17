@@ -444,7 +444,7 @@ class TaskState:
         """Supply exact local task provenance, never infer server-side expiry.
 
         Every saved physical member must have a consistent foreign owner. The
-        server still verifies the original handle's idle end and final claims.
+        server still verifies the original handle's end and physical claims.
         """
         record = self.record or {}
         requests = []

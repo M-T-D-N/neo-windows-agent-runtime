@@ -383,11 +383,16 @@ class OutputOwnershipTests(unittest.TestCase):
         self.state.bind(TASK)
         self.baseline = self.state.output_baseline('evaluate')
         self.start = time.time_ns()
+        # Give the Windows file clock a tick before creating synthetic outputs.
+        if os.name == 'nt':
+            time.sleep(0.02)
 
     def output(self, producer='evaluate', extension='txt'):
         import time, uuid
         path = self.output_root / f'{producer}-{time.time_ns() // 1000000}-{uuid.uuid4()}.{extension}'
         path.write_text('synthetic output', encoding='utf-8')
+        if os.name == 'nt':
+            time.sleep(0.02)
         return path
 
     def reply(self, path):

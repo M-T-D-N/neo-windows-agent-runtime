@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([switch]$Check,[switch]$RestoreSession,[switch]$StopOwnedRecoveryServer,[switch]$RuntimeWorker)
+param([switch]$Check,[switch]$RestoreSession,[switch]$StopOwnedRecoveryServer,[switch]$RuntimeWorker,[switch]$Background)
 $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
@@ -67,6 +67,7 @@ function Start-PersistentRuntimeWorker {
     if($launcher.Contains('"') -or $shell.Contains('"')){throw 'Invalid runtime activation path'}
     $command='"'+$shell+'" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "'+$launcher+'" -RuntimeWorker'
     if($RestoreSession){$command+=' -RestoreSession'}
+    if($Background){$command+=' -Background'}
     $startup=New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ShowWindow=[uint16]0}
     $created=Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
         CommandLine=$command;CurrentDirectory=$plan.server_state_root;ProcessStartupInformation=$startup
@@ -175,8 +176,21 @@ try {
         $arguments+='--disable-browseros-server-updater'
     }
     $env:WORKSPACE_NEO_DIRECT_RECOVERY=$null
-    # Hide only the activation worker; the agent browser must remain visible.
-    $p=Start-Process $exe -ArgumentList $arguments -WorkingDirectory $state -WindowStyle Normal -RedirectStandardError $browserLog -PassThru
+    if($Background){
+        # STARTUPINFO supplies SW_SHOWMINNOACTIVE without foreground input.
+        $launch=[pscustomobject]@{
+            executable=$exe
+            arguments=@($arguments | ForEach-Object {$_ -replace '="([^"]*)"$', '=$1'})
+            directory=$state
+            log=$browserLog
+        } | ConvertTo-Json -Depth 4 -Compress
+        $OutputEncoding=[Text.UTF8Encoding]::new($false)
+        $launchPid=$launch | & $plan.python_executable -B -X utf8 (Join-Path $PSScriptRoot 'neo_background_launch.py')
+        if($LASTEXITCODE -ne 0 -or "$launchPid" -notmatch '^\d+$'){throw 'Background Neo launch failed'}
+        $p=[pscustomobject]@{Id=[int]$launchPid}
+    } else {
+        $p=Start-Process $exe -ArgumentList $arguments -WorkingDirectory $state -WindowStyle Normal -RedirectStandardError $browserLog -PassThru
+    }
     $evidence=Join-Path (Split-Path $plan.server_state_root -Parent) 'evidence'
     New-Item -ItemType Directory -Path $evidence -Force | Out-Null
     Get-CimInstance Win32_Process -Filter "ProcessId=$($p.Id)" | Select-Object ProcessId,ParentProcessId,CreationDate,CommandLine | ConvertTo-Json | Set-Content (Join-Path $evidence 'browser-launch.json')

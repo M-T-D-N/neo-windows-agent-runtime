@@ -111,7 +111,7 @@ def select_backend(plan, processes, listeners, read_config, digest):
     return {'endpoint': f'http://127.0.0.1:{port}/mcp', 'processes': [browser, server]}
 
 
-def verified_backend_endpoint(plan):
+def verified_backend_context(plan):
     import psutil
     try:
         if not (plan.get('server_override') or {}).get('enabled'):
@@ -136,9 +136,14 @@ def verified_backend_endpoint(plan):
         for prior in found['processes']:
             if psutil.Process(prior['pid']).as_dict(attrs=list(prior)) != prior:
                 return None
-        return found['endpoint']
+        return found
     except (OSError, ValueError, KeyError, TypeError, psutil.Error):
         return None
+
+
+def verified_backend_endpoint(plan):
+    context = verified_backend_context(plan)
+    return context['endpoint'] if context else None
 
 
 if __name__ == '__main__':

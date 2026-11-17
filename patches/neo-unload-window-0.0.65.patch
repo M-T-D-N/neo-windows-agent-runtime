@@ -1,0 +1,2022 @@
+diff --git a/crates/browseros-core/src/frames.rs b/crates/browseros-core/src/frames.rs
+--- a/crates/browseros-core/src/frames.rs
++++ b/crates/browseros-core/src/frames.rs
+@@ -69,14 +69,39 @@
+         same_process_parent: Option<&ProtocolSession>,
+         cross_process: bool,
+     ) -> Result<FrameTarget, CoreError> {
++        self.resolve_frame_target_pinned(
++            page_id,
++            frame_id,
++            same_process_parent,
++            cross_process,
++            None,
++        )
++        .await
++    }
++
++    pub(crate) async fn resolve_frame_target_pinned(
++        &self,
++        page_id: PageId,
++        frame_id: Option<FrameId>,
++        same_process_parent: Option<&ProtocolSession>,
++        cross_process: bool,
++        pinned: Option<&ProtocolSession>,
++    ) -> Result<FrameTarget, CoreError> {
+         self.clear_sessions_from_prior_connection().await;
+-        let page_session_id = self
+-            .page_sessions
+-            .lock()
+-            .await
+-            .get(&page_id)
+-            .cloned()
+-            .ok_or_else(|| CoreError::Message(format!("Page {page_id} has no attached session")))?;
++        let page_session_id = if let Some(root) = pinned {
++            root.session_id()
++                .cloned()
++                .ok_or_else(|| CoreError::Message("Pinned root has no CDP session".into()))?
++        } else {
++            self.page_sessions
++                .lock()
++                .await
++                .get(&page_id)
++                .cloned()
++                .ok_or_else(|| {
++                    CoreError::Message(format!("Page {page_id} has no attached session"))
++                })?
++        };
+         let Some(frame_id) = frame_id else {
+             return Ok(FrameTarget {
+                 session: ProtocolSession::for_session(self.cdp.clone(), page_session_id),
+diff --git a/crates/browseros-core/src/input/fill.rs b/crates/browseros-core/src/input/fill.rs
+--- a/crates/browseros-core/src/input/fill.rs
++++ b/crates/browseros-core/src/input/fill.rs
+@@ -31,7 +31,8 @@
+         value: &str,
+         clear: bool,
+     ) -> Result<Option<Point>, CoreError> {
+-        let resolved = self.observer.resolve_ref(ref_id).await?;
++        self.prepare().await?;
++        let resolved = self.resolve_ref(ref_id).await?;
+         self.fill_node(
+             &resolved.session,
+             InputTarget::from_ref_entry(&resolved.entry),
+diff --git a/crates/browseros-core/src/input/mod.rs b/crates/browseros-core/src/input/mod.rs
+--- a/crates/browseros-core/src/input/mod.rs
++++ b/crates/browseros-core/src/input/mod.rs
+@@ -50,6 +50,7 @@
+     observer: Arc<Observer>,
+     pages: Arc<PageManager>,
+     page_id: PageId,
++    prepared: tokio::sync::Mutex<Option<crate::pages::PreparedPage>>,
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -89,7 +90,33 @@
+             observer,
+             pages,
+             page_id,
+-        }
++            prepared: tokio::sync::Mutex::new(None),
++        }
++    }
++
++    async fn prepare(&self) -> Result<(), CoreError> {
++        let proof = self.pages.prepare_for_unload(self.page_id.clone()).await?;
++        *self.prepared.lock().await = Some(proof);
++        Ok(())
++    }
++
++    async fn resolve_ref(
++        &self,
++        ref_id: &Ref,
++    ) -> Result<crate::observer::ResolvedElement, CoreError> {
++        let proof = self
++            .prepared
++            .lock()
++            .await
++            .clone()
++            .ok_or_else(|| CoreError::Message("Input has no prepared page".into()))?;
++        self.pages.validate_prepared(&proof).await?;
++        let resolved = self
++            .observer
++            .resolve_ref_pinned(ref_id, &proof.page.session)
++            .await?;
++        self.pages.validate_prepared(&proof).await?;
++        Ok(resolved)
+     }
+ 
+     pub async fn click(
+@@ -97,7 +124,8 @@
+         ref_id: &Ref,
+         opts: ClickOptions,
+     ) -> Result<Option<Point>, CoreError> {
+-        let resolved = self.observer.resolve_ref(ref_id).await?;
++        self.prepare().await?;
++        let resolved = self.resolve_ref(ref_id).await?;
+         self.click_node(
+             &resolved.session,
+             InputTarget::from_ref_entry(&resolved.entry),
+@@ -111,6 +139,7 @@
+         backend_node_id: i64,
+         opts: ClickOptions,
+     ) -> Result<Option<Point>, CoreError> {
++        self.prepare().await?;
+         self.with_page_session_retry(|session| {
+             let opts = opts.clone();
+             async move {
+@@ -126,6 +155,7 @@
+     }
+ 
+     pub async fn click_at(&self, x: f64, y: f64, opts: ClickOptions) -> Result<(), CoreError> {
++        self.prepare().await?;
+         self.with_page_session_retry(|session| {
+             let button = opts.button.unwrap_or(MouseButton::Left);
+             let click_count = opts.click_count.unwrap_or(1);
+@@ -135,11 +165,13 @@
+     }
+ 
+     pub async fn hover_at(&self, x: f64, y: f64) -> Result<(), CoreError> {
++        self.prepare().await?;
+         self.with_page_session_retry(|session| async move { dispatch_hover(&session, x, y).await })
+             .await
+     }
+ 
+     pub async fn type_at(&self, x: f64, y: f64, text: &str, clear: bool) -> Result<(), CoreError> {
++        self.prepare().await?;
+         self.with_page_session_retry(|session| {
+             let text = text.to_string();
+             async move {
+@@ -154,6 +186,7 @@
+     }
+ 
+     pub async fn drag_at(&self, from: Point, to: Point) -> Result<(), CoreError> {
++        self.prepare().await?;
+         self.with_page_session_retry(
+             |session| async move { dispatch_drag(&session, from, to).await },
+         )
+@@ -189,7 +222,8 @@
+     }
+ 
+     pub async fn hover(&self, ref_id: &Ref) -> Result<Point, CoreError> {
+-        let resolved = self.observer.resolve_ref(ref_id).await?;
++        self.prepare().await?;
++        let resolved = self.resolve_ref(ref_id).await?;
+         self.hover_node(
+             &resolved.session,
+             InputTarget::from_ref_entry(&resolved.entry),
+@@ -198,6 +232,7 @@
+     }
+ 
+     pub async fn hover_backend_node(&self, backend_node_id: i64) -> Result<Point, CoreError> {
++        self.prepare().await?;
+         self.with_page_session_retry(|session| async move {
+             self.hover_node(&session, InputTarget::from_backend_node(backend_node_id))
+                 .await
+@@ -218,12 +253,14 @@
+     }
+ 
+     pub async fn focus(&self, ref_id: &Ref) -> Result<(), CoreError> {
+-        let resolved = self.observer.resolve_ref(ref_id).await?;
++        self.prepare().await?;
++        let resolved = self.resolve_ref(ref_id).await?;
+         scroll_into_view(&resolved.session, resolved.backend_node_id).await;
+         focus_element_js(&resolved.session, resolved.backend_node_id).await
+     }
+ 
+     pub async fn type_text(&self, text: &str) -> Result<(), CoreError> {
++        self.prepare().await?;
+         self.with_page_session_retry(|session| {
+             let text = text.to_string();
+             async move { type_text(&session, &text).await }
+@@ -232,6 +269,7 @@
+     }
+ 
+     pub async fn press(&self, key: &str) -> Result<(), CoreError> {
++        self.prepare().await?;
+         self.with_page_session_retry(|session| {
+             let key = key.to_string();
+             async move { press_combo(&session, &key).await }
+@@ -244,7 +282,8 @@
+         ref_id: &Ref,
+         value: &str,
+     ) -> Result<Option<String>, CoreError> {
+-        let resolved = self.observer.resolve_ref(ref_id).await?;
++        self.prepare().await?;
++        let resolved = self.resolve_ref(ref_id).await?;
+         self.select_backend_node_with_session(&resolved.session, resolved.backend_node_id, value)
+             .await
+     }
+@@ -254,6 +293,7 @@
+         backend_node_id: i64,
+         value: &str,
+     ) -> Result<Option<String>, CoreError> {
++        self.prepare().await?;
+         self.with_page_session_retry(|session| {
+             let value = value.to_string();
+             async move {
+@@ -282,7 +322,8 @@
+     }
+ 
+     pub async fn check(&self, ref_id: &Ref) -> Result<bool, CoreError> {
+-        let resolved = self.observer.resolve_ref(ref_id).await?;
++        self.prepare().await?;
++        let resolved = self.resolve_ref(ref_id).await?;
+         let checked = call_on_element(
+             &resolved.session,
+             resolved.backend_node_id,
+@@ -303,7 +344,8 @@
+     }
+ 
+     pub async fn uncheck(&self, ref_id: &Ref) -> Result<bool, CoreError> {
+-        let resolved = self.observer.resolve_ref(ref_id).await?;
++        self.prepare().await?;
++        let resolved = self.resolve_ref(ref_id).await?;
+         let checked = call_on_element(
+             &resolved.session,
+             resolved.backend_node_id,
+@@ -328,7 +370,8 @@
+         ref_id: &Ref,
+         files: Vec<String>,
+     ) -> Result<(), CoreError> {
+-        let resolved = self.observer.resolve_ref(ref_id).await?;
++        self.prepare().await?;
++        let resolved = self.resolve_ref(ref_id).await?;
+         let _: Value = resolved
+             .session
+             .send(
+@@ -362,8 +405,9 @@
+     }
+ 
+     pub async fn drag(&self, source_ref: &Ref, target_ref: &Ref) -> Result<DragResult, CoreError> {
+-        let source = self.observer.resolve_ref(source_ref).await?;
+-        let target = self.observer.resolve_ref(target_ref).await?;
++        self.prepare().await?;
++        let source = self.resolve_ref(source_ref).await?;
++        let target = self.resolve_ref(target_ref).await?;
+         if !source.session.same_session(&target.session) {
+             return Err(CoreError::CrossFrameDrag);
+         }
+@@ -381,6 +425,7 @@
+         amount: i64,
+         ref_id: Option<&Ref>,
+     ) -> Result<(), CoreError> {
++        self.prepare().await?;
+         let pixels = amount * 120;
+         let (delta_x, delta_y) = match direction {
+             ScrollDirection::Left => (-pixels, 0),
+@@ -392,7 +437,7 @@
+             return Ok(());
+         }
+         if let Some(ref_id) = ref_id {
+-            let resolved = self.observer.resolve_ref(ref_id).await?;
++            let resolved = self.resolve_ref(ref_id).await?;
+             let point = get_element_center(&resolved.session, resolved.backend_node_id).await?;
+             dispatch_scroll(
+                 &resolved.session,
+@@ -418,6 +463,10 @@
+     }
+ 
+     async fn page_session(&self) -> Result<ProtocolSession, CoreError> {
++        if let Some(proof) = self.prepared.lock().await.clone() {
++            self.pages.validate_prepared(&proof).await?;
++            return Ok(proof.page.session);
++        }
+         Ok(self.pages.get_session(self.page_id.clone()).await?.session)
+     }
+ 
+@@ -447,6 +496,9 @@
+             match result {
+                 Ok(value) => return Ok(value),
+                 Err(err) if !attempted && err.is_retryable_session_loss() => {
++                    if self.prepared.lock().await.is_some() {
++                        return Err(err);
++                    }
+                     attempted = true;
+                     let _ = self.pages.refresh(self.page_id.clone()).await;
+                 }
+@@ -550,6 +602,12 @@
+         ) -> BoxFuture<'a, Result<Value, CdpError>> {
+             Box::pin(async move {
+                 match method {
++                    "Browser.getWindows" => Ok(
++                        json!({"windows":[{"windowId":3,"windowType":"normal","isVisible":true}]}),
++                    ),
++                    "Browser.getWindowForTarget" => {
++                        Ok(json!({"windowId":3,"bounds":{"windowState":"normal"}}))
++                    }
+                     "Browser.getTabs" => Ok(json!({ "tabs": [tab_value()] })),
+                     "Browser.getTabInfo" => Ok(json!({ "tab": tab_value() })),
+                     "Target.attachToTarget" => Ok(json!({ "sessionId": "session-1" })),
+diff --git a/crates/browseros-core/src/lib.rs b/crates/browseros-core/src/lib.rs
+--- a/crates/browseros-core/src/lib.rs
++++ b/crates/browseros-core/src/lib.rs
+@@ -25,3 +25,7 @@
+ mod session;
+ #[cfg(test)]
+ mod test_support;
++
++#[cfg(windows)]
++#[allow(unsafe_code)] // Confined Win32 adapter for verified no-activation restoration.
++mod native_window;
+diff --git a/crates/browseros-core/src/native_window.rs b/crates/browseros-core/src/native_window.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/browseros-core/src/native_window.rs
+@@ -0,0 +1,386 @@
++// Windows-only restoration that never calls SetForegroundWindow or activates Neo.
++// These FFI calls are confined here; the caller proves a unique existing CDP
++// normal window and derives the browser PID from that same CDP connection.
++use std::{ffi::c_void, thread, time::Duration};
++type Hwnd = *mut c_void;
++#[link(name = "user32")]
++unsafe extern "system" {
++    fn EnumWindows(callback: unsafe extern "system" fn(Hwnd, isize) -> i32, data: isize) -> i32;
++    fn GetWindowThreadProcessId(window: Hwnd, pid: *mut u32) -> u32;
++    fn GetClassNameW(window: Hwnd, name: *mut u16, count: i32) -> i32;
++    fn GetWindow(window: Hwnd, command: u32) -> Hwnd;
++    fn GetForegroundWindow() -> Hwnd;
++    fn GetWindowLongPtrW(window: Hwnd, index: i32) -> isize;
++    fn IsWindow(window: Hwnd) -> i32;
++    fn IsIconic(window: Hwnd) -> i32;
++    fn IsWindowVisible(window: Hwnd) -> i32;
++    fn SetWindowPos(
++        window: Hwnd,
++        after: Hwnd,
++        x: i32,
++        y: i32,
++        width: i32,
++        height: i32,
++        flags: u32,
++    ) -> i32;
++    fn ShowWindowAsync(window: Hwnd, command: i32) -> i32;
++}
++#[link(name = "kernel32")]
++unsafe extern "system" {
++    fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
++    fn GetExitCodeProcess(process: *mut c_void, code: *mut u32) -> i32;
++    fn CloseHandle(handle: *mut c_void) -> i32;
++}
++struct Process(usize);
++impl Drop for Process {
++    fn drop(&mut self) {
++        unsafe {
++            CloseHandle(self.0 as *mut c_void);
++        }
++    }
++}
++struct Search {
++    pid: u32,
++    windows: Vec<Hwnd>,
++}
++unsafe extern "system" fn enumerate(window: Hwnd, data: isize) -> i32 {
++    // EnumWindows calls synchronously; data points to this call's live Search.
++    let search = unsafe { &mut *(data as *mut Search) };
++    let mut pid = 0;
++    unsafe {
++        GetWindowThreadProcessId(window, &mut pid);
++    }
++    if pid == search.pid && unsafe { GetWindow(window, 4) }.is_null() {
++        let mut name = [0u16; 64];
++        let count = unsafe { GetClassNameW(window, name.as_mut_ptr(), name.len() as i32) };
++        if count > 0 && String::from_utf16_lossy(&name[..count as usize]) == "Chrome_WidgetWin_1" {
++            search.windows.push(window);
++        }
++    }
++    1
++}
++fn owner(window: Hwnd) -> u32 {
++    let mut pid = 0;
++    unsafe {
++        GetWindowThreadProcessId(window, &mut pid);
++    }
++    pid
++}
++fn behind(window: Hwnd, foreground: Hwnd) -> bool {
++    let mut cursor = foreground;
++    for _ in 0..512 {
++        cursor = unsafe { GetWindow(cursor, 2) };
++        if cursor.is_null() {
++            return false;
++        }
++        if cursor == window {
++            return true;
++        }
++    }
++    false
++}
++fn live(process: &Process) -> bool {
++    let mut code = 0;
++    unsafe { GetExitCodeProcess(process.0 as *mut c_void, &mut code) != 0 && code == 259 }
++}
++pub(crate) struct WindowTicket {
++    pid: u32,
++    window: usize,
++    thread: u32,
++    process: Process,
++}
++fn candidates(pid: u32) -> Result<Vec<usize>, String> {
++    let mut search = Search {
++        pid,
++        windows: Vec::new(),
++    };
++    if unsafe { EnumWindows(enumerate, (&mut search as *mut Search) as isize) } == 0 {
++        return Err("Cannot enumerate existing browser windows".into());
++    }
++    Ok(search.windows.into_iter().map(|w| w as usize).collect())
++}
++pub(crate) fn capture(pid: u32) -> Result<WindowTicket, String> {
++    let process = Process(unsafe { OpenProcess(0x1000, 0, pid) } as usize);
++    if process.0 == 0 || !live(&process) {
++        return Err("Browser process identity unavailable".into());
++    }
++    let windows = candidates(pid)?;
++    if windows.len() != 1 {
++        return Err("Cannot identify one existing native browser window".into());
++    }
++    let window = windows[0];
++    let mut observed = 0;
++    let thread = unsafe { GetWindowThreadProcessId(window as Hwnd, &mut observed) };
++    if observed != pid || thread == 0 {
++        return Err("Browser window identity unavailable".into());
++    }
++    Ok(WindowTicket {
++        pid,
++        window,
++        thread,
++        process,
++    })
++}
++fn validate(ticket: &WindowTicket) -> Result<(), String> {
++    let windows = candidates(ticket.pid)?;
++    let mut pid = 0;
++    let thread = unsafe { GetWindowThreadProcessId(ticket.window as Hwnd, &mut pid) };
++    if windows != vec![ticket.window]
++        || pid != ticket.pid
++        || thread != ticket.thread
++        || !live(&ticket.process)
++    {
++        return Err(
++            "Native browser window was replaced or became ambiguous; no action dispatched".into(),
++        );
++    }
++    Ok(())
++}
++pub(crate) fn restore(ticket: WindowTicket) -> Result<(), String> {
++    validate(&ticket)?;
++    let window = ticket.window as Hwnd;
++    let pid = ticket.pid;
++    let process = &ticket.process;
++    let foreground = unsafe { GetForegroundWindow() };
++    if foreground.is_null() || foreground == window || unsafe { IsWindow(foreground) } == 0 {
++        return Err("Foreground unavailable or changed; leave window untouched".into());
++    }
++    // Do not silently alter an explicit always-on-top setting.
++    if unsafe { GetWindowLongPtrW(window, -20) } & 8 != 0 {
++        return Err("Topmost window requires explicit handling; no restoration dispatched".into());
++    }
++    if owner(window) != pid || !live(process) {
++        return Err("Browser window identity changed".into());
++    }
++    validate(&ticket)?;
++    // Queue a non-activating placement at HWND_BOTTOM before show. This never
++    // uses another app's HWND as an insertion target (including fullscreen games).
++    // NOSIZE|NOMOVE|NOACTIVATE|NOOWNERZORDER|ASYNCWINDOWPOS.
++    if unsafe { SetWindowPos(window, 1usize as Hwnd, 0, 0, 0, 0, 0x4213) } == 0 {
++        return Err(format!(
++            "Background placement failed; no show dispatched: {}",
++            std::io::Error::last_os_error()
++        ));
++    }
++    for _ in 0..50 {
++        if behind(window, foreground) {
++            break;
++        }
++        thread::sleep(Duration::from_millis(10));
++    }
++    if !behind(window, foreground) {
++        return Err("Background Z-order not confirmed; no show dispatched".into());
++    }
++    if unsafe { GetForegroundWindow() } != foreground {
++        return Err("Foreground changed during background placement; no show dispatched".into());
++    }
++    if owner(window) != pid || !live(process) {
++        return Err("Window/process changed during placement; no show dispatched".into());
++    }
++    validate(&ticket)?;
++    if unsafe { ShowWindowAsync(window, 4) } == 0 {
++        return Err("Non-activating restore failed".into());
++    }
++    for _ in 0..50 {
++        if unsafe { IsIconic(window) == 0 && IsWindowVisible(window) != 0 } {
++            break;
++        }
++        thread::sleep(Duration::from_millis(10));
++    }
++    if unsafe {
++        GetForegroundWindow() != foreground || IsIconic(window) != 0 || IsWindowVisible(window) == 0
++    } || !behind(window, foreground)
++        || owner(window) != pid
++        || !live(process)
++    {
++        return Err("Non-activating restoration not confirmed; action not dispatched".into());
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod live_tests {
++    use super::*;
++    #[repr(C)]
++    struct WindowClass {
++        style: u32,
++        procedure: Option<unsafe extern "system" fn(Hwnd, u32, usize, isize) -> isize>,
++        class_extra: i32,
++        window_extra: i32,
++        instance: Hwnd,
++        icon: Hwnd,
++        cursor: Hwnd,
++        background: Hwnd,
++        menu: *const u16,
++        name: *const u16,
++    }
++    #[link(name = "user32")]
++    unsafe extern "system" {
++        fn RegisterClassW(class: *const WindowClass) -> u16;
++        fn UnregisterClassW(name: *const u16, instance: Hwnd) -> i32;
++        fn CreateWindowExW(
++            exstyle: u32,
++            class: *const u16,
++            title: *const u16,
++            style: u32,
++            x: i32,
++            y: i32,
++            width: i32,
++            height: i32,
++            parent: Hwnd,
++            menu: Hwnd,
++            instance: Hwnd,
++            param: *mut c_void,
++        ) -> Hwnd;
++        fn DestroyWindow(window: Hwnd) -> i32;
++        fn DefWindowProcW(window: Hwnd, message: u32, wparam: usize, lparam: isize) -> isize;
++    }
++    #[link(name = "kernel32")]
++    unsafe extern "system" {
++        fn GetModuleHandleW(name: *const u16) -> Hwnd;
++    }
++    struct HiddenWindows {
++        name: Vec<u16>,
++        instance: Hwnd,
++        windows: Vec<Hwnd>,
++    }
++    impl HiddenWindows {
++        fn new() -> Self {
++            let name = "Chrome_WidgetWin_1\0".encode_utf16().collect::<Vec<_>>();
++            let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
++            let class = WindowClass {
++                style: 0,
++                procedure: Some(DefWindowProcW),
++                class_extra: 0,
++                window_extra: 0,
++                instance,
++                icon: std::ptr::null_mut(),
++                cursor: std::ptr::null_mut(),
++                background: std::ptr::null_mut(),
++                menu: std::ptr::null(),
++                name: name.as_ptr(),
++            };
++            assert_ne!(unsafe { RegisterClassW(&class) }, 0);
++            Self {
++                name,
++                instance,
++                windows: Vec::new(),
++            }
++        }
++        fn add(&mut self) -> Hwnd {
++            let title = "Neo hidden synthetic fixture\0"
++                .encode_utf16()
++                .collect::<Vec<_>>();
++            let window = unsafe {
++                CreateWindowExW(
++                    0,
++                    self.name.as_ptr(),
++                    title.as_ptr(),
++                    0x00CF0000,
++                    0,
++                    0,
++                    100,
++                    100,
++                    std::ptr::null_mut(),
++                    std::ptr::null_mut(),
++                    self.instance,
++                    std::ptr::null_mut(),
++                )
++            };
++            assert!(!window.is_null());
++            self.windows.push(window);
++            window
++        }
++        fn remove(&mut self, window: Hwnd) {
++            assert_ne!(unsafe { DestroyWindow(window) }, 0);
++            self.windows.retain(|w| *w != window);
++        }
++    }
++    impl Drop for HiddenWindows {
++        fn drop(&mut self) {
++            for window in &self.windows {
++                unsafe {
++                    DestroyWindow(*window);
++                }
++            }
++            unsafe {
++                UnregisterClassW(self.name.as_ptr(), self.instance);
++            }
++        }
++    }
++    #[test]
++    fn actual_hidden_replacement_and_multiple_candidates_are_rejected_without_showing() {
++        let mut windows = HiddenWindows::new();
++        let pid = std::process::id();
++        let foreground = unsafe { GetForegroundWindow() };
++        let old = windows.add();
++        let ticket = capture(pid).expect("capture original hidden fixture");
++        windows.remove(old);
++        let replacement = windows.add();
++        assert!(restore(ticket).is_err());
++        assert_eq!(unsafe { IsWindowVisible(replacement) }, 0);
++        assert_eq!(unsafe { GetForegroundWindow() }, foreground);
++        let _second = windows.add();
++        assert!(capture(pid).is_err());
++        for window in &windows.windows {
++            assert_eq!(unsafe { IsWindowVisible(*window) }, 0);
++        }
++        assert_eq!(unsafe { GetForegroundWindow() }, foreground);
++    }
++
++    #[test]
++    #[ignore = "Needs explicit PID of the current authorized dedicated Neo browser on the interactive desktop"]
++    fn actual_minimized_and_hidden_restoration_preserves_foreground_and_window() {
++        let pid = std::env::var("NEO_GUARD_TEST_PID")
++            .expect("exact authorized browser PID")
++            .parse::<u32>()
++            .expect("PID");
++        let mut search = Search {
++            pid,
++            windows: Vec::new(),
++        };
++        assert_ne!(
++            unsafe { EnumWindows(enumerate, (&mut search as *mut Search) as isize) },
++            0
++        );
++        assert_eq!(search.windows.len(), 1);
++        let window = search.windows[0];
++        let foreground = unsafe { GetForegroundWindow() };
++        assert!(!foreground.is_null() && foreground != window);
++        // SW_SHOWMINNOACTIVE and SW_HIDE affect only the verified Neo window.
++        for command in [7, 0] {
++            assert_ne!(unsafe { ShowWindowAsync(window, command) }, 0);
++            for _ in 0..50 {
++                let ready = unsafe {
++                    if command == 7 {
++                        IsIconic(window) != 0
++                    } else {
++                        IsWindowVisible(window) == 0
++                    }
++                };
++                if ready {
++                    break;
++                }
++                thread::sleep(Duration::from_millis(10));
++            }
++            assert!(
++                unsafe {
++                    if command == 7 {
++                        IsIconic(window) != 0
++                    } else {
++                        IsWindowVisible(window) == 0
++                    }
++                },
++                "Requested minimized/hidden start state not reached"
++            );
++            assert_eq!(unsafe { GetForegroundWindow() }, foreground);
++            restore(capture(pid).expect("capture exact existing HWND"))
++                .expect("non-activating restore of exact existing window");
++            assert_eq!(unsafe { GetForegroundWindow() }, foreground);
++            assert_eq!(owner(window), pid);
++            assert!(behind(window, foreground));
++            assert_eq!(unsafe { IsIconic(window) }, 0);
++            assert_ne!(unsafe { IsWindowVisible(window) }, 0);
++        }
++    }
++}
+diff --git a/crates/browseros-core/src/navigation.rs b/crates/browseros-core/src/navigation.rs
+--- a/crates/browseros-core/src/navigation.rs
++++ b/crates/browseros-core/src/navigation.rs
+@@ -24,7 +24,9 @@
+ 
+     pub async fn goto(&self, url: &str) -> Result<(), CoreError> {
+         self.throw_if_dialog_open()?;
+-        let page = self.pages.get_session(self.page_id.clone()).await?;
++        let prepared = self.pages.prepare_for_unload(self.page_id.clone()).await?;
++        let page = prepared.page;
++
+         let _: Value = page
+             .session
+             .send("Page.navigate", json!({ "url": url }))
+@@ -34,7 +36,9 @@
+ 
+     pub async fn reload(&self) -> Result<(), CoreError> {
+         self.throw_if_dialog_open()?;
+-        let page = self.pages.get_session(self.page_id.clone()).await?;
++        let prepared = self.pages.prepare_for_unload(self.page_id.clone()).await?;
++        let page = prepared.page;
++
+         let _: Value = page.session.send("Page.reload", json!({})).await?;
+         wait_for_load(&page.session, &self.page_signals, &self.page_id).await
+     }
+@@ -49,7 +53,9 @@
+ 
+     async fn history(&self, direction: &str) -> Result<(), CoreError> {
+         self.throw_if_dialog_open()?;
+-        let page = self.pages.get_session(self.page_id.clone()).await?;
++        let prepared = self.pages.prepare_for_unload(self.page_id.clone()).await?;
++        let page = prepared.page;
++
+         let _: Value = page
+             .session
+             .send(
+diff --git a/crates/browseros-core/src/observer.rs b/crates/browseros-core/src/observer.rs
+--- a/crates/browseros-core/src/observer.rs
++++ b/crates/browseros-core/src/observer.rs
+@@ -53,6 +53,7 @@
+     refs: RefMap,
+     url: String,
+     scope: Option<RefScope>,
++    root_session: ProtocolSession,
+ }
+ 
+ #[derive(Clone)]
+@@ -68,6 +69,7 @@
+     baseline: Option<SnapshotObservation>,
+     refs: RefMap,
+     ref_scope: Option<RefScope>,
++    root_session: Option<ProtocolSession>,
+ }
+ 
+ pub struct Observer {
+@@ -127,26 +129,79 @@
+     }
+ 
+     pub async fn resolve_ref(&self, ref_id: &Ref) -> Result<ResolvedElement, CoreError> {
+-        let entry = self
+-            .state
+-            .lock()
+-            .await
+-            .refs
+-            .get(ref_id)
+-            .cloned()
+-            .ok_or_else(|| CoreError::UnknownRef(ref_id.clone()))?;
+-        let _page_session = self.pages.get_session(self.page_id.clone()).await?;
++        self.resolve_ref_inner(ref_id, None).await
++    }
++
++    pub(crate) async fn resolve_ref_pinned(
++        &self,
++        ref_id: &Ref,
++        root: &ProtocolSession,
++    ) -> Result<ResolvedElement, CoreError> {
++        self.resolve_ref_inner(ref_id, Some(root)).await
++    }
++
++    async fn resolve_ref_inner(
++        &self,
++        ref_id: &Ref,
++        pinned: Option<&ProtocolSession>,
++    ) -> Result<ResolvedElement, CoreError> {
++        let (entry, scope) = {
++            let state = self.state.lock().await;
++            if let Some(root) = pinned {
++                if !state
++                    .root_session
++                    .as_ref()
++                    .is_some_and(|s| s.same_session(root))
++                {
++                    return Err(CoreError::Message(
++                        "Snapshot belongs to another page incarnation; take a fresh snapshot"
++                            .into(),
++                    ));
++                }
++            }
++            (
++                state
++                    .refs
++                    .get(ref_id)
++                    .cloned()
++                    .ok_or_else(|| CoreError::UnknownRef(ref_id.clone()))?,
++                state.ref_scope.as_ref().map(|s| s.document_id.clone()),
++            )
++        };
++        if pinned.is_none() {
++            let _ = self.pages.get_session(self.page_id.clone()).await?;
++        }
+         let target = self
+             .frames
+-            .resolve_frame_target(self.page_id.clone(), entry.frame_id.clone(), None, false)
++            .resolve_frame_target_pinned(
++                self.page_id.clone(),
++                entry.frame_id.clone(),
++                None,
++                false,
++                pinned,
++            )
+             .await?;
+         let mut entry_for_resolution = entry.clone();
+         let resolved =
+             resolve_ref_entry(&target.session, &mut entry_for_resolution, target.ax_params).await?;
+-        if entry_for_resolution.backend_node_id != entry.backend_node_id
+-            && let Some(stored) = self.state.lock().await.refs.get_mut(ref_id)
++        let mut state = self.state.lock().await;
++        if state.refs.get(ref_id) != Some(&entry)
++            || state.ref_scope.as_ref().map(|s| s.document_id.clone()) != scope
++            || pinned.is_some_and(|root| {
++                !state
++                    .root_session
++                    .as_ref()
++                    .is_some_and(|s| s.same_session(root))
++            })
+         {
+-            stored.backend_node_id = entry_for_resolution.backend_node_id;
++            return Err(CoreError::Message(
++                "Snapshot changed during ref resolution; no input dispatched".into(),
++            ));
++        }
++        if entry_for_resolution.backend_node_id != entry.backend_node_id {
++            if let Some(stored) = state.refs.get_mut(ref_id) {
++                stored.backend_node_id = entry_for_resolution.backend_node_id;
++            }
+         }
+         Ok(resolved)
+     }
+@@ -211,6 +266,7 @@
+                     refs,
+                     url: after.url.clone(),
+                     scope: ref_scope_from(&after),
++                    root_session: page_session.session.clone(),
+                 });
+             }
+             trace_stage(
+@@ -365,6 +421,7 @@
+         });
+         state.refs = result.refs;
+         state.ref_scope = result.scope;
++        state.root_session = Some(result.root_session);
+     }
+ 
+     async fn refs_for_capture(&self, state: &MainFrameState) -> RefMap {
+@@ -775,6 +832,34 @@
+                 .then(|| children.iter().map(|child| (*child).to_string()).collect()),
+             ..AxNode::default()
+         }
++    }
++
++    #[tokio::test]
++    async fn pinned_ref_rejects_snapshot_from_different_root_session_before_resolution() {
++        let connection = crate::test_support::TestConnection::new([]);
++        let pages = std::sync::Arc::new(crate::pages::PageManager::new(
++            connection.clone(),
++            crate::pages::PageManagerHooks::default(),
++        ));
++        let observer = super::Observer::new(
++            pages,
++            crate::frames::FrameRegistry::new(connection.clone()),
++            crate::PageId(1),
++        );
++        observer.state.lock().await.root_session = Some(crate::ProtocolSession::for_session(
++            connection.clone(),
++            crate::SessionId::from("original"),
++        ));
++        let replacement = crate::ProtocolSession::for_session(
++            connection.clone(),
++            crate::SessionId::from("replacement"),
++        );
++        let error = observer
++            .resolve_ref_pinned(&crate::Ref("e1".into()), &replacement)
++            .await
++            .expect_err("must reject old snapshot");
++        assert!(error.to_string().contains("another page incarnation"));
++        assert!(connection.calls().expect("calls").is_empty());
+     }
+ 
+     #[tokio::test]
+diff --git a/crates/browseros-core/src/pages.rs b/crates/browseros-core/src/pages.rs
+--- a/crates/browseros-core/src/pages.rs
++++ b/crates/browseros-core/src/pages.rs
+@@ -48,6 +48,13 @@
+     pub session_id: SessionId,
+     pub session: ProtocolSession,
+     pub url: String,
++}
++
++#[derive(Clone)]
++pub struct PreparedPage {
++    pub(crate) info: PageInfo,
++    pub(crate) page: PageSession,
++    epoch: u64,
+ }
+ 
+ #[derive(Debug, Default)]
+@@ -380,20 +387,191 @@
+         Ok(page_id)
+     }
+ 
++    // Chromium can resolve a beforeunload dialog without preserving it when its
++    // native window is minimized. Restore only this target's existing window
++    // before an operation that can unload it; never create or move a window.
++    pub async fn prepare_for_unload(&self, page_id: PageId) -> Result<PreparedPage, CoreError> {
++        let epoch = self.cdp.connection_epoch();
++        let page = self.get_session(page_id.clone()).await?;
++        let cdp = self.cdp.clone();
++        let info = self
++            .prepare_unload_with(
++                page_id,
++                Some(page.target_id.clone()),
++                move |pid, id, target| restore_unload_window(cdp, pid, id, target),
++            )
++            .await?;
++        if page.target_id != info.target_id {
++            return Err(CoreError::Message(
++                "Guarded target changed during preparation; no action dispatched".into(),
++            ));
++        }
++        let prepared = PreparedPage { info, page, epoch };
++        self.validate_prepared(&prepared).await?;
++        Ok(prepared)
++    }
++
++    pub(crate) async fn validate_prepared(&self, prepared: &PreparedPage) -> Result<(), CoreError> {
++        let state = self.state.lock().await;
++        if self.cdp.connection_epoch() != prepared.epoch
++            || !state.pages.get(&prepared.info.page_id).is_some_and(|p| {
++                p.target_id == prepared.info.target_id && p.tab_id == prepared.info.tab_id
++            })
++        {
++            return Err(CoreError::Message(
++                "Prepared page incarnation changed; action not dispatched to replacement".into(),
++            ));
++        }
++        Ok(())
++    }
++
++    async fn prepare_unload_with<F, Fut>(
++        &self,
++        page_id: PageId,
++        expected_target: Option<TargetId>,
++        restore: F,
++    ) -> Result<PageInfo, CoreError>
++    where
++        F: FnOnce(u32, i64, TargetId) -> Fut + Send,
++        Fut: std::future::Future<Output = Result<(), CoreError>> + Send,
++    {
++        let info = self
++            .get_info(page_id.clone())
++            .await
++            .ok_or_else(|| CoreError::UnknownPageShort(page_id))?;
++        if expected_target
++            .as_ref()
++            .is_some_and(|target| target != &info.target_id)
++        {
++            return Err(CoreError::Message(
++                "Page changed before unload guard; no window or input changed".into(),
++            ));
++        }
++        let root = ProtocolSession::root(self.cdp.clone());
++        let window: Value = root
++            .send(
++                "Browser.getWindowForTarget",
++                json!({"targetId": info.target_id.as_str()}),
++            )
++            .await?;
++        let state = window
++            .pointer("/bounds/windowState")
++            .and_then(Value::as_str)
++            .ok_or_else(|| {
++                CoreError::Message(
++                    "Cannot verify unload window state; action not dispatched".into(),
++                )
++            })?;
++        if !matches!(state, "normal" | "maximized" | "fullscreen" | "minimized") {
++            return Err(CoreError::Message(
++                "Unknown unload window state; action not dispatched".into(),
++            ));
++        }
++        let windows: Value = root.send("Browser.getWindows", json!({})).await?;
++        let id = window
++            .get("windowId")
++            .and_then(Value::as_i64)
++            .ok_or_else(|| {
++                CoreError::Message("Missing unload window identity; action not dispatched".into())
++            })?;
++        let inventory = windows
++            .get("windows")
++            .and_then(Value::as_array)
++            .ok_or_else(|| {
++                CoreError::Message("Missing unload window inventory; action not dispatched".into())
++            })?;
++        let current = inventory
++            .iter()
++            .find(|w| w.get("windowId").and_then(Value::as_i64) == Some(id))
++            .ok_or_else(|| {
++                CoreError::Message("Unload window absent; action not dispatched".into())
++            })?;
++        let visible = current
++            .get("isVisible")
++            .and_then(Value::as_bool)
++            .ok_or_else(|| {
++                CoreError::Message("Unknown window visibility; action not dispatched".into())
++            })?;
++        if state == "minimized" || !visible {
++            if current.get("windowType").and_then(Value::as_str) != Some("normal") {
++                return Err(CoreError::Message(
++                    "Only the existing normal task window may be restored".into(),
++                ));
++            }
++            if inventory
++                .iter()
++                .filter(|w| w.get("windowType").and_then(Value::as_str) == Some("normal"))
++                .count()
++                != 1
++            {
++                return Err(CoreError::Message(
++                    "Ambiguous normal windows; no automatic restoration".into(),
++                ));
++            }
++            let processes: Value = root.send("SystemInfo.getProcessInfo", json!({})).await?;
++            let browsers = processes
++                .get("processInfo")
++                .and_then(Value::as_array)
++                .ok_or_else(|| CoreError::Message("Missing browser process identity".into()))?
++                .iter()
++                .filter(|p| p.get("type").and_then(Value::as_str) == Some("browser"))
++                .collect::<Vec<_>>();
++            if browsers.len() != 1 {
++                return Err(CoreError::Message(
++                    "Ambiguous browser process identity".into(),
++                ));
++            }
++            let pid = browsers[0]
++                .get("id")
++                .and_then(Value::as_u64)
++                .and_then(|id| u32::try_from(id).ok())
++                .ok_or_else(|| CoreError::Message("Invalid browser process identity".into()))?;
++            restore(pid, id, info.target_id.clone()).await?;
++            let checked: Value = root
++                .send(
++                    "Browser.getWindowForTarget",
++                    json!({"targetId": info.target_id.as_str()}),
++                )
++                .await?;
++            let checked_windows: Value = root.send("Browser.getWindows", json!({})).await?;
++            let still_visible = checked_windows
++                .get("windows")
++                .and_then(Value::as_array)
++                .is_some_and(|ws| {
++                    ws.iter().any(|w| {
++                        w.get("windowId").and_then(Value::as_i64) == Some(id)
++                            && w.get("isVisible").and_then(Value::as_bool) == Some(true)
++                    })
++                });
++            if checked.get("windowId").and_then(Value::as_i64) != Some(id)
++                || checked
++                    .pointer("/bounds/windowState")
++                    .and_then(Value::as_str)
++                    != Some("normal")
++                || !still_visible
++            {
++                return Err(CoreError::Message(
++                    "Unload window restoration not confirmed; action not dispatched".into(),
++                ));
++            }
++        } else if !matches!(state, "normal" | "maximized" | "fullscreen") {
++            return Err(CoreError::Message(
++                "Unknown unload window state; action not dispatched".into(),
++            ));
++        }
++        Ok(info)
++    }
++
+     pub async fn close(&self, page_id: PageId) -> Result<(), CoreError> {
+-        let info = self
+-            .state
+-            .lock()
+-            .await
+-            .pages
+-            .get(&page_id)
+-            .cloned()
+-            .ok_or_else(|| CoreError::UnknownPageShort(page_id.clone()))?;
++        let prepared = self.prepare_for_unload(page_id.clone()).await?;
++        let info = prepared.info.clone();
++        let starting_epoch = prepared.epoch;
+         let root = ProtocolSession::root(self.cdp.clone());
+-        let _: Value = root
+-            .send("Browser.closeTab", json!({ "tabId": info.tab_id.0 }))
+-            .await?;
+-        // Browser.closeTab acknowledges the request, not necessarily physical closure.
++        self.validate_prepared(&prepared).await?;
++        // Page.close is bound to the validated target session. A reusable tabId
++        // cannot redirect this close to a replacement WebContents.
++        let _: Value = prepared.page.session.send("Page.close", json!({})).await?;
++        // Page.close acknowledges the request, not necessarily physical closure.
+         // Retain the page/session (and dialog listener) until its target is gone.
+         let mut closed = false;
+         for _ in 0..20 {
+@@ -404,9 +582,24 @@
+                 .ok_or_else(|| {
+                     CoreError::Message("close: missing target list; page binding preserved".into())
+                 })?;
+-            if !targets.iter().any(|target| {
+-                target.get("targetId").and_then(Value::as_str) == Some(info.target_id.as_str())
+-            }) {
++            let mut identities = HashSet::new();
++            for target in targets {
++                let id = target
++                    .get("targetId")
++                    .and_then(Value::as_str)
++                    .filter(|id| !id.is_empty())
++                    .ok_or_else(|| {
++                        CoreError::Message(
++                            "close: incomplete target identity; binding preserved".into(),
++                        )
++                    })?;
++                if !identities.insert(id) {
++                    return Err(CoreError::Message(
++                        "close: duplicate target identity; binding preserved".into(),
++                    ));
++                }
++            }
++            if !identities.contains(info.target_id.as_str()) {
+                 closed = true;
+                 break;
+             }
+@@ -416,6 +609,19 @@
+             return Err(CoreError::Message("close request acknowledged, but target remains; inspect and resolve any dialog explicitly before retrying; page binding preserved".into()));
+         }
+         let mut state = self.state.lock().await;
++        if self.cdp.connection_epoch() != starting_epoch
++            || state.pages.get(&page_id).is_some_and(|current| {
++                current.target_id != info.target_id || current.tab_id != info.tab_id
++            })
++        {
++            return Err(CoreError::Message(
++                "close: page incarnation changed; replacement binding and ownership preserved"
++                    .into(),
++            ));
++        }
++        if !state.pages.contains_key(&page_id) {
++            return Ok(());
++        }
+         state.pages.remove(&page_id);
+         state.sessions.remove(&info.target_id);
+         state.agent_created.remove(&page_id);
+@@ -447,7 +653,7 @@
+                 }),
+             )
+             .await?;
+-        self.update_from_tab(page_id, result.tab).await
++        self.update_from_tab(page_id, result.tab, &info).await
+     }
+ 
+     pub async fn detach_session(&self, session_id: &SessionId) {
+@@ -551,8 +757,15 @@
+         &self,
+         page_id: PageId,
+         tab: browser::TabInfo,
++        expected: &PageInfo,
+     ) -> Result<PageInfo, CoreError> {
+         let mut state = self.state.lock().await;
++        if state.pages.get(&page_id) != Some(expected) {
++            return Err(CoreError::Message(
++                "Delayed tab update: original binding changed or closed; no binding recreated"
++                    .into(),
++            ));
++        }
+         Ok(sync_physical_aliases(&mut state, page_id, tab))
+     }
+ }
+@@ -638,6 +851,57 @@
+         .map(|info| info.page_id.clone())
+ }
+ 
++async fn restore_unload_window(
++    cdp: Arc<dyn CdpConnection>,
++    pid: u32,
++    id: i64,
++    target: TargetId,
++) -> Result<(), CoreError> {
++    #[cfg(windows)]
++    {
++        let ticket = tokio::task::spawn_blocking(move || crate::native_window::capture(pid))
++            .await
++            .map_err(|e| CoreError::Message(e.to_string()))?
++            .map_err(CoreError::Message)?;
++        // Bind the captured HWND to the unique same CDP window BEFORE restoration.
++        let root = ProtocolSession::root(cdp);
++        let checked: Value = root
++            .send(
++                "Browser.getWindowForTarget",
++                json!({"targetId":target.as_str()}),
++            )
++            .await?;
++        let all: Value = root.send("Browser.getWindows", json!({})).await?;
++        let normal = all
++            .get("windows")
++            .and_then(Value::as_array)
++            .ok_or_else(|| CoreError::Message("Window mapping unavailable".into()))?
++            .iter()
++            .filter(|w| w.get("windowType").and_then(Value::as_str) == Some("normal"))
++            .collect::<Vec<_>>();
++        if checked.get("windowId").and_then(Value::as_i64) != Some(id)
++            || normal.len() != 1
++            || normal[0].get("windowId").and_then(Value::as_i64) != Some(id)
++        {
++            return Err(CoreError::Message(
++                "CDP window replaced or ambiguous after HWND capture; no restoration dispatched"
++                    .into(),
++            ));
++        }
++        tokio::task::spawn_blocking(move || crate::native_window::restore(ticket))
++            .await
++            .map_err(|e| CoreError::Message(e.to_string()))?
++            .map_err(CoreError::Message)
++    }
++    #[cfg(not(windows))]
++    {
++        let _ = (cdp, pid, id, target);
++        Err(CoreError::Message(
++            "Restore window without activation before retrying; action not dispatched".into(),
++        ))
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::{NewPageOptions, PageManager, PageManagerHooks};
+@@ -663,6 +927,103 @@
+     fn window_json(id: i64, kind: &str, visible: bool, active: bool) -> Value {
+         json!({"windowId":id,"windowType":kind,"bounds":{},"isVisible":visible,
+             "isActive":active,"tabCount":1,"browserContextId":"Default"})
++    }
++
++    #[tokio::test]
++    async fn unload_restores_only_exact_window_and_rejects_unverified_states()
++    -> Result<(), Box<dyn Error>> {
++        for (initial, restored, succeeds, visible) in [
++            (
++                json!({"windowId":3,"bounds":{"windowState":"normal"}}),
++                None,
++                true,
++                true,
++            ),
++            (
++                json!({"windowId":3,"bounds":{"windowState":"maximized"}}),
++                None,
++                true,
++                true,
++            ),
++            (
++                json!({"windowId":3,"bounds":{"windowState":"minimized"}}),
++                Some(json!({"windowId":3,"bounds":{"windowState":"normal"}})),
++                true,
++                true,
++            ),
++            (
++                json!({"windowId":3,"bounds":{"windowState":"normal"}}),
++                Some(json!({"windowId":3,"bounds":{"windowState":"normal"}})),
++                true,
++                false,
++            ),
++            (
++                json!({"windowId":3,"bounds":{"windowState":"minimized"}}),
++                Some(json!({"windowId":4,"bounds":{"windowState":"normal"}})),
++                false,
++                true,
++            ),
++            (
++                json!({"windowId":3,"bounds":{"windowState":"minimized"}}),
++                Some(json!({"windowId":3,"bounds":{"windowState":"minimized"}})),
++                false,
++                true,
++            ),
++            (json!({"windowId":3,"bounds":{}}), None, false, true),
++            (
++                json!({"windowId":3,"bounds":{"windowState":"unknown"}}),
++                None,
++                false,
++                true,
++            ),
++        ] {
++            let mut responses = vec![
++                ("Browser.getTabs", json!({"tabs":[tab_json(7,"target-7")]})),
++                ("Browser.getWindowForTarget", initial),
++                (
++                    "Browser.getWindows",
++                    json!({"windows":[window_json(3,"normal",visible,false)]}),
++                ),
++                (
++                    "SystemInfo.getProcessInfo",
++                    json!({"processInfo":[{"id":101,"type":"browser"}]}),
++                ),
++            ];
++            if let Some(value) = restored {
++                responses.push(("Browser.getWindowForTarget", value));
++                responses.push((
++                    "Browser.getWindows",
++                    json!({"windows":[window_json(3,"normal",true,false)]}),
++                ));
++            }
++            let connection = TestConnection::new(responses);
++            let pages = PageManager::new(connection.clone(), PageManagerHooks::default());
++            let id = pages.list().await?[0].page_id.clone();
++            let result = pages
++                .prepare_unload_with(id, None, |pid, _, _| async move {
++                    assert_eq!(pid, 101);
++                    Ok(())
++                })
++                .await;
++            assert_eq!(result.is_ok(), succeeds);
++            let calls = connection.calls()?;
++            assert!(!calls.iter().any(|c| {
++                [
++                    "Browser.createWindow",
++                    "Browser.moveTab",
++                    "Browser.activateWindow",
++                    "Browser.setWindowBounds",
++                ]
++                .contains(&c.method.as_str())
++            }));
++            for call in calls
++                .iter()
++                .filter(|c| c.method == "Browser.getWindowForTarget")
++            {
++                assert_eq!(call.params, json!({"targetId":"target-7"}));
++            }
++        }
++        Ok(())
+     }
+ 
+     #[tokio::test]
+@@ -897,6 +1258,7 @@
+ 
+     struct InterleavedConnection {
+         inner: std::sync::Arc<TestConnection>,
++        pause_method: &'static str,
+         ready: tokio::sync::Notify,
+         resume: tokio::sync::Notify,
+     }
+@@ -908,7 +1270,7 @@
+             session: Option<&'a crate::SessionId>,
+         ) -> futures_util::future::BoxFuture<'a, Result<Value, browseros_cdp::CdpError>> {
+             Box::pin(async move {
+-                if method == "Browser.getTabInfo" {
++                if method == self.pause_method {
+                     self.ready.notify_one();
+                     self.resume.notified().await;
+                 }
+@@ -943,6 +1305,7 @@
+     async fn alias_creation_racing_list_reuses_the_existing_page_id() -> Result<(), Box<dyn Error>>
+     {
+         let connection = std::sync::Arc::new(InterleavedConnection {
++            pause_method: "Browser.getTabInfo",
+             inner: TestConnection::new([
+                 (
+                     "Browser.getWindows",
+@@ -981,6 +1344,299 @@
+         Ok(())
+     }
+ 
++    #[tokio::test]
++    async fn close_rejects_incomplete_target_evidence_without_detach() -> Result<(), Box<dyn Error>>
++    {
++        for evidence in [
++            json!({"targetInfos":[{}]}),
++            json!({"targetInfos":[{"targetId":""}]}),
++            json!({"targetInfos":[{"targetId":4}]}),
++            json!({"targetInfos":[{"targetId":"unrelated"},{"targetId":"unrelated"}]}),
++            json!({}),
++        ] {
++            let connection = TestConnection::new([
++                ("Browser.getTabs", json!({"tabs":[tab_json(7,"target-7")]})),
++                (
++                    "Browser.getWindowForTarget",
++                    json!({"windowId":3,"bounds":{"windowState":"normal"}}),
++                ),
++                (
++                    "Browser.getWindows",
++                    json!({"windows":[window_json(3,"normal",true,false)]}),
++                ),
++                (
++                    "Target.attachToTarget",
++                    json!({"sessionId":"close-session"}),
++                ),
++                ("Page.enable", json!({})),
++                ("DOM.enable", json!({})),
++                ("Runtime.enable", json!({})),
++                ("Accessibility.enable", json!({})),
++                ("Runtime.runIfWaitingForDebugger", json!({})),
++                ("Page.close", json!({})),
++                ("Target.getTargets", evidence),
++            ]);
++            let detached = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
++            let d = detached.clone();
++            let pages = PageManager::new(
++                connection,
++                PageManagerHooks {
++                    on_page_detached: Some(std::sync::Arc::new(move |_| {
++                        d.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
++                    })),
++                    ..Default::default()
++                },
++            );
++            let id = pages.list().await?[0].page_id.clone();
++            assert!(pages.close(id.clone()).await.is_err());
++            assert!(pages.get_info(id).await.is_some());
++            assert_eq!(detached.load(std::sync::atomic::Ordering::SeqCst), 0);
++        }
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn close_wait_racing_target_rebind_preserves_new_binding_and_returns_error()
++    -> Result<(), Box<dyn Error>> {
++        let connection = std::sync::Arc::new(InterleavedConnection {
++            pause_method: "Target.getTargets",
++            inner: TestConnection::new([
++                ("Browser.getTabs", json!({"tabs":[tab_json(7,"target-7")]})),
++                (
++                    "Browser.getWindowForTarget",
++                    json!({"windowId":3,"bounds":{"windowState":"normal"}}),
++                ),
++                (
++                    "Browser.getWindows",
++                    json!({"windows":[window_json(3,"normal",true,false)]}),
++                ),
++                (
++                    "Target.attachToTarget",
++                    json!({"sessionId":"close-session"}),
++                ),
++                ("Page.enable", json!({})),
++                ("DOM.enable", json!({})),
++                ("Runtime.enable", json!({})),
++                ("Accessibility.enable", json!({})),
++                ("Runtime.runIfWaitingForDebugger", json!({})),
++                ("Page.close", json!({})),
++                (
++                    "Target.getTargets",
++                    json!({"targetInfos":[{"targetId":"replacement"}]}),
++                ),
++            ]),
++            ready: Default::default(),
++            resume: Default::default(),
++        });
++        let detached = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
++        let d = detached.clone();
++        let pages = std::sync::Arc::new(PageManager::new(
++            connection.clone(),
++            PageManagerHooks {
++                on_page_detached: Some(std::sync::Arc::new(move |_| {
++                    d.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
++                })),
++                ..Default::default()
++            },
++        ));
++        let id = pages.list().await?[0].page_id.clone();
++        let worker = pages.clone();
++        let closing = id.clone();
++        let pending = tokio::spawn(async move { worker.close(closing).await });
++        tokio::time::timeout(
++            std::time::Duration::from_secs(2),
++            connection.ready.notified(),
++        )
++        .await?;
++        {
++            let mut state = pages.state.lock().await;
++            super::sync_physical_aliases(
++                &mut state,
++                id.clone(),
++                serde_json::from_value(tab_json(7, "replacement"))?,
++            );
++        }
++        connection.resume.notify_one();
++        assert!(pending.await?.is_err());
++        assert_eq!(
++            pages
++                .get_info(id)
++                .await
++                .ok_or("replacement lost")?
++                .target_id
++                .as_str(),
++            "replacement"
++        );
++        assert_eq!(detached.load(std::sync::atomic::Ordering::SeqCst), 0);
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn delayed_move_after_close_cannot_recreate_binding_or_detach_twice()
++    -> Result<(), Box<dyn Error>> {
++        let connection = std::sync::Arc::new(InterleavedConnection {
++            pause_method: "Browser.moveTab",
++            inner: TestConnection::new([
++                ("Browser.getTabs", json!({"tabs":[tab_json(7,"target-7")]})),
++                ("Browser.getTabInfo", json!({"tab":tab_json(7,"target-7")})),
++                ("Browser.moveTab", json!({"tab":tab_json(7,"target-7")})),
++                (
++                    "Browser.getWindowForTarget",
++                    json!({"windowId":3,"bounds":{"windowState":"normal"}}),
++                ),
++                (
++                    "Browser.getWindows",
++                    json!({"windows":[window_json(3,"normal",true,false)]}),
++                ),
++                (
++                    "Target.attachToTarget",
++                    json!({"sessionId":"close-session"}),
++                ),
++                ("Page.enable", json!({})),
++                ("DOM.enable", json!({})),
++                ("Runtime.enable", json!({})),
++                ("Accessibility.enable", json!({})),
++                ("Runtime.runIfWaitingForDebugger", json!({})),
++                ("Page.close", json!({})),
++                ("Target.getTargets", json!({"targetInfos":[]})),
++            ]),
++            ready: Default::default(),
++            resume: Default::default(),
++        });
++        let detached = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
++        let d = detached.clone();
++        let pages = std::sync::Arc::new(PageManager::new(
++            connection.clone(),
++            PageManagerHooks {
++                on_page_detached: Some(std::sync::Arc::new(move |_| {
++                    d.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
++                })),
++                ..Default::default()
++            },
++        ));
++        let id = pages.list().await?[0].page_id.clone();
++        let worker = pages.clone();
++        let moving = id.clone();
++        let pending = tokio::spawn(async move {
++            worker
++                .move_page(moving, super::MovePageOptions::default())
++                .await
++        });
++        tokio::time::timeout(
++            std::time::Duration::from_secs(2),
++            connection.ready.notified(),
++        )
++        .await?;
++        pages.close(id.clone()).await?;
++        connection.resume.notify_one();
++        assert!(pending.await?.is_err());
++        assert!(pages.get_info(id).await.is_none());
++        assert_eq!(detached.load(std::sync::atomic::Ordering::SeqCst), 1);
++        Ok(())
++    }
++
++    fn attached_responses() -> Vec<(&'static str, Value)> {
++        vec![
++            (
++                "Target.attachToTarget",
++                json!({"sessionId":"original-session"}),
++            ),
++            ("Page.enable", json!({})),
++            ("DOM.enable", json!({})),
++            ("Runtime.enable", json!({})),
++            ("Accessibility.enable", json!({})),
++            ("Runtime.runIfWaitingForDebugger", json!({})),
++        ]
++    }
++
++    #[tokio::test]
++    async fn rebind_during_guard_dispatches_no_close_navigation_or_input_to_replacement()
++    -> Result<(), Box<dyn Error>> {
++        for action in ["close", "navigate", "input"] {
++            let mut responses = attached_responses();
++            responses.extend([
++                ("Browser.getTabs", json!({"tabs":[tab_json(7,"original")]})),
++                (
++                    "Browser.getTabs",
++                    json!({"tabs":[tab_json(7,"replacement")]}),
++                ),
++                (
++                    "Browser.getWindowForTarget",
++                    json!({"windowId":3,"bounds":{"windowState":"normal"}}),
++                ),
++                (
++                    "Browser.getWindows",
++                    json!({"windows":[window_json(3,"normal",true,false)]}),
++                ),
++            ]);
++            let connection = std::sync::Arc::new(InterleavedConnection {
++                pause_method: "Browser.getWindowForTarget",
++                inner: TestConnection::new(responses),
++                ready: Default::default(),
++                resume: Default::default(),
++            });
++            let pages = std::sync::Arc::new(PageManager::new(
++                connection.clone(),
++                PageManagerHooks::default(),
++            ));
++            let id = pages.list().await?[0].page_id.clone();
++            let worker = pages.clone();
++            let working = id.clone();
++            let cdp = connection.clone();
++            let pending = tokio::spawn(async move {
++                match action {
++                    "close" => worker.close(working).await,
++                    "navigate" => {
++                        crate::navigation::Navigation::new(
++                            worker,
++                            crate::page_signals::PageSignals::new(cdp),
++                            working,
++                        )
++                        .goto("https://example.test/must-not-dispatch")
++                        .await
++                    }
++                    _ => {
++                        let observer = std::sync::Arc::new(crate::observer::Observer::new(
++                            worker.clone(),
++                            crate::frames::FrameRegistry::new(cdp),
++                            working.clone(),
++                        ));
++                        crate::input::Input::new(observer, worker, working)
++                            .type_text("must-not-dispatch")
++                            .await
++                    }
++                }
++            });
++            tokio::time::timeout(
++                std::time::Duration::from_secs(2),
++                connection.ready.notified(),
++            )
++            .await?;
++            pages.list().await?;
++            connection.resume.notify_one();
++            let error = pending
++                .await?
++                .expect_err("changed incarnation must reject")
++                .to_string();
++            assert!(error.contains("incarnation changed"), "{error}");
++            assert_eq!(
++                pages
++                    .get_info(id)
++                    .await
++                    .ok_or("replacement lost")?
++                    .target_id
++                    .as_str(),
++                "replacement"
++            );
++            assert!(!connection.inner.calls()?.iter().any(|c| {
++                c.method.starts_with("Input.")
++                    || ["Page.close", "Browser.closeTab", "Page.navigate"]
++                        .contains(&c.method.as_str())
++            }));
++        }
++        Ok(())
++    }
++
+     async fn aliases(responses: Vec<(&'static str, Value)>) -> PageManager {
+         let manager = PageManager::new(TestConnection::new(responses), PageManagerHooks::default());
+         let old: browseros_cdp::browser::TabInfo =
+@@ -1049,7 +1705,14 @@
+     async fn alias_move_update_updates_all_old_handles() -> Result<(), Box<dyn Error>> {
+         let manager = aliases(vec![]).await;
+         manager
+-            .update_from_tab(crate::PageId(2), serde_json::from_value(changed_tab())?)
++            .update_from_tab(
++                crate::PageId(2),
++                serde_json::from_value(changed_tab())?,
++                &manager
++                    .get_info(crate::PageId(2))
++                    .await
++                    .ok_or("original alias missing")?,
++            )
+             .await?;
+         assert_aliases_current(&manager).await;
+         Ok(())
+diff --git a/crates/browseros-core/src/windows.rs b/crates/browseros-core/src/windows.rs
+--- a/crates/browseros-core/src/windows.rs
++++ b/crates/browseros-core/src/windows.rs
+@@ -49,13 +49,10 @@
+         Ok(result.window)
+     }
+ 
+-    pub async fn close(&self, window_id: WindowId) -> Result<(), CoreError> {
+-        self.ensure_connected().await?;
+-        let root = ProtocolSession::root(self.cdp.clone());
+-        let _: Value = root
+-            .send("Browser.closeWindow", json!({ "windowId": window_id.0 }))
+-            .await?;
+-        Ok(())
++    pub async fn close(&self, _window_id: WindowId) -> Result<(), CoreError> {
++        Err(CoreError::Message(
++            "Whole-window close is disabled: close and verify individual tabs".into(),
++        ))
+     }
+ 
+     pub async fn activate(&self, window_id: WindowId) -> Result<(), CoreError> {
+@@ -111,4 +108,30 @@
+         assert_eq!(connection.calls()?[0].params, json!({}));
+         Ok(())
+     }
++    #[tokio::test]
++    async fn blanket_window_close_is_disabled_including_inert_anchors() -> Result<(), Box<dyn Error>>
++    {
++        for (url, window, succeeds) in [
++            ("https://mail.example/", Some(7), false),
++            ("about:blank", Some(7), false),
++            ("chrome://newtab/", None, false),
++            ("chrome://newtab/", Some(7), false),
++        ] {
++            let tab = json!({"tabId":1,"targetId":"window-target","url":url,"title":"synthetic","isActive":false,"isLoading":false,"loadProgress":1.0,"isPinned":false,"isHidden":false,"windowId":window});
++            let connection = TestConnection::new([
++                ("Browser.getTabs", json!({"tabs":[tab]})),
++                ("Browser.closeWindow", json!({})),
++            ]);
++            let windows = WindowManager::new(connection.clone());
++            assert_eq!(windows.close(crate::WindowId(7)).await.is_ok(), succeeds);
++            assert_eq!(
++                connection
++                    .calls()?
++                    .iter()
++                    .any(|c| c.method == "Browser.closeWindow"),
++                succeeds
++            );
++        }
++        Ok(())
++    }
+ }
+diff --git a/crates/browseros-mcp/src/tests.rs b/crates/browseros-mcp/src/tests.rs
+--- a/crates/browseros-mcp/src/tests.rs
++++ b/crates/browseros-mcp/src/tests.rs
+@@ -131,6 +131,7 @@
+     emit_navigation_dialog: AtomicBool,
+     close_requested: AtomicBool,
+     retain_closed_target: AtomicBool,
++    reject_unload_window: AtomicBool,
+ }
+ 
+ impl HarnessConnection {
+@@ -143,6 +144,7 @@
+             emit_navigation_dialog: AtomicBool::new(false),
+             close_requested: AtomicBool::new(false),
+             retain_closed_target: AtomicBool::new(false),
++            reject_unload_window: AtomicBool::new(false),
+         })
+     }
+ 
+@@ -198,7 +200,7 @@
+                 return std::future::pending::<Result<Value, CdpError>>().await;
+             }
+             match method {
+-                "Browser.closeTab" => {
++                "Page.close" => {
+                     self.close_requested.store(true, Ordering::SeqCst);
+                     if self.retain_closed_target.load(Ordering::SeqCst) {
+                         self.emit(
+@@ -215,6 +217,13 @@
+                     Ok(
+                         json!({"targetInfos": if present {vec![json!({"targetId":"target-1"})]} else {vec![]} }),
+                     )
++                }
++                "Browser.getWindowForTarget" => {
++                    if self.reject_unload_window.load(Ordering::SeqCst) {
++                        Ok(json!({"windowId":1,"bounds":{"windowState":"unknown"}}))
++                    } else {
++                        Ok(json!({"windowId":1,"bounds":{"windowState":"normal"}}))
++                    }
+                 }
+                 "Browser.getTabs" => Ok(json!({ "tabs": [harness_tab()] })),
+                 "Browser.getWindows" => Ok(
+@@ -1712,3 +1721,86 @@
+         }
+     }
+ }
++
++#[tokio::test]
++async fn failed_unload_guard_sends_no_single_batch_or_sdk_fill_input() {
++    for (tool, args) in [
++        (
++            "act",
++            json!({"kind":"fill","page":1,"ref":"e1","value":"must-not-dispatch"}),
++        ),
++        (
++            "act",
++            json!({"kind":"fill","page":1,"fields":[{"ref":"e1","value":"first"},{"ref":"e2","value":"second"}]}),
++        ),
++        (
++            "run",
++            json!({"code":"await browser.page(1).fill('e1','must-not-dispatch');"}),
++        ),
++    ] {
++        let (ctx, connection, _) = harness_ctx().await;
++        connection
++            .reject_unload_window
++            .store(true, Ordering::SeqCst);
++        let result = execute_tool(&tool_by_name(tool), args, &ctx)
++            .await
++            .expect("guard result");
++        assert!(result.is_error);
++        assert!(
++            result_text(&result).contains("Unknown unload window state"),
++            "{}",
++            result_text(&result)
++        );
++        let calls = connection.calls();
++        assert_eq!(
++            calls
++                .iter()
++                .filter(|c| c.method == "Browser.getWindowForTarget")
++                .count(),
++            1
++        );
++        assert!(!calls.iter().any(|c| c.method.starts_with("Input.")
++            || c.method == "DOM.focus"
++            || c.method == "Page.navigate"));
++    }
++}
++
++#[tokio::test]
++async fn window_close_returns_nonexecuting_plan_and_preserves_every_tab() {
++    let (ctx, connection, _) = harness_ctx().await;
++    let before = ctx.session.pages.list().await.expect("before inventory");
++    let window_id = before[0].window_id.as_ref().expect("window identity").0;
++    let result = execute_tool(
++        &tool_by_name("windows"),
++        json!({"action":"close","windowId":window_id}),
++        &ctx,
++    )
++    .await
++    .expect("close plan");
++    assert!(result.is_error);
++    let text = result_text(&result);
++    let wire_plan: Value = serde_json::from_str(
++        text.split_once("CleanupPlan: ")
++            .expect("text plan survives structuredContent stripping")
++            .1,
++    )
++    .expect("valid text JSON plan");
++    assert_eq!(wire_plan["requestedActionExecuted"], false);
++    assert_eq!(wire_plan["closeRightsGranted"], false);
++    assert!(
++        wire_plan["pages"]
++            .as_array()
++            .is_some_and(|pages| !pages.is_empty())
++    );
++    let data = result.structured_content.expect("structured plan");
++    assert_eq!(wire_plan, data);
++    assert_eq!(data["requestedActionExecuted"], false);
++    assert_eq!(data["individualTabCleanupRequired"], true);
++    assert_eq!(data["closeRightsGranted"], false);
++    let after = ctx.session.pages.list().await.expect("after inventory");
++    assert_eq!(before, after);
++    assert!(!connection.calls().iter().any(|c| matches!(
++        c.method.as_str(),
++        "Browser.closeWindow" | "Browser.closeTab" | "Page.close" | "Page.navigate"
++    ) || c.method.starts_with("Input.")));
++}
+diff --git a/crates/browseros-mcp/src/tools/run.rs b/crates/browseros-mcp/src/tools/run.rs
+--- a/crates/browseros-mcp/src/tools/run.rs
++++ b/crates/browseros-mcp/src/tools/run.rs
+@@ -921,9 +921,13 @@
+             }
+             "pages.close" => {
+                 let page_id = page_arg(&args, 0)?;
+-                self.control
+-                    .race(self.ctx.session.pages.close(page_id))
+-                    .await?;
++                if self
++                    .race_input(&page_id, self.ctx.session.pages.close(page_id.clone()))
++                    .await?
++                    .is_none()
++                {
++                    return Err("Close paused by a JavaScript dialog; binding preserved. Resolve it explicitly".into());
++                }
+                 Ok(BrowserCallValue::Undefined)
+             }
+             "pages.getInfo" => {
+diff --git a/crates/browseros-mcp/src/tools/tabs.rs b/crates/browseros-mcp/src/tools/tabs.rs
+--- a/crates/browseros-mcp/src/tools/tabs.rs
++++ b/crates/browseros-mcp/src/tools/tabs.rs
+@@ -120,10 +120,19 @@
+ ) -> BoxFuture<'a, ToolExecResult<Option<ToolResult>>> {
+     Box::pin(async move {
+         let args: TabsArgs = parse_args(raw)?;
+-        let _ = (&args.prior_session, &args.expected, &args.prior_group_id, &args.prior);
++        let _ = (
++            &args.prior_session,
++            &args.expected,
++            &args.prior_group_id,
++            &args.prior,
++        );
+         let result = match args.action {
+-            TabsAction::ReclaimExpired => error_result("reclaim_expired requires the Workspace task dispatcher"),
+-            TabsAction::ReclaimRestored => error_result("reclaim_restored requires explicit Workspace task recovery"),
++            TabsAction::ReclaimExpired => {
++                error_result("reclaim_expired requires the Workspace task dispatcher")
++            }
++            TabsAction::ReclaimRestored => {
++                error_result("reclaim_restored requires explicit Workspace task recovery")
++            }
+             TabsAction::List => {
+                 let pages = ctx.session.pages.list().await?;
+                 let lines = pages.iter().map(format_page_line).collect::<Vec<_>>();
+@@ -198,7 +207,23 @@
+                 let Some(page) = args.page else {
+                     return Ok(Some(error_result("tabs close: page is required.")));
+                 };
+-                ctx.session.pages.close(PageId(page)).await?;
++                let closing = ctx.session.pages.close(PageId(page));
++                let dialog = async {
++                    while ctx
++                        .session
++                        .page_signals
++                        .pending_dialog(&PageId(page))
++                        .is_none()
++                    {
++                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
++                    }
++                };
++                tokio::select! {
++                    biased;
++                    ()=dialog=>return Ok(Some(error_result("Close paused by a JavaScript dialog; binding preserved. Explicitly dismiss or accept before continuing"))),
++                    result=closing=>result?,
++                }
++
+                 text_result(format!("closed page {page}"), Some(json!({ "page": page })))
+             }
+         };
+diff --git a/crates/browseros-mcp/src/tools/windows.rs b/crates/browseros-mcp/src/tools/windows.rs
+--- a/crates/browseros-mcp/src/tools/windows.rs
++++ b/crates/browseros-mcp/src/tools/windows.rs
+@@ -1,13 +1,12 @@
+ use crate::framework::{
+     ToolCtx, ToolExecResult, ToolResult, error_result, parse_args, text_result,
+ };
+-use browseros_core::WindowId;
+ use futures_util::future::BoxFuture;
+ use schemars::JsonSchema;
+ use serde::Deserialize;
+ use serde_json::{Value, json};
+ 
+-const DESCRIPTION: &str = "Manage browser windows: list, create, or close. create reuses an existing normal window, including minimized windows. Only set separate=true when the user explicitly requests a separate window; task separation, recording, screenshots or placement errors do not qualify.";
++const DESCRIPTION: &str = "Manage browser windows: list or create; close only reports a per-tab cleanup plan and never closes a populated window. Close individually authorized task tabs instead. create reuses an existing normal window, including minimized windows. Only set separate=true when the user explicitly requests a separate window; task separation, recording, screenshots or placement errors do not qualify.";
+ 
+ #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+ #[serde(rename_all = "snake_case")]
+@@ -80,11 +79,38 @@
+                 let Some(window_id) = args.window_id else {
+                     return Ok(Some(error_result("windows close: windowId is required.")));
+                 };
+-                ctx.session.windows.close(WindowId(window_id)).await?;
+-                text_result(
+-                    format!("closed window {window_id}"),
+-                    Some(json!({ "action": "close", "windowId": window_id })),
+-                )
++                let windows = ctx.session.windows.list().await?;
++                if !windows.iter().any(|w| w.window_id == window_id) {
++                    let plan = json!({"action":"close","windowId":window_id,"alreadyAbsent":true,"requestedActionExecuted":false,"closeRightsGranted":false});
++                    return Ok(Some(text_result(
++                        format!("Window already absent. CleanupPlan: {plan}"),
++                        Some(plan),
++                    )));
++                }
++                let pages = ctx.session.pages.list().await?;
++                let inventory=pages.iter().map(|p|json!({"pageId":p.page_id.0,"targetId":p.target_id.as_str(),"tabId":p.tab_id.0,"windowId":p.window_id.as_ref().map(|w|w.0)})).collect::<Vec<_>>();
++                // Annotation needs COMPLETE inventory; a subset would prune other claims.
++                let annotated = if let Some(hook) = &ctx.inner_call_hook {
++                    hook.annotate_pages(&inventory).await
++                } else {
++                    inventory
++                };
++                let plan = annotated
++                    .into_iter()
++                    .filter(|p| p.get("windowId").and_then(Value::as_i64) == Some(window_id))
++                    .collect::<Vec<_>>();
++                let plan = json!({"action":"close","windowId":window_id,"requestedActionExecuted":false,"individualTabCleanupRequired":true,"closeRightsGranted":false,"pages":plan});
++                // The tool has no output schema: server wire conversion strips
++                // structuredContent. Keep the complete nonexecuting plan in MCP
++                // text too, so Codex and AGY can inspect it without close rights.
++                let mut result = text_result(
++                    format!(
++                        "Window close is nonexecuting. Close only individually authorized task tabs; blank URLs grant no close rights. CleanupPlan: {plan}"
++                    ),
++                    Some(plan),
++                );
++                result.is_error = true;
++                result
+             }
+         };
+         Ok(Some(result))

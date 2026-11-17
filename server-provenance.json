@@ -2,11 +2,16 @@
   "schema_version": 1,
   "version": "0.0.65",
   "source_commit": "c83de8f0947b2e45074c7f71b9899365b433d421",
-  "sha256": "29783ce22267664232b1baecb98677499ad0a895c9a3b31adf1d6df0f93281ec",
-  "bytes": 33728000,
+  "sha256": "a42e0d13788dbc2a67f883899865ddaa4462b07304e22f72d4aa978e6df07bcc",
+  "bytes": 34671616,
   "patches": {
     "neo-workspace-runtime.patch": "5eb80754f518f830c5a3f230c8f12015d11560010604eee39e06cdb11a70707f",
-    "neo-close-notice-0.0.65.patch": "eb41b2fd9c6cf7333e43a08238d942abcbe2a75c8ccab6e4920dfdc4dcb8c3da"
+    "neo-close-notice-0.0.65.patch": "eb41b2fd9c6cf7333e43a08238d942abcbe2a75c8ccab6e4920dfdc4dcb8c3da",
+    "neo-expired-recovery-0.0.65.patch": "41917947bfd21094e335f5a2b7c6094f3c2f5398a9e5868a89332e6ddd61b0d7",
+    "neo-restored-recovery-0.0.65.patch": "0469e9080ab0be18983451de3383abe4f202a77914e247af8ad20394db5ec140",
+    "neo-page-alias-0.0.65.patch": "1cc2201d2382c1ee41230cfa83933163b444a4902fe3283d4ee801681b3db8f2",
+    "neo-unload-window-0.0.65.patch": "b8a31b58aee33fbe9ae34b40bfaacd57c3ca9890a52ae5ff7c38cbc8d5cdcca3",
+    "neo-shutdown-drain-0.0.65.patch": "a4b02df3022ec1044401b22b2cd4ac7048496944d85e0799f7ee8fee11a5ab99"
   },
   "license": "AGPL-3.0-or-later",
   "rustc": "1.98.0",
@@ -17,13 +22,13 @@
     "user_name": 0,
     "task_id": 0
   },
-  "catalog_origin": "actual owned server, guarded before initialize and tools-list",
+  "catalog_origin": "Exact final server independent stdio initialize/tools-list; no browser started",
   "qualification_status": "OWNED_BINARY_MCP_AND_SCHEMA_VERIFIED; distribution acceptance recorded separately",
   "corresponding_source": {
     "filename": "neo-server-0.0.65-public-source.zip",
-    "sha256": "2cac3096ef4b51df3f56061f5029eb6b2b0cfec3c65b2ad450729979bdbb36fb",
-    "bytes": 83834586,
-    "source_files": 2289,
+    "sha256": "77d8987cdfe198088a71c349e4d09a4bbbfa52b154342ec98d086e4a84cc14fc",
+    "bytes": 83903173,
+    "source_files": 2292,
     "vendor_files": 22125,
     "offline_resolved_packages": 403
   },

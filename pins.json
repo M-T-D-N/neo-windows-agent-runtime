@@ -8,12 +8,17 @@
   "session_idle_ms": 86400000,
   "server_override": {
     "version": "0.0.65",
-    "sha256": "29783ce22267664232b1baecb98677499ad0a895c9a3b31adf1d6df0f93281ec",
+    "sha256": "a42e0d13788dbc2a67f883899865ddaa4462b07304e22f72d4aa978e6df07bcc",
     "source_commit": "c83de8f0947b2e45074c7f71b9899365b433d421"
   },
   "upstream_repository": "https://github.com/browseros-ai/BrowserOS.git",
   "patches": {
     "neo-workspace-runtime.patch": "5eb80754f518f830c5a3f230c8f12015d11560010604eee39e06cdb11a70707f",
-    "neo-close-notice-0.0.65.patch": "eb41b2fd9c6cf7333e43a08238d942abcbe2a75c8ccab6e4920dfdc4dcb8c3da"
+    "neo-close-notice-0.0.65.patch": "eb41b2fd9c6cf7333e43a08238d942abcbe2a75c8ccab6e4920dfdc4dcb8c3da",
+    "neo-expired-recovery-0.0.65.patch": "41917947bfd21094e335f5a2b7c6094f3c2f5398a9e5868a89332e6ddd61b0d7",
+    "neo-restored-recovery-0.0.65.patch": "0469e9080ab0be18983451de3383abe4f202a77914e247af8ad20394db5ec140",
+    "neo-page-alias-0.0.65.patch": "1cc2201d2382c1ee41230cfa83933163b444a4902fe3283d4ee801681b3db8f2",
+    "neo-unload-window-0.0.65.patch": "b8a31b58aee33fbe9ae34b40bfaacd57c3ca9890a52ae5ff7c38cbc8d5cdcca3",
+    "neo-shutdown-drain-0.0.65.patch": "a4b02df3022ec1044401b22b2cd4ac7048496944d85e0799f7ee8fee11a5ab99"
   }
 }

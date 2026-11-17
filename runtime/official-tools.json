@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "server_sha256": "29783ce22267664232b1baecb98677499ad0a895c9a3b31adf1d6df0f93281ec",
+  "server_sha256": "a42e0d13788dbc2a67f883899865ddaa4462b07304e22f72d4aa978e6df07bcc",
   "initialize": {
     "protocolVersion": "2025-06-18",
     "capabilities": {
@@ -31,9 +31,35 @@
                 "list",
                 "active",
                 "new",
-                "close"
+                "close",
+                "reclaim_expired",
+                "reclaim_restored"
               ],
               "type": "string"
+            },
+            "expected": {
+              "items": {
+                "additionalProperties": {
+                  "not": {}
+                },
+                "properties": {
+                  "targetId": {
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "targetId",
+                  "url"
+                ],
+                "type": "object"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
             },
             "groupId": {
               "default": null,
@@ -49,6 +75,50 @@
               "minimum": 0,
               "type": [
                 "integer",
+                "null"
+              ]
+            },
+            "prior": {
+              "items": {
+                "additionalProperties": {
+                  "not": {}
+                },
+                "properties": {
+                  "tabId": {
+                    "format": "int64",
+                    "type": "integer"
+                  },
+                  "targetId": {
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "tabId",
+                  "targetId",
+                  "url"
+                ],
+                "type": "object"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "priorGroupId": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "priorSession": {
+              "default": null,
+              "description": "Internal Workspace resume proof; public callers use workspace_cleanup resume.",
+              "type": [
+                "string",
                 "null"
               ]
             },
@@ -906,7 +976,7 @@
       },
       {
         "name": "windows",
-        "description": "Manage browser windows: list, create, or close. create reuses an existing normal window, including minimized windows. Only set separate=true when the user explicitly requests a separate window; task separation, recording, screenshots or placement errors do not qualify.",
+        "description": "Manage browser windows: list or create; close only reports a per-tab cleanup plan and never closes a populated window. Close individually authorized task tabs instead. create reuses an existing normal window, including minimized windows. Only set separate=true when the user explicitly requests a separate window; task separation, recording, screenshots or placement errors do not qualify.",
         "inputSchema": {
           "$schema": "https://json-schema.org/draft/2020-12/schema",
           "additionalProperties": {

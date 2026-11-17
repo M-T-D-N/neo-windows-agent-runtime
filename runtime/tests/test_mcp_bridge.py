@@ -993,8 +993,12 @@ class OutputBridgeTests(unittest.IsolatedAsyncioTestCase):
             output_root = root / 'tool-output'; output_root.mkdir()
             state = TaskState(root / 'tasks', output_root=output_root); state.bind(task)
             dispatched = time.time_ns()
+            if os.name == 'nt':
+                await asyncio.sleep(0.02)  # Dispatch and file creation span a Windows clock tick.
             path = output_root / f'evaluate-{time.time_ns()//1000000}-{uuid.uuid4()}.txt'
             path.write_text('synthetic local result', encoding='utf-8')
+            if os.name == 'nt':
+                await asyncio.sleep(0.02)
             state.record_output('evaluate', {'structuredContent':dict(writtenToFile=True,path=str(path),contentLength=22)}, dispatched, 'direct-1', 'old', frozenset())
             async def starter(): self.fail('outputs must never start Neo')
             def handler(request): self.fail('outputs must never call HTTP')

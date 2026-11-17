@@ -1,0 +1,388 @@
+diff --git a/apps/claw-server-rust/src/runtime.rs b/apps/claw-server-rust/src/runtime.rs
+--- a/apps/claw-server-rust/src/runtime.rs
++++ b/apps/claw-server-rust/src/runtime.rs
+@@ -30,7 +30,10 @@
+         self.token.cancelled().await;
+     }
+ 
+-    fn child_token(&self) -> CancellationToken {
++    pub(crate) fn is_requested(&self) -> bool {
++        self.token.is_cancelled()
++    }
++    pub(crate) fn child_token(&self) -> CancellationToken {
+         self.token.child_token()
+     }
+ }
+diff --git a/apps/claw-server-rust/src/api/mcp/mod.rs b/apps/claw-server-rust/src/api/mcp/mod.rs
+--- a/apps/claw-server-rust/src/api/mcp/mod.rs
++++ b/apps/claw-server-rust/src/api/mcp/mod.rs
+@@ -50,7 +50,12 @@
+                     RetainedGroupAction::Close => {
+                         // Forget ownership only after the retained browser group is actually absent.
+                         if crate::config::workspace_manual_tab_cleanup() {
+-                            return effects::tab_groups::agent_tab_group_is_absent(session.as_ref(), &ownership, &key).await;
++                            return effects::tab_groups::agent_tab_group_is_absent(
++                                session.as_ref(),
++                                &ownership,
++                                &key,
++                            )
++                            .await;
+                         }
+                         effects::tab_groups::close_agent_tab_group(
+                             session.as_ref(),
+@@ -70,9 +75,10 @@
+ pub fn streamable_http_service(
+     state: AppState,
+ ) -> StreamableHttpService<ClawMcpService, LocalSessionManager> {
++    let shutdown = state.shutdown.child_token();
+     StreamableHttpService::new(
+         move || Ok(browser_mcp_service(state.clone())),
+         Arc::new(LocalSessionManager::default()),
+-        StreamableHttpServerConfig::default(),
++        StreamableHttpServerConfig::default().with_cancellation_token(shutdown),
+     )
+ }
+diff --git a/apps/claw-server-rust/src/api/mcp/service.rs b/apps/claw-server-rust/src/api/mcp/service.rs
+--- a/apps/claw-server-rust/src/api/mcp/service.rs
++++ b/apps/claw-server-rust/src/api/mcp/service.rs
+@@ -789,6 +789,11 @@
+             let Some(session_id) = session_id else {
+                 return;
+             };
++            // Cancellation closes HTTP streams during application shutdown.
++            // Leave those sessions to the runtime's durable shutdown teardown.
++            if state.shutdown.is_requested() {
++                return;
++            }
+             if let Err(error) = state
+                 .sessions
+                 .remove(&session_id, "closed", Some("transport closed"))
+diff --git a/apps/claw-server-rust/src/main.rs b/apps/claw-server-rust/src/main.rs
+--- a/apps/claw-server-rust/src/main.rs
++++ b/apps/claw-server-rust/src/main.rs
+@@ -219,7 +219,9 @@
+                 } else {
+                     disconnected_seconds += 1;
+                     if disconnected_seconds >= 10 {
+-                        info!("Workspace direct recovery browser disconnected; stopping own server");
++                        info!(
++                            "Workspace direct recovery browser disconnected; stopping own server"
++                        );
+                         recovery_shutdown.request();
+                         return;
+                     }
+@@ -228,10 +230,21 @@
+         });
+     }
+     runtime.spawn_task("harness integration reconciliation", boot_task);
+-    axum::serve(listener, app.into_make_service())
+-        .with_graceful_shutdown(wait_for_shutdown(shutdown))
+-        .await
+-        .context("claw-server listener failed")
++    let http = axum::serve(listener, app.into_make_service())
++        .with_graceful_shutdown(wait_for_shutdown(shutdown.clone()));
++    // An idle stream may outlive shutdown (including a cockpit stream).
++    // Bound the transport drain so the runtime can persist session endings
++    // before Chromium's supervisor removes the process.
++    tokio::select! {
++        result = async { http.await } => result.context("claw-server listener failed"),
++        () = async move {
++            shutdown.requested().await;
++            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
++        } => {
++            warn!("HTTP drain exceeded shutdown grace; starting runtime teardown");
++            Ok(())
++        }
++    }
+ }
+ 
+ async fn serve_stdio(state: AppState) -> anyhow::Result<()> {
+diff --git a/apps/claw-server-rust/tests/routes.rs b/apps/claw-server-rust/tests/routes.rs
+--- a/apps/claw-server-rust/tests/routes.rs
++++ b/apps/claw-server-rust/tests/routes.rs
+@@ -293,6 +293,55 @@
+     let retry_response = app.router.clone().oneshot(retry).await?;
+     let retry_bytes = to_bytes(retry_response.into_body(), usize::MAX).await?;
+     assert_eq!(retry_bytes.as_ref(), br#"{"status":"ok"}"#);
++    assert_eq!(app.state.sessions.shutdown().await?, 1);
++    Ok(())
++}
++
++#[tokio::test]
++async fn shutdown_closes_open_mcp_events_before_runtime_teardown() -> anyhow::Result<()> {
++    let app = test_app().await?;
++    let session_id = initialize_mcp(&app).await?;
++    let response = app
++        .router
++        .clone()
++        .oneshot(
++            Request::builder()
++                .method("GET")
++                .uri("/mcp")
++                .header(header::HOST, "localhost")
++                .header(header::ACCEPT, "text/event-stream")
++                .header("mcp-session-id", &session_id)
++                .header("MCP-Protocol-Version", "2025-06-18")
++                .body(Body::empty())?,
++        )
++        .await?;
++    if response.status() != StatusCode::OK {
++        let status = response.status();
++        let body = to_bytes(response.into_body(), 4096).await?;
++        anyhow::bail!(
++            "GET events status {status}: {}",
++            String::from_utf8_lossy(&body)
++        );
++    }
++    let mut events = response.into_body().into_data_stream();
++    let still_open = tokio::time::timeout(Duration::from_millis(50), async {
++        while let Some(event) = events.next().await {
++            event?;
++        }
++        Ok::<(), axum::Error>(())
++    })
++    .await;
++    assert!(still_open.is_err(), "event stream closed before shutdown");
++
++    app.state.shutdown.request();
++    tokio::time::timeout(Duration::from_secs(1), async {
++        while let Some(event) = events.next().await {
++            event?;
++        }
++        Ok::<(), axum::Error>(())
++    })
++    .await??;
++    assert_eq!(app.state.sessions.count().await, 1);
+     assert_eq!(app.state.sessions.shutdown().await?, 1);
+     Ok(())
+ }
+@@ -1991,9 +2040,29 @@
+ ) -> Result<Value, String> {
+     match method {
+         "Browser.getVersion" => Ok(json!({ "product": "BrowserOS Mock" })),
++        "Browser.getWindows" => Ok(json!({
++            "windows": [{
++                "windowId": 1, "windowType": "normal", "bounds": {},
++                "isActive": false, "isVisible": true, "tabCount": tabs.lock().await.len()
++            }]
++        })),
+         "Browser.getTabs" => {
+             let tabs = tabs.lock().await;
+             Ok(json!({ "tabs": tabs.iter().map(tab_json).collect::<Vec<_>>() }))
++        }
++        "Browser.getTabGroups" => {
++            let tabs = tabs.lock().await;
++            let mut by_group = std::collections::BTreeMap::<_, Vec<_>>::new();
++            for tab in tabs.iter() {
++                if let Some(group) = &tab.group_id {
++                    by_group.entry((group, tab.window_id)).or_default().push(tab.tab_id);
++                }
++            }
++            let groups: Vec<_> = by_group.into_iter().map(|((group, window), tabs)| {
++                json!({"groupId": group, "windowId": window, "title": "group",
++                    "color": "blue", "collapsed": false, "tabIds": tabs})
++            }).collect();
++            Ok(json!({"groups": groups}))
+         }
+         "Browser.createTab" => {
+             let mut tabs = tabs.lock().await;
+diff --git a/apps/claw-server-rust/src/db/session_tabs.rs b/apps/claw-server-rust/src/db/session_tabs.rs
+--- a/apps/claw-server-rust/src/db/session_tabs.rs
++++ b/apps/claw-server-rust/src/db/session_tabs.rs
+@@ -105,21 +105,23 @@
+ impl SessionTabLedger {
+     /// Positive continuation proof, not absence from an in-memory live snapshot.
+     /// Caller also holds the live-session and ownership locks while admitting.
+-    pub async fn idle_owner_for_tabs(
++    pub async fn unchanged_owner_for_tabs(
+         &self,
+         prior_session: &str,
+         tabs: &[(i64, String)],
++        unclaimed: bool,
+     ) -> AppResult<Option<(String, String)>> {
+         self.drain_writes().await;
+-        idle_owner_in(self.db.connection(), prior_session, tabs).await
++        closed_owner_in(self.db.connection(), prior_session, tabs, RecoveryProof::Unchanged { unclaimed }).await
+     }
+ 
+     /// Write the complete new claim set in one transaction and propagate failure.
+-    pub async fn record_idle_recovery(&self, prior_session: &str, current_session: &str,
+-        current_owner: &str, old_owner: &str, client: &str, tabs: &[(i64,String)]) -> AppResult<bool>
++    pub async fn record_unchanged_recovery(&self, prior_session: &str, current_session: &str,
++        current_owner: &str, old_owner: &str, client: &str, tabs: &[(i64,String)], unclaimed: bool) -> AppResult<bool>
+     {
+         let txn=self.db.connection().begin().await?;
+-        if idle_owner_in(&txn,prior_session,tabs).await? != Some((old_owner.to_owned(),client.to_owned())) {
++        if closed_owner_in(&txn, prior_session, tabs, RecoveryProof::Unchanged { unclaimed }).await?
++            != Some((old_owner.to_owned(),client.to_owned())) {
+             return Ok(false);
+         }
+         let claimed=now_epoch_ms();
+@@ -136,7 +138,7 @@
+     pub async fn normal_owner_for_tabs(&self, prior_session: &str, tabs: &[(i64,String)])
+         -> AppResult<Option<(String,String)>> {
+         self.drain_writes().await;
+-        closed_owner_in(self.db.connection(),prior_session,tabs,true).await
++        closed_owner_in(self.db.connection(),prior_session,tabs,RecoveryProof::Restored).await
+     }
+ 
+     /// Restored tabs are new physical incarnations. Revalidate the old complete
+@@ -145,7 +147,7 @@
+         current_owner: &str, old_owner: &str, client: &str,
+         prior_tabs: &[(i64,String)], current_tabs: &[(i64,String)]) -> AppResult<bool> {
+         let txn=self.db.connection().begin().await?;
+-        if closed_owner_in(&txn,prior_session,prior_tabs,true).await?
++        if closed_owner_in(&txn,prior_session,prior_tabs,RecoveryProof::Restored).await?
+             != Some((old_owner.to_owned(),client.to_owned())) {return Ok(false)}
+         for (tab,target) in current_tabs {
+             if SessionTabs::find().filter(session_tabs::Column::OpenedTargetId.eq(target.clone()))
+@@ -173,14 +175,14 @@
+ 
+ }
+ 
+-async fn idle_owner_in<C:ConnectionTrait>(conn:&C, prior_session:&str,
+-    tabs:&[(i64,String)]) -> AppResult<Option<(String,String)>>
+-{
+-    closed_owner_in(conn,prior_session,tabs,false).await
++#[derive(Clone, Copy)]
++enum RecoveryProof {
++    Unchanged { unclaimed: bool },
++    Restored,
+ }
+ 
+ async fn closed_owner_in<C:ConnectionTrait>(conn:&C, prior_session:&str,
+-    tabs:&[(i64,String)], restored:bool) -> AppResult<Option<(String,String)>>
++    tabs:&[(i64,String)], proof:RecoveryProof) -> AppResult<Option<(String,String)>>
+ {
+         if tabs.is_empty()
+             || tabs.iter().map(|(tab, _)| tab).collect::<std::collections::BTreeSet<_>>().len() != tabs.len()
+@@ -194,15 +196,19 @@
+             .filter(agent_session_ends::Column::SessionId.eq(prior_session))
+             .all(conn).await?;
+         let ([start], [end]) = (starts.as_slice(), ends.as_slice()) else { return Ok(None) };
+-        let normal_reason=if restored {
+-            matches!(end.reason.as_deref(),Some("idle timeout" | "server shutdown"))
+-        } else {end.reason.as_deref()==Some("idle timeout")};
+-        if end.kind != "closed" || !normal_reason
++        let reason = end.reason.as_deref();
++        let interrupted = reason == Some("server exited")
++            && matches!(proof, RecoveryProof::Unchanged { unclaimed: true });
++        let allowed_reason = match proof {
++            RecoveryProof::Unchanged { unclaimed: false } => reason == Some("idle timeout"),
++            _ => matches!(reason, Some("idle timeout" | "server shutdown")) || interrupted,
++        };
++        if end.kind != "closed" || !allowed_reason
+             || end.created_at < start.created_at
+         {
+             return Ok(None);
+         }
+-        if restored {
++        if matches!(proof, RecoveryProof::Restored) || interrupted {
+             let rows=SessionTabs::find().filter(session_tabs::Column::SessionId.eq(prior_session))
+                 .all(conn).await?;
+             if rows.iter().any(|r|r.released_at.is_none()) {return Ok(None)}
+@@ -220,7 +226,15 @@
+                 .one(conn).await? else { return Ok(None) };
+             if target.is_empty() || last.session_id != prior_session || last.agent_id != start.agent_id
+                 || last.opened_target_id.as_deref() != Some(target.as_str())
+-                || last.released_at.is_none_or(|released| released < last.claimed_at || released > end.created_at)
++                || last.released_at.is_none_or(|released| {
++                    // Boot releases stranded claims. Its audit end is backdated
++                    // to the departing process's last observed activity.
++                    released < last.claimed_at || if interrupted {
++                        released < end.created_at
++                    } else {
++                        released > end.created_at
++                    }
++                })
+             {
+                 return Ok(None);
+             }
+diff --git a/apps/claw-server-rust/src/services/sessions/manager.rs b/apps/claw-server-rust/src/services/sessions/manager.rs
+--- a/apps/claw-server-rust/src/services/sessions/manager.rs
++++ b/apps/claw-server-rust/src/services/sessions/manager.rs
+@@ -458,7 +458,7 @@
+     /// A previous opaque task handle plus its final released claims proves provenance.
+     /// Keep lifecycle admission stable through the ownership CAS: a same-client live
+     /// conversation is just as protected as a different-client conversation.
+-    pub async fn reclaim_idle_pages<F>(
++    pub async fn reclaim_unchanged_pages<F>(
+         self: &Arc<Self>,
+         prior_session: &SessionId,
+         current_session: &SessionId,
+@@ -481,9 +481,10 @@
+           if cancel.is_cancelled() || live.contains_key(&prior_session) || tabs.is_empty() || expected.len() < tabs.len() {
+             return Err("Prior task is active or recovery membership is incomplete".into());
+         }
++        let unclaimed = expected.iter().all(|(_, owner)| owner.is_none());
+         registry.ownership.reclaim_pages_if_unchanged(current.convo_id(), &expected, &group_ref, false, async {
+-            let (owner, client) = registry.session_tabs.idle_owner_for_tabs(prior_session.as_str(), &tabs)
+-                .await.map_err(|e| e.to_string())?.ok_or("No exact idle-expired task claim proof")?;
++            let (owner, client) = registry.session_tabs.unchanged_owner_for_tabs(prior_session.as_str(), &tabs, unclaimed)
++                .await.map_err(|e| e.to_string())?.ok_or("No exact closed task claim proof for the same physical tabs")?;
+             let owner = ConvoId::new(owner);
+             if current.client_name() != client
+                 || expected.iter().any(|(_, prior)| prior.as_ref().is_some_and(|prior|prior != &owner))
+@@ -493,8 +494,8 @@
+             }
+             validate_physical.await?;
+             if cancel.is_cancelled() {return Err("Recovery cancelled before commit".into())}
+-            if !registry.session_tabs.record_idle_recovery(prior_session.as_str(),current_session.as_str(),
+-                current.convo_id().as_str(),owner.as_str(),&client,&tabs).await.map_err(|e|e.to_string())? {
++            if !registry.session_tabs.record_unchanged_recovery(prior_session.as_str(),current_session.as_str(),
++                current.convo_id().as_str(),owner.as_str(),&client,&tabs,unclaimed).await.map_err(|e|e.to_string())? {
+                 return Err("Recovery claim changed before commit".into());
+             }
+             Ok(())
+diff --git a/apps/claw-server-rust/src/api/mcp/effects/expired_recovery.rs b/apps/claw-server-rust/src/api/mcp/effects/expired_recovery.rs
+--- a/apps/claw-server-rust/src/api/mcp/effects/expired_recovery.rs
++++ b/apps/claw-server-rust/src/api/mcp/effects/expired_recovery.rs
+@@ -337,7 +337,7 @@
+         } else {
+             call.state
+                 .sessions
+-                .reclaim_idle_pages(
++                .reclaim_unchanged_pages(
+                     &SessionId::new(request.prior_session),
+                     &call.session_id,
+                     &owners,
+@@ -1044,6 +1044,30 @@
+     }
+ 
+     #[tokio::test]
++    async fn interrupted_session_recovers_only_its_unclaimed_unchanged_physical_group()
++    -> anyhow::Result<()> {
++        use sea_orm::{ConnectionTrait, DbBackend, Statement};
++        for changed_target in [false, true] {
++            let (call, browser, page) = fixture(true, true, false).await?;
++            let db = call.state.session_tabs.connection();
++            db.execute(Statement::from_string(
++                DbBackend::Sqlite,
++                "UPDATE agent_session_ends SET reason = 'server exited' WHERE session_id = 'prior-task'".to_owned(),
++            )).await?;
++            db.execute(Statement::from_string(
++                DbBackend::Sqlite,
++                "UPDATE session_tabs SET released_at = (SELECT created_at + 1 FROM agent_session_ends WHERE session_id = 'prior-task') WHERE session_id = 'prior-task'".to_owned(),
++            )).await?;
++            // A crash label does not allow claiming any currently owned alias.
++            assert!(reclaim_enabled(&call).await.is_error);
++            call.state.sessions.ownership().remove_page(&page).await;
++            browser.restored.store(changed_target, Ordering::SeqCst);
++            assert_eq!(reclaim_enabled(&call).await.is_error, changed_target);
++        }
++        Ok(())
++    }
++
++    #[tokio::test]
+     async fn expired_recovery_failed_database_commit_preserves_prior_owner() -> anyhow::Result<()> {
+         use sea_orm::{ConnectionTrait, DbBackend, Statement};
+         let (call, _, page) = fixture(true, true, false).await?;
+@@ -1154,7 +1178,7 @@
+         let release_work = release.clone();
+         let recovery = tokio::spawn(async move {
+             registry
+-                .reclaim_idle_pages(
++                .reclaim_unchanged_pages(
+                     &SessionId::new("prior-task"),
+                     &current,
+                     &expected,

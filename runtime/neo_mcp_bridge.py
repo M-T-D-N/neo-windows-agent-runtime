@@ -464,7 +464,7 @@ class Bridge:
     async def start_runtime(self):
         # The launcher verifies publisher/profile and serializes concurrent starts.
         command = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                   "-File", str(ROOT / "start-neo.ps1")]
+                   "-File", str(ROOT / "start-neo.ps1"), "-Background"]
         state = json.loads((ROOT / "runtime-plan.json").read_text(encoding="utf-8"))["server_state_root"]
         # Python preserves PS7 module paths when invoking Windows PowerShell 5.1.
         # Let the child rebuild its own defaults; never change the parent/registry.

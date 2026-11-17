@@ -270,3 +270,38 @@ foreach($case in @(@{status='Valid';publisher='Approved Neo Publisher';allow=$tr
  if((Test-NeoPublisherSignature $signature $case.publisher) -ne $case.allow){throw 'Signature/publisher boundary changed'}
 }
 ''')
+
+
+class RestorableShutdownProofTests(unittest.TestCase):
+    def test_ack_or_reconciled_exit_is_not_a_durable_shutdown(self):
+        import runpy
+        import sqlite3
+        from contextlib import closing
+
+        verify = runpy.run_path(str(Path(__file__).resolve().parents[1] / "stop-neo.py"))["verify_drained"]
+        with closing(sqlite3.connect(":memory:")) as db:
+            db.executescript("""
+                CREATE TABLE agent_session_starts (session_id TEXT);
+                CREATE TABLE agent_session_ends (session_id TEXT, kind TEXT, reason TEXT, created_at INTEGER);
+                CREATE TABLE session_tabs (session_id TEXT, claimed_at INTEGER, released_at INTEGER);
+                INSERT INTO agent_session_starts VALUES ('retained-session');
+                INSERT INTO session_tabs VALUES ('retained-session', 10, NULL);
+            """)
+            prior = [("retained-session",)]
+            with self.assertRaisesRegex(RuntimeError, "still open"):
+                verify(db, prior)
+
+            with db:
+                db.execute("INSERT INTO agent_session_ends VALUES ('retained-session', 'closed', 'server exited', 20)")
+                db.execute("UPDATE session_tabs SET released_at = 25")
+            with self.assertRaisesRegex(RuntimeError, "did not persist"):
+                verify(db, prior)
+
+            with db:
+                db.execute("UPDATE agent_session_ends SET reason = 'server shutdown'")
+            with self.assertRaisesRegex(RuntimeError, "claims did not drain"):
+                verify(db, prior)
+
+            with db:
+                db.execute("UPDATE session_tabs SET released_at = 20")
+            verify(db, prior)
