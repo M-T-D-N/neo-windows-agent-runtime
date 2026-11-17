@@ -21,12 +21,15 @@ class TaskStateTests(unittest.TestCase):
         self.assertEqual(self.state.reconciliation([child], groups, native_targets=['child']), ([], []))
         self.assertEqual(json.dumps(self.state.record, sort_keys=True), before)
         self.state.checkpoint_session('reconnected')
+        self.assertEqual(self.state.restored_candidates([child], groups, native_targets=['child']), [])
         recovery = dict(prior_group_id='original', group_id='original',
                         pages=[dict(targetId='child', url=child['url'])],
                         reason='Human selected the registered child tab for cleanup')
         self.assertEqual(self.state.reconciliation([child], groups, recovery=recovery,
                                                    native_targets=['child']), ([], []))
-        self.state.save('reconnected', [child], groups)
+        with self.assertRaisesRegex(ValueError, 'preserve original binding'):
+            self.state.save('reconnected', [child], groups)
+        self.state.save('reconnected', [child], groups, native_targets=['child'])
         self.assertEqual(self.state.record['pages'], [])
         self.assertEqual(self.state.record['groups'], [])
         self.assertEqual(child['ownership'], 'user')
@@ -58,6 +61,58 @@ class TaskStateTests(unittest.TestCase):
                 before = json.dumps(self.state.record, sort_keys=True)
                 self.assertTrue(self.state.reconciliation(pages, current_groups, native_targets=targets)[1])
                 self.assertEqual(json.dumps(self.state.record, sort_keys=True), before)
+
+    def test_explicit_restored_recovery_needs_original_handle_and_full_selected_incarnation(self):
+        self.state.record['pages'][0]['tabId']=101
+        self.state.checkpoint_session('replacement')
+        restored=dict(page('new','restored','user'),tabId=202)
+        groups=[dict(id='restored',title='human selected actual group')]
+        recovery=dict(prior_group_id='original',group_id='restored',
+            pages=[dict(targetId='new',url=restored['url'])],reason='Human explicitly selected this restored group')
+        request=self.state.restored_recovery(recovery,[restored],groups)
+        self.assertEqual(request,dict(groupId='restored',priorGroupId='original',priorSession='old',
+            prior=[dict(tabId=101,targetId='one',url=restored['url'])],expected=recovery['pages']))
+        before=json.dumps(self.state.record,sort_keys=True)
+        for pages in ([restored,page()],
+                      [dict(restored,ownerAgentId='active',ownership='other-agent')],
+                      [dict(restored,url='https://example.com/changed')],
+                      [restored,dict(restored,targetId='extra',pageId=7)],
+                      [restored,dict(restored,pageId=8,ownership='other-agent',ownerAgentId='same-client')]):
+            with self.assertRaises(ValueError):self.state.restored_recovery(recovery,pages,groups)
+            self.assertEqual(json.dumps(self.state.record,sort_keys=True),before)
+        self.state.record.pop('pages_session')
+        self.state.record.pop('prior_bindings')
+        with self.assertRaises(ValueError):self.state.restored_recovery(recovery,[restored],groups)
+
+    def test_expired_task_proof_preserves_native_handle_and_requires_exact_group(self):
+        groups=[dict(id='original',title='verified task label')]
+        self.state.checkpoint_session('replacement')
+        other=dict(page(ownership='other-agent'),ownerAgentId='old-native-owner')
+        alias=dict(other,pageId=2,ownership='user',ownerAgentId=None)
+        request=self.state.expired_recovery([alias,other],groups)
+        self.assertEqual(request,[dict(groupId='original',priorSession='old',
+            expected=[dict(targetId='one',url='https://example.com/a')])])
+        self.assertTrue(self.state.reconciliation([alias,other],groups)[1])
+        self.assertEqual(self.state.reconciliation([alias,other],groups,allow_expired=True),(['original'],[]))
+        self.assertEqual(self.state.expired_recovery([alias],groups),request)
+        for pages in ([dict(other,ownerAgentId=None)],
+                      [other,dict(alias,url='https://example.com/changed')],
+                      [other,dict(other,targetId='extra',pageId=3)],
+                      [other,dict(other,ownerAgentId='another-owner',pageId=3)]):
+            self.assertEqual(self.state.expired_recovery(pages,groups),[])
+        self.state.save('replacement',[page()],groups)
+        self.assertEqual(self.state.record['prior_bindings'],[])
+
+    def test_legacy_retention_proves_original_handle_without_inventing_checkpoint_ownership(self):
+        groups=[dict(id='original',title='verified task label')]
+        self.state.record.pop('pages_session')
+        self.state.record['retained']=[(('old','one','https://example.com/a'),'Unfinished real task')]
+        self.state.checkpoint_session('replacement')
+        self.assertEqual(self.state.record.get('prior_bindings',[]),[])
+        other=dict(page(ownership='other-agent'),ownerAgentId='old-native-owner')
+        self.assertEqual(self.state.expired_recovery([other],groups)[0]['priorSession'],'old')
+        self.state.record['retained'].append((('ambiguous','one','https://example.com/a'),'Another historical key'))
+        self.assertEqual(self.state.expired_recovery([other],groups),[])
 
     def setUp(self):
         root=os.environ['WEB_AUTOMATION_TEST_ROOT']
@@ -139,6 +194,8 @@ class TaskStateTests(unittest.TestCase):
         self.assertTrue(self.state.reconciliation([exact],[dict(id='original',title='verified task label')],native_targets=['different'])[1])
         matching=page('different','other','other-agent')
         self.assertTrue(self.state.reconciliation([matching],groups,native_targets=['different'])[1])
+        self.state.checkpoint_session('replacement')
+        self.assertEqual(self.state.restored_candidates([unrelated],groups),[dict(priorGroupId='original',candidates=[])])
         for invalid in (42,[''],['one'],['different',None]):
             with self.assertRaisesRegex(ValueError,'Incomplete native target inventory'):
                 self.state.reconciliation([unrelated],groups,native_targets=invalid)
@@ -215,7 +272,9 @@ class ReconciliationTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory(dir=os.environ['WEB_AUTOMATION_TEST_ROOT']) as root:
             state=TaskState(root); state.bind(TASK)
             state.save('old',[page()],[dict(id='original',title='verified task label')])
-            bridge=Bridge('http://127.0.0.1:9010/mcp',lambda _:None,state_root=root,task_id=TASK)
+            # This test exercises the legacy asynchronous tabs-new protocol.
+            bridge=Bridge('http://127.0.0.1:9010/mcp',lambda _:None,state_root=root,task_id=TASK,
+                          catalog={'catalog':{'tools':[]}})
             self.addAsyncCleanup(bridge.close)
             restored=page('new','restored','user')
             owned=dict(restored,ownership='mine')
@@ -239,7 +298,8 @@ class ReconciliationTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory(dir=os.environ['WEB_AUTOMATION_TEST_ROOT']) as root:
             state=TaskState(root);state.bind(TASK)
             state.save('old',[page()],[dict(id='original',title='verified task label')])
-            out=[];bridge=Bridge('http://127.0.0.1:9010/mcp',out.append,state_root=root,task_id=TASK)
+            out=[];bridge=Bridge('http://127.0.0.1:9010/mcp',out.append,state_root=root,task_id=TASK,
+                                catalog={'catalog':{'tools':[]}})
             self.addAsyncCleanup(bridge.close)
             restored=page('new','restored','user','https://example.com/login')
             owned=dict(restored,ownership='mine')
@@ -255,9 +315,8 @@ class ReconciliationTests(unittest.IsolatedAsyncioTestCase):
                           pages=metadata['recoveryPages'],
                           reason='User selected the exact restored synthetic group')
             bridge.ensure_ready=AsyncMock()
-            bridge.inventory=AsyncMock(side_effect=[dict(pages=[restored],groups=[group]),
-                dict(pages=[owned,temporary],groups=[group]),dict(pages=[owned],groups=[group]),
-                dict(pages=[owned],groups=[group])])
+            snapshots=iter([dict(pages=[restored],groups=[group]), dict(pages=[owned,temporary],groups=[group])])
+            bridge.inventory=AsyncMock(side_effect=lambda:next(snapshots,dict(pages=[owned],groups=[group])))
             bridge.internal_tool=AsyncMock(return_value={})
             # Exercise the public dispatch path, with only the trailing check
             # response stubbed so it cannot hide adoption/cleanup behavior.
@@ -281,7 +340,8 @@ class ReconciliationTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory(dir=os.environ['WEB_AUTOMATION_TEST_ROOT']) as root:
             state=TaskState(root);state.bind(TASK)
             state.save('old',[page()],[dict(id='original',title='verified task label')])
-            bridge=Bridge('http://127.0.0.1:9010/mcp',lambda _:None,state_root=root,task_id=TASK)
+            bridge=Bridge('http://127.0.0.1:9010/mcp',lambda _:None,state_root=root,task_id=TASK,
+                          catalog={'catalog':{'tools':[]}})
             self.addAsyncCleanup(bridge.close)
             restored=page('new','restored','user'); group=dict(id='restored',title='verified task label')
             temporary=dict(page('temporary','restored','mine','about:blank'),pageId=9)

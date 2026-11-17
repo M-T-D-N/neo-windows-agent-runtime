@@ -138,11 +138,15 @@ class DispatchBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 begun=await call(1,'workspace_cleanup',action='begin',task_id=TASK)
                 self.assertTrue(begun['structuredContent']['freshInventoryRequired'])
                 queued=bridge.handle(request(2,'tabs',action='close',page=1,session='old-session'))
+                failed[0]=True  # Automatic catalogs must not authorize an old request on failure.
                 for i,name,args in ((3,'read',dict(page=1)),(4,'tabs',dict(action='close',page=1)),
                         (5,'workspace_cleanup',dict(action='use',pageIds=[1],reason='old request',task_id=TASK))):
                     blocked=await call(i,name,**args)
                     self.assertTrue(blocked.get('isError') or blocked.get('structuredContent',{}).get('decision')=='block',output[-1])
-                self.assertEqual(calls,[]);bridge.ensure_ready.assert_not_awaited()
+                self.assertEqual(len(calls),3)
+                self.assertTrue(all(c['params']['name']=='tabs' and c['params']['arguments']['action']=='list' for c in calls))
+                self.assertEqual(bridge.ensure_ready.await_count,3)
+                self.assertTrue(all(c.kwargs=={'allow_start':False} for c in bridge.ensure_ready.await_args_list))
                 for i,name in ((6,'windows'),(7,'tab_groups')):
                     await call(i,name,action='list')
                     self.assertTrue(bridge.reset_requires_inventory)
@@ -229,7 +233,7 @@ class DispatchBoundaryTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.gather(work,*([manager] if manager else []),return_exceptions=True)
                     await bridge.close()
 
-    async def test_queued_prior_request_cannot_dispatch_after_reset_until_begin(self):
+    async def test_queued_prior_request_requires_fresh_inventory_after_reset(self):
         with tempfile.TemporaryDirectory(dir=os.environ['WEB_AUTOMATION_TEST_ROOT']) as directory:
             calls=[];output=[]
             def forbidden(request):calls.append(request);raise AssertionError('Prior request must not dispatch')
@@ -245,7 +249,7 @@ class DispatchBoundaryTests(unittest.IsolatedAsyncioTestCase):
                     path=Path(directory)/(TASK+'.json');observed=json.loads(path.read_text(encoding='utf-8'))
                     bridge.task_state._write_record(closed(observed),administrator_reset=True,expected_state=copy.deepcopy(observed),operation_guard=admin)
                 await asyncio.wait_for(work,2)
-                self.assertTrue(output[-1]['result']['isError']);self.assertIn('begin',json.dumps(output[-1]))
+                self.assertTrue(output[-1]['result']['isError']);self.assertIn('tabs action=list',json.dumps(output[-1]))
                 self.assertEqual(calls,[]);bridge.ensure_ready.assert_not_awaited()
                 await bridge.handle(dict(jsonrpc='2.0',id=2,method='tools/call',params=dict(name='workspace_cleanup',arguments=dict(action='begin',task_id=TASK))))
                 self.assertTrue(output[-1]['result']['structuredContent']['browserReset'])

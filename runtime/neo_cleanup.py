@@ -13,7 +13,8 @@ DEFER_CONDITIONS = ('unsaved', 'request_pending', 'other_owner', 'permission_mis
 
 
 def has_pending_cleanup(value):
-    return bool(value.get('pendingPageIds') or value.get('reviewPageIds') or value.get('pendingUsedTargetIds'))
+    return bool(value.get('pendingPageIds') or value.get('reviewPageIds')
+                or value.get('pendingUsedTargetIds') or value.get('pendingReconciliationGroups'))
 
 
 def _page_ids(args):
@@ -55,6 +56,12 @@ TOOL = {
     },
     "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
 }
+
+TOOL['inputSchema']['properties']['recovery']['description'] += (
+    ' When the server advertises restored recovery, use this only after management has verified a normal browser restart'
+    ' and the human has selected the exact restored group. All prior native targets must be absent; complete original'
+    ' session/claim evidence and all current aliases are rechecked. A normal server-session receipt alone does not prove'
+    ' a normal browser restart. Without a selection, preserve the original binding and inspect read-only candidates.')
 
 class CleanupPolicy:
     def __init__(self):

@@ -6,6 +6,28 @@ server 0.0.65**, not a claim to support the latest upstream version. DOT review 
 required before the first public upload. Current-PC isolated tests and other-PC
 tests are reported separately; the latter are deferred by the owner.
 
+## v0.1.5: reconnect initialization shared by Codex and AGY
+
+Binding the actual task UUID performs local initialization without a redundant
+`begin`. After a recorded reset, a premature page/cleanup action returns only a
+fresh caller-visible tab catalog and current session/receipt. The explicit
+`NEO_RECONNECT_INITIALIZED`, `requestedActionExecuted=false` and `isError=true`
+response means the submitted operation was not executed. Select current IDs and
+construct a new request. No stale or queued page operation is replayed.
+
+This initialization path never starts an off browser, adopts groups or infers an
+unknown task. Failed inventory/delivery, retired sessions and wrong receipts
+remain blocked. The export also synchronizes the current operating recovery
+guards and their tests; the complete delta is reviewed before publication.
+Read-only cleanup preserves original restoration evidence across renamed, empty
+or incomplete inventories and does not mark unresolved restoration complete.
+The final save boundary also requires safe native ownership or closure evidence.
+Equal URLs in another group never discharge a missing prior group. Each selected
+recovery replaces only its proven prior group, with ownership checked across all
+aliases of each target. Legacy adoption requires a completed native operation;
+read-only cleanup cannot manufacture an adoption receipt.
+Browser/server versions, dependency pins, profiles and permissions are unchanged.
+
 ## v0.1.4: identity records after a browser-only restart
 
 Equivalent absolute config paths use normalized comparison; relative config
@@ -37,87 +59,6 @@ replayed. Browser/server/dependency pins are unchanged.
 
 This is qualified on an isolated installation on the maintainer's current Windows
 PC, including a Unicode path with spaces; other-PC testing remains deferred.
-
-## v0.1.3: AGY finish inspection after an administrator reset
-
-The independent CLI finish observer now locally binds the actual task before its
-read-only cleanup check. After a consumed browser reset, valid retained scope and
-fully cleaned scope no longer incorrectly return exit 6 solely because this fresh
-observer had not acknowledged the reset. Binding failure, pending tabs, stale
-retention, failed browser inspection and unknown outcomes still block completion.
-The observer does not launch Neo, mutate pages or grant inventory receipt rights.
-The public endpoint identity guard and same-execution retention/defer evidence
-remain enforced. Browser 0.51.0, server 0.0.65 and dependency pins are unchanged.
-
-## v0.1.2: registered popup tabs after parent closure
-
-Closing the last owned parent no longer strands its binding when a link-opened,
-unclaimed child remains in the same group. Native absence, the saved full group
-tab IDs, exact registered target/tab/URL and every current alias must agree.
-Known pre-existing unowned siblings cannot fall back to URL restoration when
-registration fails, even when the parent and child have the same URL.
-Unknown group members, other owners, changed registrations or a surviving parent
-preserve the binding. The child is never adopted or closed by reconciliation;
-its contents and used-tab cleanup scope remain intact for explicit review.
-
-Browser 0.51.0, patched server 0.0.65, installer/dependency pins and corresponding
-server source remain unchanged. This release adds no ownership permissions.
-
-After an explicitly authorized administrator close-all, cached clients can
-consume a complete closed reset receipt without starting Neo. A fresh
-browser_reset_id UUID, immutable browser_reset_verified=true,
-browser_reset_pending=true, browser_closed=true, null
-session/pages_session, and empty pages/groups/used_tabs/retained/prior_bindings/
-review_required arrays are required. Output inventories remain intact. A new
-server handle consumes the pending receipt; readiness failures cannot revive
-old hints. Other cached clients can read the pending or consumed state and reuse
-the current handle. Begin only acknowledges retirement. Each connection must
-receive an explicit successful tabs action=list, select current page IDs/session,
-and echo its inventory_receipt on fresh browser and page-using cleanup requests.
-The ephemeral receipt is returned in text and com.workspace.neo/inventory_receipt
-metadata; it is never persisted or forwarded upstream. Internal inventory,
-windows/groups lists and failed lists do not authorize page operations. Old queued
-requests and retired explicit session hints are rejected rather than replayed
-against reused page numbers. Local begin/outputs/check need no receipt.
-Normally close with native browser tools first. Then hold
-state.browser_operation(exclusive=True) from snapshot capture through exact
-browser/server termination verification and all administrator writes:
-TaskState._write_record(administrator_reset=True, operation_guard=guard,
-expected_state=<deep copy read under the guard before closure verification>).
-Browser tools must not be invoked while administration holds this guard.
-The profile-wide OS lock permits concurrent shared Codex/AGY Bridge.handle calls;
-exclusive administration waits for readiness, internal reconciliation, in-flight
-HTTP and result bookkeeping, while blocking new calls. Raw/stateless clients
-outside the adapter are not covered and must not be active at administration.
-After an epoch change an old queued request stops before dispatch until local
-workspace_cleanup begin acknowledges retirement and fresh inventory is inspected.
-The same transaction rejects changed state and reused reset
-UUIDs. Every task write advances a revision; mutation-capable dispatch persists
-it before action, so a later operation cannot return silently to an equal-looking
-old snapshot. Transactions preserve the union of cached/on-disk
-output receipts and reject provenance conflicts or stale reset writes. Two
-in-flight reset mints cannot replace the first consumed handle; the later caller
-refreshes current state and stops its stale preflight before further actions.
-This mechanism never closes tabs or grants ownership by itself. Raw parent
-targets missing from the SDK listing also block URL recovery.
-
-## v0.1.1: closed-group reconciliation fix
-
-Closing the last tab in one task group no longer leaves an unrecoverable stale
-binding when a different group shares its session title. The bridge checks the
-complete native target list and exact group identity before recognizing absence.
-SDK-only aliases are excluded only after a per-target CDP query returns the
-explicit no-such-target error. Live targets, other errors and incomplete proof
-preserve the prior binding. Arbitrary omissions from both catalogs cannot be
-independently detected; normal CDP catalog completeness remains a trust premise.
-A surviving native target with a missing SDK alias, ownership conflicts and
-ambiguous restoration still preserve the prior binding. Reconnect the MCP client
-after changing the installed source; reuse the same task UUID and existing tabs.
-
-This is a Python bridge/state fix. Browser 0.51.0, patched server 0.0.65, binary
-pins, corresponding server source, installer, endpoint checks and dependencies
-are unchanged from v0.1.0. Install this source into a fresh root as documented;
-the existing installer intentionally refuses to overwrite a different source ID.
 
 ## Requirements and installation
 
@@ -224,6 +165,15 @@ perform a real read-only Neo query. This is a **Codex host capability**, not a t
 supplied by the Neo server; unmodified hosts may need their own supported MCP
 restart UI. AGY also uses its own supported reconnect path. A new MCP connection
 must restore task identity before opening replacement tabs.
+
+The shared bridge initializes locally when the actual task UUID is bound; no
+second `begin` is needed after reconnect. After a recorded reset, a premature
+page operation returns `NEO_RECONNECT_INITIALIZED` with a fresh tab catalog only.
+`requestedActionExecuted=false` and `isError=true` mean the original operation
+did not run. Select current IDs/session and construct a new request with the
+returned `inventory_receipt`. Initialization never starts an off browser, adopts
+groups, or replays a save/upload/post. Failed inventory/delivery and previously
+queued requests cannot authorize page operations.
 
 For a whole-browser restart that must preserve task bindings, quit the browser
 application normally (Exit / supported `Browser.close`) after inspecting pending

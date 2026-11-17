@@ -38,6 +38,7 @@ def response(request, result=None, status=200, session="first"):
     return httpx.Response(status, headers={"Mcp-Session-Id": session}, json={
         "jsonrpc": "2.0", "id": message.get("id"), "result": result or {}})
 
+
 class BridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_closed_parent_with_used_user_child_reconciles_without_claiming(self):
         import tempfile
@@ -230,13 +231,21 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         calls = []
         bridge, output = await self.make_bridge(lambda request: calls.append(request))
         bridge.catalog['catalog']['tools'] = [{'name': 'tabs', 'inputSchema': {'properties': {
-            'action': {'enum': ['list', 'new', 'reclaim']}, 'expected': {'type': 'array'}}}}]
+            'action': {'enum': ['list', 'new', 'reclaim', 'reclaim_expired','reclaim_restored']},
+            'expected': {'type': 'array'},'priorSession':{'type':'string'},
+            'priorGroupId':{'type':'string'},'prior':{'type':'array'}}}}]
         await bridge.handle({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'})
         properties = output[-1]['result']['tools'][0]['inputSchema']['properties']
         self.assertEqual(properties['action']['enum'], ['list', 'new'])
         self.assertNotIn('expected', properties)
-        self.assertIn('reclaim', bridge.catalog['catalog']['tools'][0]['inputSchema']['properties']['action']['enum'])
-        for args in ({'action': 'reclaim', 'groupId': 'foreign'}, {'action': 'new', 'expected': []}):
+        self.assertNotIn('priorSession',properties)
+        self.assertNotIn('priorGroupId',properties)
+        self.assertNotIn('prior',properties)
+        self.assertIn('reclaim_expired', bridge.catalog['catalog']['tools'][0]['inputSchema']['properties']['action']['enum'])
+        for args in ({'action': 'reclaim', 'groupId': 'foreign'}, {'action': 'new', 'expected': []},
+                     {'action':'reclaim_expired','groupId':'foreign'}, {'action':'new','priorSession':'foreign'},
+                     {'action':'reclaim_restored','groupId':'foreign'}, {'action':'new','priorGroupId':'foreign'},
+                     {'action':'new','prior':[]}):
             await bridge.handle({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call',
                                  'params': {'name': 'tabs', 'arguments': args}})
             self.assertTrue(output[-1]['result']['isError'])
@@ -287,18 +296,149 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(after['execution_incomplete'])
                     self.assertIsNone(bridge.cleanup_empty_session)
                     self.assertFalse(bridge.task_prepared)
+            for name in ('snapshot','read','grep','diff','screenshot'):
+                with self.subTest(observation=name):
+                    await bridge.handle({'jsonrpc':'2.0','id':22,'method':'tools/call',
+                        'params':{'name':name,'arguments':{'page':10}}})
+                    self.assertFalse(output[-1]['result'].get('isError',False))
+                    after=json.loads(saved.read_text(encoding='utf-8'))
+                    for key in ('pages','groups','retained','session'):
+                        self.assertEqual(after.get(key),before.get(key))
+                    self.assertFalse(bridge.task_prepared)
             for name,args in (('tabs',{'action':'new'}),('tabs',{'action':'close','page':10}),
                               ('windows',{'action':'close','windowId':1}),
                               ('tabs',{'action':'list','url':'https://example.com'}),
-                              ('run',{'code':'return 1'})):
+                              ('run',{'code':'return 1'}),
+                              ('evaluate',{'page':10,'code':'document.body.textContent="changed"'}),
+                              ('act',{'page':10,'kind':'fill','ref':'e1','value':'changed'})):
                 with self.subTest(blocked=name,args=args):
                     await bridge.handle({'jsonrpc':'2.0','id':21,'method':'tools/call',
                         'params':{'name':name,'arguments':args}})
                     self.assertIn('NEO_NOT_READY',output[-1]['result']['content'][0]['text'])
                     self.assertIn('Ownership/membership conflict',output[-1]['result']['content'][0]['text'])
             dispatched=[rpc['params']['name'] for rpc in calls if rpc['method']=='tools/call']
-            self.assertEqual([name for name in dispatched if name!='run'],['tabs','windows','tab_groups'])
+            self.assertEqual([name for name in dispatched if name!='run'],
+                ['tabs','windows','tab_groups','snapshot','read','grep','diff','screenshot'])
             self.assertNotIn('new',[rpc.get('params',{}).get('arguments',{}).get('action') for rpc in calls])
+
+    async def test_expired_resume_uses_only_proven_protocol_and_never_legacy_takeover(self):
+        import tempfile
+        task='00000000-0000-4000-8000-000000000001'
+        for mode in ('accepted','rejected','unsupported','ack-unverified','implicit','unclaimed-no-proof'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(dir=os.environ['WEB_AUTOMATION_TEST_ROOT']) as root:
+                old=dict(pageId=5,tabId=7,targetId='old-target',groupId='saved-group',
+                    url='https://example.com/editor',ownership='mine',ownerAgentId=None)
+                pages=[dict(old,ownership='other-agent',ownerAgentId='prior-owner')]
+                groups=[dict(groupId='saved-group',title='original task')]
+                calls=[]
+                def handler(request):
+                    rpc=json.loads(request.content);calls.append(rpc)
+                    if rpc['method']=='ping':return response(request)
+                    name=rpc['params']['name'];args=rpc['params']['arguments']
+                    if name=='tabs':
+                        self.assertEqual(args['action'],'reclaim_expired')
+                        self.assertEqual(args['priorSession'],'old-session')
+                        self.assertEqual(args['expected'],[dict(targetId='old-target',url=old['url'])])
+                        self.assertEqual(args['session'],'new-session')
+                        if mode=='rejected':return response(request,dict(isError=True,content=[dict(type='text',text='active owner')]))
+                        if mode!='ack-unverified':pages[0]=dict(old)
+                        return response(request,dict(content=[dict(type='text',text='verified expired task')]))
+                    self.assertEqual(name,'run')
+                    value=(dict(pages=pages,groups=groups) if 'Browser.getTabGroups' in args['code'] else pages)
+                    return response(request,dict(structuredContent=dict(ok=True,value=value)))
+                out=[];b=Bridge('http://127.0.0.1:9010/mcp',out.append,state_root=root,task_id=task,
+                    client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+                self.addAsyncCleanup(b.close);b.initialize=INIT;b.tool_session='new-session'
+                b.catalog['catalog']['tools']=[dict(name='tabs',inputSchema=dict(properties=dict(
+                    action=dict(enum=['list','new','close']+([] if mode=='unsupported' else ['reclaim_expired'])))))]
+                b.task_state.save('old-session',[old],groups)
+                if mode=='unclaimed-no-proof':
+                    pages[0]=dict(old,ownership='user')
+                    b.task_state.record.pop('pages_session')
+                request=(dict(name='run',arguments=dict(code='return 1')) if mode=='implicit'
+                         else dict(name='workspace_cleanup',arguments=dict(action='resume',task_id=task)))
+                await b.handle(dict(jsonrpc='2.0',id=9,method='tools/call',params=request))
+                actual=[c['params']['arguments']['action'] for c in calls
+                        if c['method']=='tools/call' and c['params']['name']=='tabs']
+                self.assertEqual(actual,[] if mode in ('unsupported','implicit','unclaimed-no-proof') else ['reclaim_expired'])
+                self.assertEqual(b.task_state.record['pages'][0]['targetId'],'old-target')
+                self.assertEqual(b.task_state.record.get('pages_session'),
+                    'new-session' if mode=='accepted' else None if mode=='unclaimed-no-proof' else 'old-session')
+                if mode=='accepted':self.assertTrue(b.task_prepared)
+                elif mode=='implicit':self.assertTrue(out[-1]['result']['isError'])
+                else:self.assertEqual(out[-1]['result']['structuredContent']['decision'],'block')
+
+    async def test_restored_resume_needs_explicit_selection_and_keeps_prior_record_on_failure(self):
+        import tempfile
+        task='00000000-0000-4000-8000-000000000001'
+        for mode in ('accepted','no-designation','renamed-group','missing-group','ambiguous-groups','rejected','ack-unverified','missing-proof','alias-owner','implicit'):
+            with self.subTest(mode=mode),tempfile.TemporaryDirectory(dir=os.environ['WEB_AUTOMATION_TEST_ROOT']) as root:
+                old=dict(pageId=1,tabId=101,targetId='old-target',groupId='original',
+                    url='https://example.com/editor',ownership='mine',ownerAgentId=None)
+                pages=[dict(old,pageId=2,tabId=202,targetId='restored-target',groupId='restored',ownership='user')]
+                groups=[dict(groupId='restored',title='original task')]
+                calls=[]
+                def handler(request):
+                    rpc=json.loads(request.content);calls.append(rpc)
+                    if rpc['method']=='ping':return response(request)
+                    name=rpc['params']['name'];args=rpc['params']['arguments']
+                    if name=='tabs':
+                        self.assertEqual(args['action'],'reclaim_restored')
+                        self.assertEqual(args['priorSession'],'old-session')
+                        self.assertEqual(args['priorGroupId'],'original')
+                        self.assertEqual(args['prior'],[dict(tabId=101,targetId='old-target',url=old['url'])])
+                        self.assertEqual(args['expected'],[dict(targetId='restored-target',url=old['url'])])
+                        if mode=='rejected':return response(request,dict(isError=True,content=[dict(type='text',text='not normally closed')]))
+                        if mode=='accepted':pages[0]['ownership']='mine'
+                        return response(request,dict(content=[dict(type='text',text='recovery ACK')]))
+                    self.assertEqual(name,'run')
+                    value=dict(pages=pages,groups=groups) if 'Browser.getTabGroups' in args['code'] else pages
+                    return response(request,dict(structuredContent=dict(ok=True,value=value)))
+                out=[];b=Bridge('http://127.0.0.1:9010/mcp',out.append,state_root=root,task_id=task,
+                    client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+                self.addAsyncCleanup(b.close);b.initialize=INIT;b.tool_session='new-session'
+                b.catalog['catalog']['tools']=[dict(name='tabs',inputSchema=dict(properties=dict(
+                    action=dict(enum=['list','new','close','reclaim_expired','reclaim_restored']))))]
+                b.task_state.save('old-session',[old],[dict(groupId='original',title='original task')])
+                if mode=='renamed-group':groups[0]['title']='renamed by user'
+                if mode=='missing-group':pages.clear();groups.clear()
+                if mode=='ambiguous-groups':
+                    groups.append(dict(groupId='second',title='original task'))
+                    pages.append(dict(pages[0],pageId=8,tabId=303,targetId='second-target',groupId='second'))
+                if mode=='missing-proof':b.task_state.record.pop('pages_session')
+                if mode=='alias-owner':pages.append(dict(pages[0],pageId=3,ownership='other-agent',ownerAgentId='active-same-client'))
+                args=dict(action='resume',task_id=task)
+                if mode not in ('no-designation','renamed-group','missing-group','ambiguous-groups','implicit'):
+                    args['recovery']=dict(prior_group_id='original',group_id='restored',
+                        pages=[dict(targetId='restored-target',url=old['url'])],reason='Human selected this restored group after normal restart')
+                request=dict(name='workspace_cleanup',arguments=args)
+                if mode=='implicit':request=dict(name='run',arguments=dict(code='return 1'))
+                await b.handle(dict(jsonrpc='2.0',id=10,method='tools/call',params=request))
+                actual=[c['params']['arguments']['action'] for c in calls
+                    if c['method']=='tools/call' and c['params']['name']=='tabs']
+                self.assertEqual(actual,['reclaim_restored'] if mode in ('accepted','rejected','ack-unverified') else [])
+                self.assertNotIn('new',actual)
+                self.assertEqual(b.task_state.record['pages'][0]['targetId'],
+                    'restored-target' if mode=='accepted' else 'old-target')
+                if mode=='accepted':self.assertTrue(b.task_prepared)
+                elif mode=='implicit':self.assertTrue(out[-1]['result']['isError'])
+                else:self.assertEqual(out[-1]['result']['structuredContent']['decision'],'block')
+                if mode in ('no-designation','renamed-group','missing-group','ambiguous-groups'):
+                    self.assertIn('read-only restored candidates',str(out[-1]))
+
+    async def test_cleanup_resume_cancellation_cancels_the_actual_internal_waiter(self):
+        from unittest.mock import AsyncMock
+        bridge,out=await self.make_bridge(lambda request:self.fail('must not forward a mismatched external request id'))
+        entered=asyncio.Event()
+        async def wait(message):
+            entered.set();await asyncio.Event().wait()
+        bridge.cleanup_call=AsyncMock(side_effect=wait)
+        task=asyncio.create_task(bridge.handle(dict(jsonrpc='2.0',id=70,method='tools/call',
+            params=dict(name='workspace_cleanup',arguments=dict(action='resume',task_id='00000000-0000-4000-8000-000000000001')))))
+        await entered.wait()
+        await bridge.handle(dict(jsonrpc='2.0',method='notifications/cancelled',params=dict(requestId=70)))
+        with self.assertRaises(asyncio.CancelledError):await task
+        self.assertNotIn(70,bridge.active_tools)
 
     async def test_explicit_session_is_reconciled_before_dispatch(self):
         import tempfile
@@ -927,6 +1067,61 @@ if __name__ == "__main__":
 
 
 class UsedBridgeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_conflict_allows_use_defer_check_without_claiming_or_losing_prior_bindings(self):
+        import tempfile
+        from neo_cleanup import has_pending_cleanup
+        task='00000000-0000-4000-8000-000000000001'
+        current=dict(pageId=5,tabId=7,targetId='prior',groupId='prior-group',
+            url='https://example.com/editor',ownership='other-agent',ownerAgentId='unknown-owner')
+        groups=[dict(groupId='prior-group',title='recorded task')]
+        calls=[]
+        def handler(request):
+            rpc=json.loads(request.content);calls.append(rpc)
+            if rpc['method']=='ping':
+                return response(request)
+            self.assertEqual(rpc['params']['name'],'run')
+            code=rpc['params']['arguments']['code']
+            value=(dict(tabs=[dict(tabId=7,targetId='prior',url=current['url'])],
+                        targets=['prior'],pages=[current]) if 'Browser.getTabs' in code
+                   else dict(pages=[current],groups=groups) if 'Browser.getTabGroups' in code else [current])
+            return response(request,dict(structuredContent=dict(ok=True,value=value)))
+        with tempfile.TemporaryDirectory(dir=os.environ['WEB_AUTOMATION_TEST_ROOT']) as root:
+            out=[];bridge=Bridge('http://127.0.0.1:9010/mcp',out.append,state_root=root,task_id=task,
+                client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+                catalog={'catalog':{'tools':[]}})
+            self.addAsyncCleanup(bridge.close);bridge.initialize=INIT;bridge.tool_session='new-session'
+            retained=[(('prior-session','prior',current['url']),'Unfinished real work needs this exact editor')]
+            bridge.task_state.save('new-session',[dict(current,ownership='mine')],groups,retained)
+            bridge.cleanup.retained={tuple(k):v for k,v in retained}
+            bridge.execution_id='current-execution'
+            before=json.loads((Path(root)/(task+'.json')).read_text(encoding='utf-8'))
+            async def invoke(action,**kw):
+                await bridge.handle(dict(jsonrpc='2.0',id=10,method='tools/call',params=dict(
+                    name='workspace_cleanup',arguments=dict(action=action,task_id=task,**kw))))
+                self.assertNotIn('error',out[-1]);self.assertFalse(out[-1]['result'].get('isError',False))
+                return out[-1]['result']['structuredContent']
+            used=await invoke('use',pageIds=[5],reason='Read the existing approved editor without changing ownership')
+            self.assertEqual(used['pendingUsedTargetIds'],['prior'])
+            deferred=await invoke('defer',pageIds=[5],condition='other_owner',
+                reason='Original owner recovery unresolved; preserve unfinished work')
+            self.assertEqual(deferred['pendingUsedTargetIds'],[])
+            self.assertEqual(len(deferred['deferredUsedPages']),1)
+            checked=await invoke('check',stop_hook_active=True)
+            self.assertTrue(checked['pendingReconciliationGroups'])
+            self.assertTrue(has_pending_cleanup(checked));self.assertEqual(checked['decision'],'block')
+            after=json.loads((Path(root)/(task+'.json')).read_text(encoding='utf-8'))
+            for key in ('pages','groups','retained','session'):
+                self.assertEqual(after.get(key),before.get(key))
+            self.assertTrue(after['execution_incomplete'])
+            self.assertIsNone(after['finish_checked_execution'])
+            self.assertIsNone(bridge.cleanup_empty_session)
+            self.assertFalse(bridge.task_prepared)
+            # Resume and edits must still meet the unchanged ownership guard.
+            await bridge.handle(dict(jsonrpc='2.0',id=11,method='tools/call',params=dict(
+                name='workspace_cleanup',arguments=dict(action='resume',task_id=task))))
+            self.assertIn('ownership reconciliation',json.dumps(out[-1]))
+            self.assertFalse(any(c.get('params',{}).get('name')=='tabs' for c in calls))
+
     async def test_durable_use_survives_reconnect_alias_loss_and_only_absence_clears_it(self):
         import tempfile
         task='00000000-0000-4000-8000-000000000001'

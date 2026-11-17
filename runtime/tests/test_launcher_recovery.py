@@ -59,6 +59,7 @@ class ProfileIdentityTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         code = r'''
 . (Join-Path '__ROOT__' 'neo-runtime-common.ps1')
+function Test-NeoEndpointIdentity {param($Endpoint) return $true} # Explicit transport-only fixture; identity has separate tests.
 $plan=[pscustomobject]@{profile_root='D:/owned/profile'}
 $exe='D:\owned\chrome.exe';$browserExe=$exe;$profile='D:\owned\profile'
 function Get-CimInstance {param($ClassName,$Filter) $script:fixture}

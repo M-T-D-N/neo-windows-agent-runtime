@@ -19,6 +19,11 @@ or change permissions.
    supported reconnect capability (e.g. `mcp_control.restart` when exposed), then
    verify with the current client's real read-only Neo query. Initialization/status
    alone should not launch a browser. Launch only for requested browser work.
+   A bound actual UUID initializes locally without a redundant begin.
+   `NEO_RECONNECT_INITIALIZED` returns a fresh catalog only;
+   `requestedActionExecuted=false`/`isError=true` mean the original action did not run.
+   Select current IDs/session and construct a new request with its inventory receipt.
+   This path never starts an off browser or replays an action.
 4. On session replacement, reconcile physical targets and task records. Preserve
    ambiguous/other-owned tabs. Do not work around an ownership conflict by opening
    duplicate tabs or claiming another active owner.

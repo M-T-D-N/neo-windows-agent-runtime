@@ -23,6 +23,32 @@ class TaskState:
         root=self.root.parent.parent if self.root.parent.name=='task-tabs' else self.root
         return OperationBoundary(root/'browser-operations.lock',exclusive=exclusive,timeout=timeout)
 
+    def bind(self, task_id):
+        if str(uuid.UUID(task_id)) != task_id:
+            raise ValueError("Use the actual lowercase task UUID")
+        if self.task_id and self.task_id != task_id:
+            raise ValueError("Connection already belongs to another task")
+        self.task_id = task_id
+        path = self.root / (task_id + '.json')
+        ensure_no_reparse_components(path)
+        if self.record is not None and path.exists():
+            fresh = json.loads(path.read_text(encoding='utf-8'))
+            reset = fresh.get('browser_reset_id')
+            if reset is not None and (reset != self.record.get('browser_reset_id') or
+                    self.record.get('browser_reset_pending') is True and fresh.get('browser_reset_pending') is False):
+                self._validate_reset(fresh, task_id)
+                fresh['outputs'] = self._merge_outputs(self.record, fresh)
+                self.record = fresh
+        if self.record is None:
+            fresh = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {
+                'schema_version': 1, 'task_id': task_id, 'session': None, 'pages': [], 'groups': [], 'retained': []}
+            if fresh.get('schema_version') != 1 or fresh.get('task_id') != task_id:
+                raise ValueError("Invalid/future task binding; preserve it for inspection")
+            if fresh.get('browser_reset_id') is not None or fresh.get('browser_reset_pending'):
+                self._validate_reset(fresh, task_id)
+            self.record = fresh
+        return self.record
+
     @staticmethod
     def _validate_reset(record, task_id):
         reset = record.get('browser_reset_id')
@@ -52,42 +78,29 @@ class TaskState:
                 entries[key] = entry
         return list(entries.values())
 
-    def consume_browser_reset_handle(self, session):
-        if not isinstance(session,str) or not session or self.record.get('browser_reset_pending') is not True:
-            raise ValueError('Expected a fresh server handle and pending reset')
-        updated=dict(self.record,browser_reset_pending=False,browser_closed=False,session=session)
-        self._write_record(updated, consume_reset=True)
-        self.record=updated
-
-    def bind(self, task_id):
-        if str(uuid.UUID(task_id)) != task_id:
-            raise ValueError("Use the actual lowercase task UUID")
-        if self.task_id and self.task_id != task_id:
-            raise ValueError("Connection already belongs to another task")
-        self.task_id = task_id
-        path = self.root / (task_id + '.json')
-        ensure_no_reparse_components(path)
-        if self.record is not None and path.exists():
-            fresh = json.loads(path.read_text(encoding='utf-8'))
-            reset = fresh.get('browser_reset_id')
-            if reset is not None and (reset != self.record.get('browser_reset_id') or
-                    self.record.get('browser_reset_pending') is True and fresh.get('browser_reset_pending') is False):
-                self._validate_reset(fresh, task_id)
-                fresh['outputs'] = self._merge_outputs(self.record, fresh)
-                self.record = fresh
-        if self.record is None:
-            fresh = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {
-                'schema_version': 1, 'task_id': task_id, 'session': None, 'pages': [], 'groups': [], 'retained': []}
-            if fresh.get('schema_version') != 1 or fresh.get('task_id') != task_id:
-                raise ValueError("Invalid/future task binding; preserve it for inspection")
-            if fresh.get('browser_reset_id') is not None or fresh.get('browser_reset_pending'):
-                self._validate_reset(fresh, task_id)
-            self.record = fresh
-        return self.record
-
-    def save(self, session, pages, groups, retained=None):
+    def save(self, session, pages, groups, retained=None, *, native_targets=None, recovery=None, native_recoveries=()):
         if not self.task_id:
             return
+        missing = self.restored_candidates(pages, groups, native_targets=native_targets, observed_session=session)
+        selections = ([recovery] if recovery is not None else []) + list(native_recoveries)
+        consumed = set()
+        for selection in selections:
+            if not any(p['priorGroupId'] == selection['prior_group_id'] for p in missing):
+                continue
+            # Native recovery receipts are supplied only after an actual legacy
+            # adoption, never inferred by readonly cleanup from equal URLs.
+            group_id, members = self.recovery_group(selection, pages, groups)
+            if group_id in consumed:
+                raise ValueError('One current group cannot discharge multiple prior bindings')
+            consumed.add(group_id)
+            expected = {p['targetId'] for p in members}
+            aliases = [p for p in pages if p.get('targetId') in expected]
+            mine = {p['targetId'] for p in aliases if p.get('ownership') == 'mine'}
+            if not expected.issubset(mine) or any(other_owner(p) for p in aliases):
+                raise ValueError('Selected recovery is not exclusively native-owned; preserve prior binding')
+            missing = [p for p in missing if p['priorGroupId'] != selection['prior_group_id']]
+        if missing:
+            raise ValueError('Restored task evidence is unresolved; preserve original binding: ' + json.dumps(missing))
         # Only actual native mine ownership can create a binding. Keep enough
         # context to restore a group, never page contents or credentials.
         mine = {p['targetId']: p for p in pages if p.get('ownership') == 'mine' and p.get('targetId')}
@@ -98,7 +111,9 @@ class TaskState:
                 raise ValueError('Credential-bearing URL cannot be stored; preserve existing binding')
         group_ids = {p.get('groupId') for p in selected}
         matched = [g for g in groups if g.get('id', g.get('groupId')) in group_ids]
-        self.record.update(session=session, pages=selected, groups=matched)
+        self.record.update(session=session, pages_session=session, pages=selected, groups=matched)
+        self.record['prior_bindings'] = [p for p in self.record.get('prior_bindings', [])
+                                        if p.get('targetId') not in mine]
         if retained is not None:
             self.record['retained'] = list(retained)
         self._write_record()
@@ -107,6 +122,13 @@ class TaskState:
         """Persist explicit business scope even if later ownership bookkeeping fails."""
         updated=dict(self.record, used_tabs=list(used), browser_closed=False)
         self._write_record(updated)
+        self.record=updated
+
+    def consume_browser_reset_handle(self, session):
+        if not isinstance(session,str) or not session or self.record.get('browser_reset_pending') is not True:
+            raise ValueError('Expected a fresh server handle and pending reset')
+        updated=dict(self.record,browser_reset_pending=False,browser_closed=False,session=session)
+        self._write_record(updated, consume_reset=True)
         self.record=updated
 
     def _write_record(self, record=None, *, administrator_reset=False, consume_reset=False, expected_state=None, operation_guard=None):
@@ -146,6 +168,12 @@ class TaskState:
 
     def checkpoint_session(self, session):
         if self.task_id and session and self.record.get('session') != session:
+            owner_session = self.record.get('pages_session')
+            if owner_session and owner_session != session:
+                prior = {p['targetId']:p for p in self.record.get('prior_bindings', [])}
+                for page in self.record.get('pages', []):
+                    prior[page['targetId']] = dict(page, session=owner_session)
+                self.record['prior_bindings'] = list(prior.values())
             self.record['session'] = session
             self._write_record()
 
@@ -351,7 +379,106 @@ class TaskState:
         tab_ids = {p['tabId'] for p in members}
         return len(tab_ids) == len(targets) and tab_ids == set(current[0]['tabIds'])
 
-    def reconciliation(self, pages, groups, *, recovery=None, native_targets=None):
+    def restored_candidates(self, pages, groups, *, native_targets=None, observed_session=None):
+        """Missing bindings after reconnection stay pending, even after renaming."""
+        record = self.record or {}
+        current = observed_session if observed_session is not None else record.get('session')
+        if record.get('pages_session') == current:
+            return []
+        physical = {p.get('targetId') for p in pages}
+        result = []
+        for old_id in {p.get('groupId') for p in record.get('pages', [])}:
+            old = [p for p in record['pages'] if p.get('groupId') == old_id]
+            if self._registered_unclaimed_remainder(old_id, old, pages, groups, native_targets):
+                continue
+            if physical.intersection(p['targetId'] for p in old):
+                continue
+            candidates = []
+            for group in groups:
+                gid = group.get('id', group.get('groupId'))
+                members = [p for p in pages if p.get('groupId') == gid]
+                unique = {p['targetId']:p for p in members if p.get('targetId')}
+                matches = Counter(p['url'] for p in unique.values()) == Counter(p['url'] for p in old)
+                aliases = [p for p in pages if p.get('targetId') in unique]
+                if unique and matches:
+                    candidates.append(dict(groupId=gid,blockedByOwner=any(other_owner(p) for p in aliases),
+                        pages=[dict(targetId=t,url=p['url']) for t,p in unique.items()]))
+            # Neither a shared URL nor native ownership of a different target
+            # acknowledges this prior group. Only an explicit verified recovery
+            # may discharge it at save time.
+            result.append(dict(priorGroupId=old_id,candidates=candidates))
+        return result
+
+    def restored_recovery(self, recovery, pages, groups):
+        """Explicit human-selected restoration, never title/URL-based admission."""
+        group_id, members = self.recovery_group(recovery, pages, groups)
+        old = [p for p in self.record['pages'] if p.get('groupId') == recovery['prior_group_id']]
+        targets = {p['targetId'] for p in old}
+        if targets.intersection(p.get('targetId') for p in pages):
+            raise ValueError('Original physical targets still exist; restored recovery is forbidden')
+        expected = {p['targetId']: p['url'] for p in members}
+        if (len({p['url'] for p in old}) != len(old)
+                or len(set(expected.values())) != len(expected)
+                or Counter(p['url'] for p in old) != Counter(expected.values())
+                or any(type(p.get('tabId')) is not int or credential_bearing_url(p['url']) for p in old)):
+            raise ValueError('Restored task needs complete unambiguous original tab/target/URL provenance')
+        proof = {}
+        owner_session = self.record.get('pages_session')
+        if owner_session:
+            proof[owner_session] = targets
+        for prior in self.record.get('prior_bindings', []):
+            if (prior.get('targetId') in targets and prior.get('groupId') == recovery['prior_group_id']
+                    and any(p['targetId'] == prior['targetId'] and p['url'] == prior.get('url') for p in old)):
+                proof.setdefault(prior['session'], set()).add(prior['targetId'])
+        for key, _ in self.record.get('retained', []):
+            if len(key) == 3 and any(p['targetId'] == key[1] and p['url'] == key[2] for p in old):
+                proof.setdefault(key[0], set()).add(key[1])
+        handles = [s for s, ts in proof.items() if ts == targets and s != self.record.get('session')]
+        if len(handles) != 1:
+            raise ValueError('Original task session proof is missing or ambiguous; preserve binding')
+        return dict(groupId=group_id, priorGroupId=recovery['prior_group_id'], priorSession=handles[0],
+            prior=[{k:p[k] for k in ('tabId','targetId','url')} for p in old],
+            expected=[dict(targetId=t,url=u) for t,u in sorted(expected.items())])
+
+    def expired_recovery(self, pages, groups):
+        """Supply exact local task provenance, never infer server-side expiry.
+
+        Every saved physical member must have a consistent foreign owner. The
+        server still verifies the original handle's idle end and final claims.
+        """
+        record = self.record or {}
+        requests = []
+        for group_id in {p.get('groupId') for p in record.get('pages', [])}:
+            old = [p for p in record['pages'] if p.get('groupId') == group_id]
+            expected = {p['targetId']:p['url'] for p in old}
+            aliases = [p for p in pages if p.get('targetId') in expected]
+            members = [p for p in pages if p.get('groupId') == group_id]
+            if (not group_id or sum(g.get('id',g.get('groupId')) == group_id for g in groups) != 1
+                    or {p.get('targetId'):p.get('url') for p in members} != expected
+                    or {p.get('targetId') for p in aliases} != set(expected)
+                    or any(p.get('groupId') != group_id or p.get('url') != expected[p['targetId']]
+                           or p.get('ownership') == 'mine' for p in aliases)):
+                continue
+            owners = {p.get('ownerAgentId') for p in aliases if other_owner(p)}
+            unclaimed = all(p.get('ownership') == 'user' and p.get('ownerAgentId') is None for p in aliases)
+            if not unclaimed and (len(owners) != 1 or not all(isinstance(o,str) and o for o in owners)
+                    or any(not any(other_owner(p) for p in aliases if p['targetId'] == target) for target in expected)):
+                continue
+            proof = {}
+            for prior in record.get('prior_bindings', []):
+                if expected.get(prior.get('targetId')) == prior.get('url') and prior.get('groupId') == group_id:
+                    proof.setdefault(prior['session'], set()).add(prior['targetId'])
+            for key, _ in record.get('retained', []):
+                if len(key) == 3 and expected.get(key[1]) == key[2]:
+                    proof.setdefault(key[0], set()).add(key[1])
+            handles = [handle for handle, targets in proof.items()
+                       if targets == set(expected) and handle != record.get('session')]
+            if len(handles) == 1:
+                requests.append(dict(groupId=group_id, priorSession=handles[0],
+                    expected=[dict(targetId=p['targetId'],url=p['url']) for p in old]))
+        return requests
+
+    def reconciliation(self, pages, groups, *, recovery=None, allow_expired=False, native_targets=None):
         """Return unique proven groups or unresolved conflicts, without mutations."""
         selected = self.recovery_group(recovery, pages, groups) if recovery is not None else None
         if not self.record or not self.record['pages']:
@@ -362,26 +489,34 @@ class TaskState:
                 or not set(physical).issubset(native_targets)):
             raise ValueError('Incomplete native target inventory; preserve prior bindings')
         physical_targets = set(physical) if native_targets is None else set(native_targets)
+        expired = {r['groupId'] for r in self.expired_recovery(pages, groups)} if allow_expired else set()
         candidates, unresolved = [], []
         for old_id in {p.get('groupId') for p in self.record['pages']}:
             old = [p for p in self.record['pages'] if p.get('groupId') == old_id]
-            if {p['targetId'] for p in old}.intersection(physical_targets).difference(physical):
-                unresolved.append({'groupId':old_id, 'reason':'Recorded physical target is missing from SDK inventory; no URL-based claim'})
+            old_targets = {p['targetId'] for p in old}
+            if old_targets.intersection(physical_targets).difference(physical):
+                unresolved.append({'groupId':old_id,
+                    'reason':'Recorded physical target is missing from SDK inventory; no URL-based claim'})
                 continue
             if self._registered_unclaimed_remainder(old_id, old, pages, groups, native_targets):
+                # Physical closure retires only the old mine binding. The
+                # registered user tabs stay unclaimed and require cleanup review.
                 continue
-            if (not {p['targetId'] for p in old}.intersection(physical_targets)
+            if (not old_targets.intersection(physical_targets)
                     and self._has_preexisting_sibling(old_id, old, pages)):
-                unresolved.append({'groupId':old_id, 'reason':'Previously unowned group member has incomplete registration; no URL-based claim'})
+                unresolved.append({'groupId':old_id,
+                    'reason':'Previously unowned group member has incomplete registration; no URL-based claim'})
                 continue
             if selected and old_id == recovery['prior_group_id']:
                 owned={p['targetId'] for p in selected[1] if p.get('ownership')=='mine'}
                 if not {p['targetId'] for p in selected[1]}.issubset(owned):
                     candidates.append(selected[0])
                 continue
-            old_targets={p['targetId'] for p in old}
             if any(p.get('targetId') in old_targets and
                    other_owner(p) for p in pages):
+                if old_id in expired:
+                    candidates.append(old_id)
+                    continue
                 unresolved.append({'groupId':old_id,'reason':'Another active or unknown owner occupies a recorded physical target'})
                 continue
             owned_targets={p['targetId'] for p in pages if p.get('ownership')=='mine' and p.get('targetId')}
@@ -404,8 +539,10 @@ class TaskState:
             for group in groups:
                 gid = group.get('id', group.get('groupId'))
                 same = gid == old_id or (titles and group.get('title') in titles)
-                # Distinct groups can share a session title. Native target and
-                # exact group absence prove closure; a title alone does not.
+                # Session titles are shared by distinct groups. Native target
+                # absence plus exact group absence proves closure even when an
+                # unrelated group keeps that title; title/URL matches still go
+                # through the existing recovery and foreign-owner checks.
                 related = related or gid == old_id or (bool(same) and native_targets is None)
                 members = {p['targetId']:p for p in pages if p.get('groupId') == gid and p.get('targetId')}
                 if same and Counter(p['url'] for p in members.values()) == expected:
