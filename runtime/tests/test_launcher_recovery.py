@@ -273,6 +273,30 @@ foreach($case in @(@{status='Valid';publisher='Approved Neo Publisher';allow=$tr
 
 
 class RestorableShutdownProofTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "win32", "Windows process exit code")
+    def test_preopened_handle_reads_zero_and_nonzero_exit_after_child_is_gone(self):
+        from contextlib import ExitStack
+        import runpy
+
+        import psutil
+
+        shutdown = runpy.run_path(str(Path(__file__).resolve().parents[1] / "stop-neo.py"))
+        for code in (0, 17):
+            with self.subTest(code=code), ExitStack() as handles:
+                with subprocess.Popen(
+                    [sys.executable, "-B", "-c", f"import sys; sys.stdin.read(1); sys.exit({code})"],
+                    stdin=subprocess.PIPE,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                ) as child:
+                    row = psutil.Process(child.pid).as_dict(attrs=shutdown["PROCESS_FIELDS"])
+                    wait = handles.enter_context(shutdown["held_process_exit"](row))
+                    with self.assertRaises(TimeoutError):
+                        wait(0)
+                    child.stdin.close()
+                    self.assertEqual(child.wait(timeout=5), code)
+                del child  # Drop Popen's own Windows handle before reading the recorded exit.
+                self.assertEqual(wait(0), code)
+
     def test_ack_or_reconciled_exit_is_not_a_durable_shutdown(self):
         import runpy
         import sqlite3

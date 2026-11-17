@@ -1,7 +1,7 @@
 """Quit the verified dedicated Neo after its server has durably drained sessions."""
 import argparse
 import base64
-from contextlib import closing
+from contextlib import closing, contextmanager
 import json
 import os
 from pathlib import Path
@@ -44,6 +44,46 @@ def process(row):
     if instance.as_dict(attrs=list(row)) != row:
         raise RuntimeError('Dedicated runtime process identity changed')
     return instance
+
+
+@contextmanager
+def held_process_exit(row):
+    """Keep the exact Windows process object alive until its exit code is read."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
+    kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+
+    def wait(timeout):
+        status = kernel.WaitForSingleObject(handle, timeout * 1000)
+        if status == 0x102:  # WAIT_TIMEOUT
+            raise TimeoutError(f'Process {row["pid"]} did not exit in {timeout} seconds')
+        if status != 0:  # WAIT_OBJECT_0
+            raise ctypes.WinError(ctypes.get_last_error())
+        code = wintypes.DWORD()
+        if not kernel.GetExitCodeProcess(handle, ctypes.byref(code)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return code.value
+
+    process(row)
+    # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION
+    handle = kernel.OpenProcess(0x00100000 | 0x1000, False, row['pid'])
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        # Recheck after opening to reject a PID recycled between observation and open.
+        process(row)
+        yield wait
+    finally:
+        kernel.CloseHandle(handle)
 
 
 def ownership(plan):
@@ -123,12 +163,14 @@ def stop_preserving_tabs(plan):
 
 def _stop_under_boundary(plan):
     endpoint, browser, server = ownership(plan)
-    server_process = process(server)
-    browser_process = process(browser)
     backend = endpoint.removesuffix('/mcp')
     cdp_port = plan.get('cdp_port', 9111)
     cdp = f'http://127.0.0.1:{cdp_port}'
-    with httpx.Client(timeout=5, trust_env=False, follow_redirects=False) as http:
+    with (
+        held_process_exit(server) as wait_server,
+        held_process_exit(browser) as wait_browser,
+        httpx.Client(timeout=5, trust_env=False, follow_redirects=False) as http,
+    ):
         socket = browser_socket(http, cdp, browser)
         with database(plan) as db:
             active = open_sessions(db)
@@ -138,11 +180,11 @@ def _stop_under_boundary(plan):
         if response.json().get('status') != 'ok':
             raise RuntimeError('Server did not acknowledge shutdown')
         try:
-            code = server_process.wait(timeout=15)
-        except psutil.TimeoutExpired as error:
+            server_exit = wait_server(15)
+        except TimeoutError as error:
             raise RuntimeError('Server did not finish draining; keeping the browser open') from error
-        if code != 0:
-            raise RuntimeError('Server did not exit normally; keeping the browser open')
+        if server_exit != 0:
+            raise RuntimeError(f'Server exited with code {server_exit}; keeping the browser open')
         if browser_socket(http, cdp, browser) != socket:
             raise RuntimeError('Browser connection changed after server drain')
         with database(plan) as db:
@@ -159,11 +201,11 @@ def _stop_under_boundary(plan):
         # The socket may disappear as soon as the browser handles Browser.close.
         # Only the original process's exit proves that the requested quit occurred.
         try:
-            code = browser_process.wait(timeout=10)
-        except psutil.TimeoutExpired as error:
+            browser_exit = wait_browser(10)
+        except TimeoutError as error:
             raise RuntimeError('Dedicated browser quit was not verified; inspect before retrying') from error
-        if code != 0:
-            raise RuntimeError('Dedicated browser did not exit normally')
+        if browser_exit != 0:
+            raise RuntimeError(f'Dedicated browser exited with code {browser_exit}')
         ports = {cdp_port, urlsplit(endpoint).port, urlsplit(plan['mcp_endpoint']).port}
         deadline = time.monotonic() + 5
         while any(c.status == psutil.CONN_LISTEN and c.laddr.port in ports
@@ -173,6 +215,7 @@ def _stop_under_boundary(plan):
             time.sleep(0.1)
         return {'browserClosed': True, 'drainedSessions': len(active),
                 'browserPid': browser['pid'], 'serverPid': server['pid'],
+                'browserExitCode': browser_exit, 'serverExitCode': server_exit,
                 'dispatchStatus': close.returncode}
 
 
