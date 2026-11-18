@@ -1,10 +1,32 @@
 # Neo Windows Agent Runtime (unofficial)
 
 Portable Windows launcher, MCP stdio bridge, task tab recovery and cleanup for
-BrowserOS neo. This is a candidate built from the currently qualified **Neo 0.51.0 /
-server 0.0.65**, not a claim to support the latest upstream version. DOT review is
-required before the first public upload. Current-PC isolated tests and other-PC
-tests are reported separately; the latter are deferred by the owner.
+BrowserOS neo. The qualified combination is **BrowserOS neo 0.52.1.1**
+(Chromium 155.0.8318.26) and the protected **Claw Server 0.0.65**.
+Current-PC isolated qualification covers this version pair. Other-PC testing is deferred.
+
+## v0.1.9: browser update and screen-lock restart
+
+The launcher disables Chromium's screen-lock Smart Restart trigger for the dedicated
+browser. The managed installer verification and browser update flow are retained.
+The release uses the same qualified server binary and corresponding source as the
+preceding release, preserving its tab ownership and durable shutdown behavior.
+
+After a browser replacement, list current tabs through the active MCP connection
+before continuing. The bridge preserves the server and profile identity checks and
+requires a fresh tab inventory before a request is sent to the replacement browser.
+The option is applied when the dedicated launcher creates a new browser process.
+`start-neo.ps1 -Background` reuses an existing browser and leaves its startup
+options in effect. At a safe restart boundary, verify that unsaved input and
+active requests are clear. Use the normal shutdown command below, start it again,
+and verify that the new browser process has `--disable-features=SmartRestartLockScreen`.
+
+Tab restoration depends on Chromium's saved session state. Verify the required
+windows and tabs after restart. A normal restart can leave a previously visible
+tab absent, especially a closed tab or a live remote session. This runtime does
+not reconnect remote sessions automatically. Save in-progress work beforehand.
+The verification used a local representative remote-session page, without a live
+Chrome Remote Desktop connection.
 
 ## v0.1.6: one physical tab and background restoration
 
@@ -63,8 +85,6 @@ Neo. Unknown/user tabs remain unless their closure is explicitly authorized.
 Tab closure validates every target identity and atomically compares its original
 incarnation before removing a binding. A delayed move reply cannot recreate a
 closed handle or overwrite a changed binding.
-
-The browser stays at 0.51.0/server 0.0.65. Other-PC testing remains deferred.
 
 ## v0.1.5: reconnect initialization shared by Codex and AGY
 

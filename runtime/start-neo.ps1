@@ -155,6 +155,8 @@ try {
     $arguments+='--disable-updates'
     # The upstream proxy binds all interfaces. Use the verified loopback server.
     $arguments+='--disable-browseros-server'
+    # The managed payload cannot consume an installer update on a screen lock.
+    $arguments+='--disable-features=SmartRestartLockScreen'
     $override=$plan.server_override
     if($override -and $override.enabled){
         $serverExe=$override.executable.Replace('/','\')

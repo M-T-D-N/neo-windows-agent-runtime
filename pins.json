@@ -1,9 +1,9 @@
 {
-  "version": "0.51.0",
-  "chromium_version": "155.0.8309.26",
-  "installer_url": "https://cdn.browseros.com/releases/browserclaw/0.51.0/win/BrowserOS_neo_v0.51.0_x64_installer.exe",
-  "installer_bytes": 137351224,
-  "installer_sha256": "101d428144d67b04d60d91685645193612ad83be30d06d64ee940d62577938e3",
+  "version": "0.52.1.1",
+  "chromium_version": "155.0.8318.26",
+  "installer_url": "https://cdn.browseros.com/releases/browserclaw/0.52.1.1/win/BrowserOS_neo_v0.52.1.1_x64_installer.exe",
+  "installer_bytes": 140804064,
+  "installer_sha256": "f9a8493dd8cbcf11b349ff41e434f5d67c301d99613ccc221f418385e361f2cd",
   "authenticode_publisher": "Felafax, Inc.",
   "session_idle_ms": 86400000,
   "server_override": {
