@@ -88,6 +88,51 @@ aliases of each target. Legacy adoption requires a completed native operation;
 read-only cleanup cannot manufacture an adoption receipt.
 Browser/server versions, dependency pins, profiles and permissions are unchanged.
 
+## Browser replacement and MCP diagnostics
+
+The launcher’s read-only check reports the MCP listener and browser identity
+separately. Inspect `mcpIdentity.code` and `mcpReadinessError` in the result:
+
+| Code | Observed state |
+| --- | --- |
+| `MCP_NOT_LISTENING` | No listener on the configured MCP port. |
+| `CDP_NOT_LISTENING` | The recorded browser exists; its CDP listener is unavailable. |
+| `RECORDED_BROWSER_EXITED` | The owned MCP server is listening and CDP has no listener. |
+| `BROWSER_RECORD_STALE` | The owned MCP server is listening, the recorded browser exited, and a new loopback CDP owner needs verification. |
+| `IDENTITY_UNVERIFIED` | An exact process, profile, configuration, or socket check failed. |
+
+An actual browser request can repair a stale browser record through the
+installation mutex. This path verifies the existing processes and only updates
+the recorded browser identity. It sends no browser action, opens no window, and
+leaves the existing server running. After recovery, request a fresh tab list
+and use the current page IDs. The bridge rejects queued requests from before
+the replacement. Local tool discovery and the passive event stream never
+perform the repair.
+
+If a transport reset occurs while an owned listener is still present, the
+bridge retries MCP readiness briefly. The same rule covers the gap between
+the old browser exiting and its replacement acquiring CDP. That request does
+not invoke the launcher if the existing listener disappears during the wait.
+
+When Windows process auditing was enabled at the time of the incident, run
+the following in an elevated Windows PowerShell from the installation root.
+Use the affected installation's plan and replace the timestamp and PIDs.
+
+```powershell
+& .\runtime\Get-NeoRestartEvents.ps1 -PlanPath .\runtime\runtime-plan.json `
+    -IncidentTime '2025-02-03T10:53:02+09:00' -BrowserPid 7001,7002
+```
+
+The query compares UTC timestamps directly in the Windows Security log. It
+reports the process creator and exit code. When Windows recorded the command
+line, the helper searches its text for restart switches. These hints can also
+match text inside quoted arguments. The creator PID and exit code alone do
+not identify the origin of a restart request.
+
+Use the timestamped Chromium and recovery-server logs plus the recorded process
+IDs and creation times when investigating an unexpected relaunch. A CDP
+disconnect or reconnect by itself identifies a change in the connection only.
+
 ## v0.1.4: identity records after a browser-only restart
 
 Equivalent absolute config paths use normalized comparison; relative config

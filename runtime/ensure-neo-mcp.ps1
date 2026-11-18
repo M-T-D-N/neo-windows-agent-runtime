@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([switch]$Check,[switch]$StopOwnedRecovery,[switch]$WaitForManagedStartup)
+param([switch]$Check,[switch]$StopOwnedRecovery,[switch]$WaitForManagedStartup,[switch]$RepairOwnedBrowser)
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'neo-runtime-common.ps1')
 $plan=Get-Content -Encoding UTF8 (Join-Path $PSScriptRoot 'runtime-plan.json') -Raw | ConvertFrom-Json
@@ -56,6 +56,7 @@ function Repair-RecoveryBrowserRecord {
         $exitCode=$LASTEXITCODE
         $result=($raw -join "`n") | ConvertFrom-Json
         if($exitCode -ne 0 -or $result.rebound -isnot [bool]){throw "Recovery browser record was preserved: $($result.reason)"}
+        return $result.rebound
     } finally {
         if($locked){$mutex.ReleaseMutex()}
         $mutex.Dispose()
@@ -107,17 +108,25 @@ function Stop-OrphanedManagedServer {
         Start-Sleep -Milliseconds 200
     } while($true)
 }
+if($RepairOwnedBrowser){
+    if($Check -or $StopOwnedRecovery -or $WaitForManagedStartup -or $plan.runtime_mode -ne 'DIRECT_LOOPBACK'){
+        throw 'RepairOwnedBrowser is a standalone action for the direct installation'
+    }
+    [pscustomobject]@{rebound=Repair-RecoveryBrowserRecord}
+    return
+}
 if($StopOwnedRecovery){Stop-Recovery; Stop-OrphanedManagedServer; [pscustomobject]@{recoveryServerStopped=$true};return}
 $browser=@(Get-Browser)
 $owned=Get-OwnedServer
 if($Check){
-    [pscustomobject]@{mcpReady=Test-McpReady;effectiveMcpEndpoint=$script:mcpEffectiveEndpoint;recoveryServerPids=@($owned.ProcessId);mode=if($owned){'WORKSPACE_DIRECT_RECOVERY'}else{'CHROMIUM_MANAGED'}}
+    $ready=Test-McpReady
+    [pscustomobject]@{mcpReady=$ready;effectiveMcpEndpoint=$script:mcpEffectiveEndpoint;mcpIdentity=$script:mcpIdentity;mcpReadinessError=if(-not $ready){$script:mcpReadinessError};recoveryServerPids=@($owned.ProcessId);mode=if($owned){'WORKSPACE_DIRECT_RECOVERY'}else{'CHROMIUM_MANAGED'}}
     return
 }
 if($browser.Count -ne 1){throw 'Exactly one dedicated browser is required for live MCP recovery'}
 if(Test-McpReady){[pscustomobject]@{mcpReady=$true;recoveryServerPids=@($owned.ProcessId);recovered=$false};return}
 if($plan.runtime_mode -eq 'DIRECT_LOOPBACK' -and $owned){
-    Repair-RecoveryBrowserRecord
+    Repair-RecoveryBrowserRecord | Out-Null
     # Only readiness is repeated; no website action is replayed.
     if(Test-McpReady){[pscustomobject]@{mcpReady=$true;recoveryServerPids=@($owned.ProcessId);recovered=$true};return}
 }

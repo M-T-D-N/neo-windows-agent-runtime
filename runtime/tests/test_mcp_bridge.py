@@ -830,6 +830,184 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             Bridge("https://remote.invalid/mcp", lambda _: None)
 
+    async def test_workspace_browser_replacement_blocks_old_actions_without_launcher(self):
+        from unittest.mock import AsyncMock
+
+        sent = []
+        generation = (10, 100.)
+
+        def handler(request):
+            message = json.loads(request.content)
+            sent.append(message.get('params', {}).get('name', message['method']))
+            return response(request, {'content': [{'type':'text','text':'fresh inventory'}]})
+
+        bridge, output = await self.make_bridge(handler)
+        bridge.initialize = INIT
+        bridge.browser_generation = lambda: generation
+        bridge.starter = AsyncMock(side_effect=AssertionError('Do not relaunch a browser'))
+        await bridge.ensure_ready()
+        generation = (11, 200.)
+        old = {'jsonrpc':'2.0','id':1,'method':'tools/call','params':{
+            'name':'read','arguments':{'pageId':5}}}
+        await bridge.handle(old)
+        self.assertIn('original request was not dispatched',output[-1]['result']['content'][0]['text'])
+        await bridge.handle({'jsonrpc':'2.0','id':2,'method':'tools/call','params':{
+            'name':'tabs','arguments':{'action':'list'}}})
+        self.assertEqual(output[-1]['result']['_meta']['com.workspace.neo/inventory_receipt'],bridge.inventory_receipt)
+        await bridge.handle(dict(old,id=3))
+        self.assertIn('requires inventory_receipt',output[-1]['result']['content'][0]['text'])
+        self.assertEqual(sent,['ping','ping','tabs'])
+        bridge.starter.assert_not_awaited()
+
+    async def test_managed_reconnect_waits_through_empty_ports_without_launching(self):
+        from unittest.mock import AsyncMock
+
+        generation = (10, 100.0)
+        requests = []
+
+        def handler(request):
+            nonlocal generation
+            message = json.loads(request.content)
+            method = message['method']
+            requests.append(message.get('params', {}).get('name', method))
+            if generation is None:
+                if method == 'initialize':
+                    generation = (11, 200.0)
+                raise httpx.ConnectError('Managed browser and MCP listeners are both absent')
+            if method == 'initialize':
+                return response(request, {'protocolVersion': '2025-03-26'})
+            return response(request, {'content': [{'type': 'text', 'text': 'fresh inventory'}]})
+
+        bridge, output = await self.make_bridge(handler)
+        bridge.initialize = INIT
+        bridge.browser_generation = lambda: generation
+        bridge.backend_resolver = lambda: None
+        bridge.starter = AsyncMock()
+        await bridge.connect(INIT)
+
+        generation = None
+        await bridge.handle(CALL)
+
+        bridge.starter.assert_not_awaited()
+        self.assertIn('original request was not dispatched', output[-1]['result']['content'][0]['text'])
+        self.assertEqual(requests, ['initialize', 'ping', 'initialize'])
+        await bridge.handle({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call', 'params': {
+            'name': 'tabs', 'arguments': {'action': 'list'}}})
+        self.assertFalse(output[-1]['result'].get('isError', False))
+        self.assertEqual(requests[-2:], ['ping', 'tabs'])
+
+    async def test_replacement_receipt_cannot_authorize_a_retired_session(self):
+        import copy
+        import tempfile
+        from unittest.mock import AsyncMock
+
+        sent = []
+
+        def handler(request):
+            message = json.loads(request.content)
+            if message['method'] != 'tools/call':
+                return response(request)
+            params = message['params']
+            sent.append((params['name'], params['arguments'].get('session')))
+            result = {'content': [{'type': 'text', 'text': 'fixture'}]}
+            if params['name'] == 'tabs':
+                result['_meta'] = {SESSION_META_KEY: 'current-session'}
+            return response(request, result)
+
+        bridge, output = await self.make_bridge(handler)
+        bridge.initialize = INIT
+        state = tempfile.TemporaryDirectory(dir=os.environ['WEB_AUTOMATION_TEST_ROOT'])
+        self.addCleanup(state.cleanup)
+        task_id = '00000000-0000-4000-8000-000000000002'
+        bridge.task_state = neo_mcp_bridge.TaskState(state.name)
+        bridge.bind_task(task_id)
+        bridge.task_state.save('retired-session', [], [])
+        record_path = Path(state.name) / (task_id + '.json')
+        bridge.endpoint_epoch = 1
+        bridge.reset_requires_inventory = True
+        bridge.prepare_task = AsyncMock()
+
+        async def call(sequence, name, **arguments):
+            await bridge.handle({'jsonrpc': '2.0', 'id': sequence, 'method': 'tools/call',
+                                 'params': {'name': name, 'arguments': arguments}})
+            return output[-1]['result']
+
+        first = await call(1, 'tabs', action='list')
+        receipt = first['_meta']['com.workspace.neo/inventory_receipt']
+        self.assertEqual(bridge.tool_session, 'current-session')
+        before = record_path.read_bytes()
+        bound = copy.deepcopy(bridge.task_state.record)
+        sent.clear()
+        for seq, name, args in ((2, 'snapshot', {'page': 5}),
+                                (3, 'act', {'page': 5, 'kind': 'click_at', 'x': 1, 'y': 1})):
+            with self.subTest(name=name):
+                result = await call(seq, name, session='retired-session', inventory_receipt=receipt, **args)
+                self.assertTrue(result.get('isError'))
+                self.assertIn('Retired session hint', result['content'][0]['text'])
+                self.assertEqual(sent, [])
+                self.assertEqual(bridge.tool_session, 'current-session')
+                self.assertEqual(bridge.task_state.record, bound)
+                self.assertEqual(record_path.read_bytes(), before)
+        bridge.prepare_task.assert_not_awaited()
+
+        await call(4, 'tabs', action='list', session='retired-session')
+        self.assertEqual(sent, [('tabs', 'current-session')])
+        self.assertEqual(bridge.tool_session, 'current-session')
+        result = await call(5, 'snapshot', page=5, session='current-session', inventory_receipt=receipt)
+        self.assertFalse(result.get('isError', False))
+        self.assertEqual(sent[-1], ('snapshot', 'current-session'))
+
+    async def test_managed_reconnect_timeout_does_not_allow_old_tools_to_start_browser(self):
+        import tempfile
+        from unittest.mock import AsyncMock
+
+        generation = (10, 100.0)
+
+        def handler(request):
+            if generation is None:
+                raise httpx.ConnectError('Managed runtime is unavailable')
+            reply = response(request, {'protocolVersion': '2025-03-26'})
+            del reply.headers['Mcp-Session-Id']
+            return reply
+
+        bridge, output = await self.make_bridge(handler)
+        state = tempfile.TemporaryDirectory(dir=os.environ['WEB_AUTOMATION_TEST_ROOT'])
+        self.addCleanup(state.cleanup)
+        bridge.task_state = neo_mcp_bridge.TaskState(state.name)
+        bridge.bind_task('00000000-0000-4000-8000-000000000001')
+        bridge.initialize = INIT
+        bridge.browser_generation = lambda: generation
+        bridge.backend_resolver = lambda: None
+        bridge.starter = AsyncMock()
+        bridge.startup_seconds = 0
+        await bridge.connect(INIT)
+
+        generation = None
+        await bridge.handle(CALL)
+        self.assertIn('observing an owned runtime', output[-1]['result']['content'][0]['text'])
+        await bridge.handle(dict(CALL, id=5))
+        self.assertIn('never starts it', output[-1]['result']['content'][0]['text'])
+        bridge.starter.assert_not_awaited()
+
+    async def test_browser_replacement_after_readiness_ping_retires_old_handles(self):
+        generation = (10, 100.0)
+
+        def handler(request):
+            nonlocal generation
+            method = json.loads(request.content)['method']
+            self.assertNotEqual(method, 'tools/call')
+            generation = (11, 200.0)
+            return response(request)
+
+        bridge, output = await self.make_bridge(handler)
+        bridge.initialize = INIT
+        bridge.browser_generation = lambda: generation
+        await bridge.handle(CALL)
+
+        self.assertIn('original request was not dispatched', output[-1]['result']['content'][0]['text'])
+        self.assertEqual(bridge.endpoint_browser, generation)
+        self.assertTrue(bridge.reset_requires_inventory)
+
     async def test_offline_check_is_unverified_without_stop_continuation_or_state_loss(self):
         import copy
         import tempfile

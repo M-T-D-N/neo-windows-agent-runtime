@@ -12,6 +12,14 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 
+class BrowserRecordStale(ValueError):
+    """An owned direct server is listening alongside a possible replacement CDP owner."""
+
+
+class OwnedEndpointTransition(ValueError):
+    """The verified direct MCP listener survives while its browser CDP is unavailable."""
+
+
 def _path(value):
     return ntpath.normcase(ntpath.abspath(value))
 
@@ -144,6 +152,32 @@ def verified_backend_context(plan):
 def verified_backend_endpoint(plan):
     context = verified_backend_context(plan)
     return context['endpoint'] if context else None
+
+
+def verified_browser_identity(plan):
+    """Observe the dedicated browser generation without launching or repairing it."""
+    import psutil
+
+    try:
+        port = plan.get('cdp_port', 9111)
+        listeners = [(c.laddr.ip,c.pid) for c in psutil.net_connections(kind='tcp')
+                     if c.status == psutil.CONN_LISTEN and c.laddr.port == port]
+        if len(listeners) != 1 or listeners[0][0] != '127.0.0.1' or not listeners[0][1]:
+            return None
+        process = psutil.Process(listeners[0][1])
+        observed = process.as_dict(attrs=['pid','exe','cmdline','create_time'])
+        command = observed['cmdline']
+        profile = browser_profile(command)
+        executable = Path(plan['proposed_runtime_root'])/'Chrome-bin/chrome.exe'
+        if (not observed['exe'] or not profile or browser_has_type(command)
+                or _path(observed['exe']) != _path(executable)
+                or _path(profile) != _path(plan['profile_root'])
+                or _option(command,'--browseros-cdp-port') != str(port)
+                or observed['create_time'] is None or not process.is_running()):
+            return None
+        return observed['pid'],observed['create_time']
+    except (OSError, ValueError, KeyError, TypeError, psutil.Error):
+        return None
 
 
 if __name__ == '__main__':

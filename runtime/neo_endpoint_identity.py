@@ -9,7 +9,9 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import psutil
-from neo_transport import browser_profile, browser_has_type, absolute_path
+from neo_transport import (
+    BrowserRecordStale, OwnedEndpointTransition, absolute_path, browser_has_type, browser_profile,
+)
 
 
 def path(value):
@@ -148,16 +150,18 @@ def rebind_browser(plan):
     return True
 
 
-def assert_owned_endpoint(plan, endpoint=None):
+def inspect_owned_endpoint(plan, endpoint=None):
     if plan.get('runtime_mode') != 'DIRECT_LOOPBACK':
         raise ValueError('Unsupported portable runtime mode')
     if endpoint is not None and endpoint != plan['mcp_endpoint']:
         raise ValueError('Alternate endpoint is not qualified for this direct installation')
     port=urlsplit(plan['mcp_endpoint']).port
-    listeners=[(c.laddr.ip,c.laddr.port,c.pid) for c in psutil.net_connections(kind='tcp')
-               if c.status == psutil.CONN_LISTEN and c.laddr.port == port]
+    cdp_port=plan['cdp_port']
+    sockets=[(c.laddr.ip,c.laddr.port,c.pid) for c in psutil.net_connections(kind='tcp')
+             if c.status == psutil.CONN_LISTEN and c.laddr.port in (port,cdp_port)]
+    listeners=[c for c in sockets if c[1] == port]
     if not listeners:
-        return False  # No listener; no readiness claim and no browser startup here.
+        return {'verified':False,'code':'MCP_NOT_LISTENING','reason':'MCP endpoint is not listening'}
     state=Path(plan['server_state_root'])
     try:
         record=json.loads((state/'recovery-server-process.json').read_text(encoding='utf-8'))
@@ -172,16 +176,50 @@ def assert_owned_endpoint(plan, endpoint=None):
         ready=validate(plan,record,server,browser,listeners,config,sha)
         if psutil.Process(server['pid']).as_dict(attrs=list(server)) != server:
             raise ValueError('Server identity changed during inspection')
-        return ready
+        cdp=[c for c in sockets if c[1] == cdp_port]
+        if ready:
+            if not cdp:
+                return {'verified':False,'code':'CDP_NOT_LISTENING',
+                        'reason':'MCP is listening; the recorded browser does not yet have its CDP listener',
+                        'browserPid':browser['pid'],'mcpPid':server['pid']}
+            if cdp != [('127.0.0.1',cdp_port,browser['pid'])]:
+                raise ValueError('Recorded browser and CDP listener do not match; preserve both processes')
+            return {'verified':True,'code':'READY','reason':'',
+                    'browserPid':browser['pid'],'browserCreated':browser['create_time'],
+                    'mcpPid':server['pid']}
+        previous=record['browser']['ProcessId']
+        if cdp and (len(cdp) != 1 or cdp[0][0] != '127.0.0.1' or not cdp[0][2] or cdp[0][2] == previous):
+            raise ValueError('CDP listener changed or is ambiguous; preserve the existing processes')
+        return {'verified':False,
+                'code':'BROWSER_RECORD_STALE' if cdp else 'RECORDED_BROWSER_EXITED',
+                'reason':('MCP is listening; recorded browser exited and a replacement CDP owner needs verification'
+                          if cdp else 'MCP is listening; recorded browser exited and CDP is not listening'),
+                'recordedBrowserPid':previous,'mcpPid':server['pid'],
+                'cdpPid':cdp[0][2] if cdp else None}
     except psutil.NoSuchProcess as error:
         # The listener snapshot may race normal server exit. Absence is not
         # permission to contact a replacement listener, so inspect again.
         if not any(c.status == psutil.CONN_LISTEN and c.laddr.port == port
                    for c in psutil.net_connections(kind='tcp')):
-            return False
+            return {'verified':False,'code':'MCP_NOT_LISTENING','reason':'MCP endpoint is not listening'}
         raise ValueError('Endpoint process changed; preserve existing listener') from error
     except (OSError,KeyError,TypeError,psutil.Error) as error:
         raise ValueError('Endpoint ownership is unverified; preserve the existing listener') from error
+
+
+def assert_owned_endpoint(plan, endpoint=None):
+    return inspect_owned_endpoint(plan,endpoint)['verified']
+
+
+def transport_browser_identity(plan, endpoint):
+    state=inspect_owned_endpoint(plan,endpoint)
+    if state['code'] == 'BROWSER_RECORD_STALE':
+        raise BrowserRecordStale(state['reason'])
+    if state['code'] in ('RECORDED_BROWSER_EXITED', 'CDP_NOT_LISTENING'):
+        raise OwnedEndpointTransition(state['reason'])
+    if not state['verified']:
+        return False
+    return state['browserPid'],state['browserCreated']
 
 
 if __name__ == '__main__':
@@ -198,8 +236,7 @@ if __name__ == '__main__':
         if args.rebind_browser:
             print(json.dumps({'rebound':rebind_browser(plan),'reason':''}))
             raise SystemExit(0)
-        verified=assert_owned_endpoint(plan,args.endpoint)
-        print(json.dumps({'verified':verified,'reason':'' if verified else 'Endpoint is not listening'}))
+        print(json.dumps(inspect_owned_endpoint(plan,args.endpoint)))
     except Exception as error:
-        print(json.dumps({'verified':False,'reason':f'{type(error).__name__}: {error}'}))
+        print(json.dumps({'verified':False,'code':'IDENTITY_UNVERIFIED','reason':f'{type(error).__name__}: {error}'}))
         raise SystemExit(2)

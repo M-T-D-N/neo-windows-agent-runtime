@@ -228,11 +228,14 @@ class BrowserRecordRepairTests(unittest.TestCase):
         self.record_path.write_text(json.dumps(self.record),encoding='utf-8')
         self.config_path.write_text(json.dumps(self.config),encoding='utf-8')
 
-    def repair(self):
+    def observe(self, operation):
         import contextlib,copy
         owner=self
         class Process:
-            def __init__(self,pid=99):self.pid=pid
+            def __init__(self,pid=99):
+                if pid==10 and not owner.old_present:
+                    raise owner.identity.psutil.NoSuchProcess(pid)
+                self.pid=pid
             def as_dict(self,attrs):
                 row=owner.server if self.pid==20 else owner.browser if self.pid==10 else owner.replacement
                 if owner.change and self.pid==11:
@@ -247,7 +250,25 @@ class BrowserRecordRepairTests(unittest.TestCase):
             stack.enter_context(patch.object(self.identity.psutil,'process_iter',lambda attrs:processes))
             stack.enter_context(patch.object(self.identity.psutil,'net_connections',lambda **kw:connections))
             stack.enter_context(patch.object(self.identity,'session_id',lambda pid:self.current_session if pid==11 else 1))
-            return self.identity.rebind_browser(self.plan)
+            return operation(self.plan)
+
+    def repair(self):
+        return self.observe(self.identity.rebind_browser)
+
+    def test_read_only_diagnostics_distinguish_missing_socket_and_stale_browser(self):
+        before=self.record_path.read_bytes()
+        for matches,expected,pid in (
+            (self.connection_rows,'BROWSER_RECORD_STALE',11),
+            (self.connection_rows[:1],'RECORDED_BROWSER_EXITED',None),
+            (self.connection_rows[1:],'MCP_NOT_LISTENING',None),
+        ):
+            with self.subTest(expected=expected):
+                self.connection_rows=matches
+                observed=self.observe(self.identity.inspect_owned_endpoint)
+                self.assertFalse(observed['verified'])
+                self.assertEqual(observed['code'],expected)
+                self.assertEqual(observed.get('cdpPid'),pid)
+                self.assertEqual(self.record_path.read_bytes(),before)
 
     def test_exact_restarted_browser_updates_only_browser_record(self):
         self.assertTrue(self.repair())
@@ -401,6 +422,96 @@ class EgressTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(self.IdentityError):
             await self.bridge.post({'jsonrpc':'2.0','id':1,'method':'ping'})
         self.assertEqual(self.checked,['http://127.0.0.1:19210/mcp'])
+        self.unchanged()
+
+    async def test_tcp_reset_on_owned_endpoint_retries_only_initialize(self):
+        from unittest.mock import AsyncMock
+        requests=[]
+        def handler(request):
+            message=json.loads(request.content)
+            requests.append(message['method'])
+            if len(requests)==1:
+                raise httpx.ReadError('fixture transient connection reset')
+            return httpx.Response(200,json={'jsonrpc':'2.0','id':message['id'],
+                'result':{'protocolVersion':'2025-06-18'}})
+        await self.bridge.client.aclose()
+        self.bridge.client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        self.bridge.endpoint_guard=lambda _: (52004,1767225601.)
+        self.bridge.starter=AsyncMock(side_effect=AssertionError('Runtime already owns the endpoint'))
+        await self.bridge.connect({'jsonrpc':'2.0','id':1,'method':'initialize','params':{}})
+        self.assertEqual(requests,['initialize','initialize'])
+        self.bridge.starter.assert_not_awaited()
+
+    async def test_transition_at_ping_never_launches_even_if_listener_then_disappears(self):
+        from neo_mcp_bridge import UpstreamError
+        from neo_transport import OwnedEndpointTransition
+        from unittest.mock import AsyncMock
+        calls=0
+        def observe(_):
+            nonlocal calls
+            calls+=1
+            if calls==1:
+                raise OwnedEndpointTransition('owned MCP remains while CDP disappears')
+            return False
+        self.bridge.endpoint_guard=observe
+        self.bridge.startup_seconds=.02
+        self.bridge.starter=AsyncMock(side_effect=AssertionError('Do not launch during browser handoff'))
+        with self.assertRaisesRegex(UpstreamError,'observing an owned runtime'):
+            await self.bridge.ensure_ready()
+        self.assertGreaterEqual(calls,2)
+        self.bridge.starter.assert_not_awaited()
+        self.unchanged()
+
+    async def test_browser_replacement_repairs_without_start_or_replaying_old_tools(self):
+        from neo_endpoint_identity import BrowserRecordStale
+        from unittest.mock import AsyncMock
+        outgoing=[]
+        joined=[]
+        fresh=False
+        def guard(endpoint):
+            if not fresh:
+                raise BrowserRecordStale('fixture replacement')
+            return (52004,1767225601.)
+        async def repair(script,*args):
+            nonlocal fresh
+            self.assertEqual((script,args),('ensure-neo-mcp.ps1',('-RepairOwnedBrowser',)))
+            fresh=True
+        def handler(request):
+            message=json.loads(request.content)
+            outgoing.append((message['method'],message.get('params',{}).get('name')))
+            return httpx.Response(200,json={'jsonrpc':'2.0','id':message['id'],'result':
+                {'content':[{'type':'text','text':'new inventory'}]} if message['method']=='tools/call' else {}})
+        await self.bridge.client.aclose()
+        self.bridge.client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        self.bridge.endpoint_guard=guard
+        self.bridge.run_runtime_script=AsyncMock(side_effect=repair)
+        self.bridge.starter=AsyncMock(side_effect=AssertionError('Do not start a browser'))
+        self.bridge.emit=joined.append
+        old={'jsonrpc':'2.0','id':1,'method':'tools/call',
+             'params':{'name':'run','arguments':{'code':'old request'}}}
+        queued=self.bridge.handle(dict(old,id=2))
+        await self.bridge.handle(old)
+        self.assertIn('original request was not dispatched',joined[-1]['result']['content'][0]['text'])
+        self.assertEqual(outgoing,[])
+        await self.bridge.handle({'jsonrpc':'2.0','id':3,'method':'tools/call',
+            'params':{'name':'tabs','arguments':{'action':'list'}}})
+        self.assertEqual(outgoing,[('ping',None),('tools/call','tabs')])
+        await queued
+        self.assertIn('queued before browser replacement',joined[-1]['result']['content'][0]['text'])
+        self.assertEqual(outgoing,[('ping',None),('tools/call','tabs')])
+        self.bridge.run_runtime_script.assert_awaited_once()
+        self.bridge.starter.assert_not_awaited()
+
+    async def test_browser_replacement_already_repaired_by_peer_still_retires_local_transport(self):
+        from neo_mcp_bridge import UpstreamError
+        from unittest.mock import AsyncMock
+        self.bridge.endpoint_browser=(7016,1767225600.)
+        self.bridge.endpoint_guard=lambda _: (52004,1767225601.)
+        self.bridge.run_runtime_script=AsyncMock()
+        with self.assertRaisesRegex(UpstreamError,'original request was not dispatched'):
+            await self.bridge.ensure_ready(allow_start=False)
+        self.bridge.run_runtime_script.assert_not_awaited()
+        self.assertTrue(self.bridge.reset_requires_inventory)
         self.unchanged()
 
 

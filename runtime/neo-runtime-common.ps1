@@ -86,7 +86,9 @@ function Test-NeoEndpointIdentity {
     $OutputEncoding=[Text.UTF8Encoding]::new($false)
     $json=$plan | ConvertTo-Json -Depth 12 -Compress
     $raw=$json | & $plan.python_executable -B -X utf8 (Join-Path $PSScriptRoot 'neo_endpoint_identity.py') --endpoint $Endpoint
+    $script:mcpIdentity=$null
     try {$identity=($raw -join "`n") | ConvertFrom-Json} catch {$script:mcpReadinessError='Endpoint identity helper failed';return $false}
+    $script:mcpIdentity=$identity
     if(-not $identity.verified){$script:mcpReadinessError=$identity.reason;return $false}
     return $true
 }

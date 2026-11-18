@@ -41,6 +41,7 @@ from workspace_storage import atomic_write_text
 from neo_cleanup import CleanupPolicy, TOOL as CLEANUP_TOOL, TOOL_NAME as CLEANUP_TOOL_NAME, has_pending_cleanup
 from neo_task_state import TaskState
 from neo_tab_identity import credential_bearing_url, other_owner
+from neo_transport import BrowserRecordStale, OwnedEndpointTransition
 
 
 class UpstreamError(Exception):
@@ -48,6 +49,10 @@ class UpstreamError(Exception):
 
 
 class EndpointIdentityError(UpstreamError):
+    pass
+
+
+class BrowserGenerationChanged(EndpointIdentityError):
     pass
 
 
@@ -104,7 +109,7 @@ async def sse_messages(response: httpx.Response):
 class Bridge:
     def __init__(self, endpoint: str, emit: Callable[[dict], None], *, client=None,
                  starter=None, startup_seconds: float = 45, catalog=None, state_root=None, task_id=None,
-                 backend_resolver=None, endpoint_guard=None):
+                 backend_resolver=None, endpoint_guard=None, browser_generation=None):
         address = urlsplit(endpoint)
         if (address.scheme != "http" or address.hostname != "127.0.0.1"
                 or address.path != "/mcp" or address.username or address.password
@@ -114,6 +119,9 @@ class Bridge:
         self.canonical_endpoint = endpoint
         self.backend_resolver = backend_resolver
         self.endpoint_guard = endpoint_guard
+        self.browser_generation = browser_generation
+        self.endpoint_browser = None
+        self.endpoint_epoch = 0
         self.emit = emit
         self.client = client or httpx.AsyncClient(
             trust_env=False, follow_redirects=False,
@@ -145,12 +153,46 @@ class Bridge:
         if task_id and self.task_state:
             self.bind_task(task_id)
 
-    async def guard_endpoint(self):
+    async def endpoint_observation(self):
         if self.endpoint_guard is not None:
-            try:
-                return await asyncio.to_thread(self.endpoint_guard, self.endpoint)
-            except Exception as error:
-                raise EndpointIdentityError('Endpoint ownership check failed before dispatch: '+str(error)) from error
+            return await asyncio.to_thread(self.endpoint_guard, self.endpoint)
+        if self.browser_generation is not None:
+            return await asyncio.to_thread(self.browser_generation)
+
+    async def guard_endpoint(self, *, defer_recovery=False):
+        try:
+            identity = await self.endpoint_observation()
+        except (BrowserRecordStale, OwnedEndpointTransition):
+            if defer_recovery:
+                return False
+            raise
+        except Exception as error:
+            raise EndpointIdentityError('Endpoint ownership check failed before dispatch: '+str(error)) from error
+        if isinstance(identity, tuple):
+            if self.endpoint_browser is not None and self.endpoint_browser != identity:
+                if defer_recovery:
+                    return False
+                raise BrowserGenerationChanged('Verified browser process changed')
+            self.endpoint_browser = identity
+        return identity
+
+    async def reconcile_endpoint_browser(self, error):
+        if isinstance(error, BrowserRecordStale):
+            # This entry point only rebinds an existing verified CDP owner.
+            # It never launches a browser, stops a server or sends an RPC.
+            await self.run_runtime_script('ensure-neo-mcp.ps1', '-RepairOwnedBrowser')
+        identity = await self.endpoint_observation()
+        if not isinstance(identity, tuple):
+            raise UpstreamError('Browser identity was not ready after recovery; no browser was launched')
+        self.endpoint_browser = identity
+        self.endpoint_epoch += 1
+        self.session = self.protocol = None
+        self.task_prepared = False
+        self.cleanup_empty_session = self.cleanup_closed_session = None
+        self.reset_requires_inventory = True
+        self.inventory_receipt = None
+        raise UpstreamError('Browser replacement verified. Call tabs action=list and select current IDs; '
+                            'the original request was not dispatched.')
 
     def bind_task(self, task_id):
         self.cleanup.bind(task_id)
@@ -463,8 +505,11 @@ class Bridge:
 
     async def start_runtime(self):
         # The launcher verifies publisher/profile and serializes concurrent starts.
+        await self.run_runtime_script("start-neo.ps1", "-Background")
+
+    async def run_runtime_script(self, script, *arguments):
         command = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                   "-File", str(ROOT / "start-neo.ps1"), "-Background"]
+                   "-File", str(ROOT / script), *arguments]
         state = json.loads((ROOT / "runtime-plan.json").read_text(encoding="utf-8"))["server_state_root"]
         # Python preserves PS7 module paths when invoking Windows PowerShell 5.1.
         # Let the child rebuild its own defaults; never change the parent/registry.
@@ -549,12 +594,12 @@ class Bridge:
                     return item
             raise UpstreamError("neo response ended without the matching RPC result")
 
-    async def connect(self, message: dict, *, allow_start=True):
+    async def connect(self, message: dict, *, allow_start=True, preserve_existing=False):
         # A former backend port is not authority for a new transport session.
         self.endpoint = self.canonical_endpoint
         self.session = None
         self.protocol = None
-        deadline = time.monotonic() + self.startup_seconds
+        deadline = time.monotonic() + (min(self.startup_seconds, 10) if preserve_existing else self.startup_seconds)
         started = False
         checked_backend = False
         while True:
@@ -565,16 +610,33 @@ class Bridge:
                     raise UpstreamError("neo initialization was rejected")
                 self.protocol = reply["result"]["protocolVersion"]
                 return reply
-            except (httpx.TransportError, NotReady):
+            except (BrowserRecordStale, BrowserGenerationChanged) as error:
+                await self.reconcile_endpoint_browser(error)
+            except (httpx.TransportError, NotReady, OwnedEndpointTransition) as error:
                 if not checked_backend and self.backend_resolver is not None:
                     checked_backend = True
                     backend = await asyncio.to_thread(self.backend_resolver)
                     if backend and backend != self.endpoint:
-                        # Only initialization is retried. Website tools have not
-                        # been dispatched; the logical browser handle is retained.
+                        # A verified managed child is already serving the browser.
+                        # Recheck readiness there without starting another worker.
                         self.endpoint = backend
+                        deadline = min(deadline, time.monotonic() + 10)
+                        preserve_existing = True
                         continue
-                if not started:
+                if not preserve_existing and self.endpoint_guard is not None:
+                    try:
+                        identity = (True if isinstance(error, OwnedEndpointTransition)
+                                    else await self.guard_endpoint())
+                    except (BrowserRecordStale, BrowserGenerationChanged) as replaced:
+                        await self.reconcile_endpoint_browser(replaced)
+                    except OwnedEndpointTransition:
+                        identity = True
+                    if identity is True or isinstance(identity, tuple):
+                        # Even if both listeners subsequently disappear, this
+                        # request does not authorize a launch during a handoff.
+                        deadline = min(deadline, time.monotonic() + 10)
+                        preserve_existing = True
+                if not started and not preserve_existing:
                     if not allow_start:
                         raise UpstreamError('Neo is unavailable; reconnect initialization never starts it. '
                                             'No original action was dispatched. For new browser work, call tabs action=list.')
@@ -583,6 +645,9 @@ class Bridge:
                     checked_backend = False  # The verified child may now exist.
                     self.endpoint = self.canonical_endpoint
                 if time.monotonic() >= deadline:
+                    if preserve_existing:
+                        raise UpstreamError('Neo readiness did not recover after observing an owned runtime. '
+                                            'The launcher was not retried; inspect the new tab inventory.') from error
                     raise UpstreamError("neo did not become ready before startup deadline")
                 await asyncio.sleep(0.3)
 
@@ -591,6 +656,12 @@ class Bridge:
             if self.initialize is None:
                 raise UpstreamError("MCP initialize has not completed")
             self.sequence += 1
+            # The managed proxy and child server can both disappear while a
+            # previously verified browser is being replaced. Preserve that
+            # connection's launch boundary even if resolving the child fails.
+            managed_reconnect = (self.browser_generation is not None
+                                 and self.endpoint_browser is not None
+                                 and self.protocol is not None)
             if self.endpoint != self.canonical_endpoint:
                 backend = await asyncio.to_thread(self.backend_resolver) if self.backend_resolver else None
                 if backend != self.endpoint:
@@ -602,10 +673,18 @@ class Bridge:
                 if not reply or "error" in reply:
                     raise UpstreamError("neo readiness ping failed")
                 return
-            except (httpx.TransportError, SessionGone, NotReady):
+            except (BrowserRecordStale, BrowserGenerationChanged) as error:
+                await self.reconcile_endpoint_browser(error)
+            except (httpx.TransportError, SessionGone, NotReady, OwnedEndpointTransition) as error:
                 # No website action has been dispatched. Reinitializing is safe.
                 reconnect = dict(self.initialize, id=f"neo-reconnect-{self.sequence}")
-                reply = await self.connect(reconnect, allow_start=allow_start)
+                try:
+                    await self.connect(reconnect, allow_start=allow_start,
+                                       preserve_existing=managed_reconnect or isinstance(error, OwnedEndpointTransition))
+                except UpstreamError:
+                    if managed_reconnect:
+                        self.reset_requires_inventory = True
+                    raise
                 if self.initialized:
                     await self.post({"jsonrpc": "2.0", "method": "notifications/initialized"})
                     self.start_events()
@@ -631,7 +710,7 @@ class Bridge:
                     async for item in sse_messages(response):
                         if self.session == session:
                             self.emit(item)
-            except EndpointIdentityError:
+            except (EndpointIdentityError, BrowserRecordStale, OwnedEndpointTransition):
                 return  # Stop this channel; never poll or send to an unverified owner.
             except (httpx.HTTPError, UpstreamError, ValueError):
                 # Readiness is checked before the next request; never restart a tool here.
@@ -642,9 +721,9 @@ class Bridge:
         # Capture at submission, before the coroutine can wait behind another
         # request. A later catalog cannot authorize an already queued old action.
         reset_id=(self.task_state.record or {}).get('browser_reset_id') if self.task_state else None
-        return self._handle(message,self.reset_requires_inventory,reset_id)
+        return self._handle(message,self.reset_requires_inventory,reset_id,self.endpoint_epoch)
 
-    async def _handle(self, message: dict, inventory_pending, arrival_reset_id):
+    async def _handle(self, message: dict, inventory_pending, arrival_reset_id, arrival_endpoint_epoch):
         method = message.get("method")
         sent = False
         delivered_page_inventory = False
@@ -653,7 +732,7 @@ class Bridge:
                 p=message.get('params') or {}
                 a=p.get('arguments') or {}
                 if not (p.get('name') == CLEANUP_TOOL_NAME and a.get('action') in ('begin','outputs')):
-                    await self.guard_endpoint()  # Before task binding/marking or cleanup record changes.
+                    await self.guard_endpoint(defer_recovery=True)  # Reject foreign owners before task bookkeeping.
             if method == "ping":
                 # Transport heartbeat must not reopen a deliberately closed browser.
                 result = {"jsonrpc": "2.0", "id": message["id"], "result": {}}
@@ -711,6 +790,9 @@ class Bridge:
                 try:
                     async with self.tool_lock, self.browser_operation(local_only=(
                             (message.get('params') or {}).get('arguments',{}).get('action') in ('begin','outputs'))):
+                        if (arrival_endpoint_epoch != self.endpoint_epoch and
+                                (message.get('params') or {}).get('arguments',{}).get('action') not in ('begin','outputs')):
+                            raise UpstreamError('Cleanup was queued before browser replacement; use current tab inventory')
                         result = await self.cleanup_call(message)
                         delivered_page_inventory = bool((result.get('result', {}).get('structuredContent') or {}).get('freshInventoryProvided'))
                 finally:
@@ -721,11 +803,14 @@ class Bridge:
                     # Serialize first-call minting and handle replacement; concurrent
                     # requests must not fork this connection's browser identity.
                     async with self.tool_lock, self.browser_operation():
+                        if arrival_endpoint_epoch != self.endpoint_epoch:
+                            raise UpstreamError('Request was queued before browser replacement; use current tab inventory')
                         supplied_session=((message.get('params') or {}).get('arguments') or {}).get('session')
                         message = self.refresh_reset_binding(message)
                         current_reset_id=(self.task_state.record or {}).get('browser_reset_id') if self.task_state else None
                         if arrival_reset_id != current_reset_id:
                             raise UpstreamError('Request predates browser reset and was not replayed. Task binding was refreshed locally; call tabs action=list and construct a NEW request')
+                        requires_receipt = current_reset_id or self.endpoint_epoch
                         params = dict(message.get("params") or {})
                         args = dict(params.get("arguments") or {})
                         inventory_receipt = args.pop('inventory_receipt', None)
@@ -737,12 +822,8 @@ class Bridge:
                                 or any(k in args for k in ('expected','priorSession','priorGroupId','prior'))):
                             raise ValueError('Task recovery is internal; use workspace_cleanup begin to reconcile recorded tabs')
                         requested_session = args.get("session")
-                        if "session" in args:
-                            if not isinstance(requested_session, str) or not requested_session:
-                                raise ValueError('session must be a nonempty current browser handle')
-                            if requested_session != self.tool_session:
-                                self.tool_session = requested_session
-                                self.task_prepared = False
+                        if "session" in args and (not isinstance(requested_session, str) or not requested_session):
+                            raise ValueError('session must be a nonempty current browser handle')
                         inventory_only = (params.get("name") in ("tabs", "windows", "tab_groups")
                                           and args.get("action") == "list"
                                           and set(args) <= {"action", "session", "agentName"})
@@ -755,12 +836,18 @@ class Bridge:
                             return
                         if (self.reset_requires_inventory or inventory_pending) and not inventory_only:
                             raise UpstreamError('Fresh caller-visible inventory required after reset: call tabs action=list, select its current page IDs/session, then issue a fresh request. Queued prior requests are not replayed')
-                        if (current_reset_id and not inventory_only
+                        if (requires_receipt and not inventory_only
                                 and (not self.inventory_receipt or inventory_receipt != self.inventory_receipt)):
                             raise UpstreamError('Post-reset request requires inventory_receipt from this connection\'s tabs action=list. Select current page IDs/session and issue a fresh request; old requests are not replayed')
-                        if (current_reset_id and supplied_session is not None and supplied_session != self.tool_session
-                                and not inventory_only):
-                            raise UpstreamError('Retired session hint cannot address current pages. Select current page IDs/session from tabs action=list and issue a fresh request')
+                        if requires_receipt and supplied_session is not None and supplied_session != self.tool_session:
+                            if not inventory_only:
+                                raise UpstreamError('Retired session hint cannot address current pages. Select current page IDs/session from tabs action=list and issue a fresh request')
+                            # Inventories may refresh a known session but a caller
+                            # cannot bind one by combining a list with an old hint.
+                            args.pop('session', None)
+                        elif not requires_receipt and requested_session is not None and requested_session != self.tool_session:
+                            self.tool_session = requested_session
+                            self.task_prepared = False
                         # Fixed observation tools cannot adopt, navigate or edit.
                         # Arbitrary run/evaluate code still requires reconciliation.
                         observation_only = inventory_only or params.get("name") in (
@@ -800,7 +887,13 @@ class Bridge:
                             except Exception as error:
                                 baseline_error = error
                         dispatched_ns = time.time_ns()
-                        result = await self.post(request, headers=headers)
+                        try:
+                            result = await self.post(request, headers=headers)
+                        except (BrowserRecordStale, BrowserGenerationChanged) as error:
+                            # post detected the change before opening its HTTP
+                            # stream. Retire the stale handles on this request.
+                            sent = False
+                            await self.reconcile_endpoint_browser(error)
                         handle = ((result or {}).get("result", {}).get("_meta") or {}).get(SESSION_META_KEY)
                         if isinstance(handle, str) and handle:
                             self.tool_session = handle
@@ -810,7 +903,7 @@ class Bridge:
                                 and 'result' in result and 'error' not in result and not upstream.get('isError')
                                 and any(c.get('type')=='text' and c.get('text','').strip() for c in upstream.get('content',[]))):
                             delivered_page_inventory = True
-                            if current_reset_id:
+                            if requires_receipt:
                                 if self.inventory_receipt is None:
                                     self.inventory_receipt = str(uuid.uuid4())
                                 upstream.setdefault('_meta', {})[INVENTORY_META_KEY] = self.inventory_receipt
@@ -870,7 +963,7 @@ class Bridge:
                 self.emit({"jsonrpc": "2.0", "id": message["id"], "result": {
                     "content": [{"type": "text", "text": json.dumps(hook_value)}], "structuredContent": value}})
             elif method == "tools/call":
-                sent = sent and not isinstance(error, EndpointIdentityError)
+                sent = sent and not isinstance(error, (EndpointIdentityError, BrowserRecordStale, OwnedEndpointTransition))
                 status = "OUTCOME_UNKNOWN" if sent else "NEO_NOT_READY"
                 guidance = ("Request was dispatched and will NOT be replayed. Inspect the actual page/saved result before retrying any action."
                             if sent else "Tool request was NOT dispatched. Fix runtime readiness before invoking the tool again.")
@@ -905,7 +998,8 @@ class Bridge:
         self.bind_task(args.get("task_id"))
         if self.reset_requires_inventory and args.get('action') not in ('begin','outputs','check'):
             return await self.reconnect_inventory(message)
-        if ((self.task_state.record or {}).get('browser_reset_id') if self.task_state else False) and args.get('action') not in ('begin','outputs','check'):
+        recorded_reset = self.task_state and (self.task_state.record or {}).get('browser_reset_id')
+        if (self.endpoint_epoch or recorded_reset) and args.get('action') not in ('begin','outputs','check'):
             if not self.inventory_receipt or inventory_receipt != self.inventory_receipt:
                 raise UpstreamError('Post-reset cleanup requires inventory_receipt from this connection\'s tabs action=list; use current page IDs and issue a fresh request')
         if args.get('action') == 'inventory':
@@ -1054,11 +1148,9 @@ async def main():
     catalog = json.loads((ROOT / 'official-tools.json').read_text(encoding='utf-8'))
     if catalog.get('server_sha256') != plan['server_override']['sha256']:
         raise UpstreamError('Official schema catalog does not match the approved server; refresh it without launching a browser')
-    from neo_transport import verified_backend_endpoint
-    from neo_endpoint_identity import assert_owned_endpoint
+    from neo_endpoint_identity import transport_browser_identity
     bridge = Bridge(plan["mcp_endpoint"], emit, startup_seconds=55, catalog=catalog,
-                    backend_resolver=None,
-                    endpoint_guard=lambda endpoint: assert_owned_endpoint(plan, endpoint),
+                    endpoint_guard=lambda endpoint: transport_browser_identity(plan, endpoint),
                     state_root=Path(plan['ledger_root']) / 'task-tabs' / args.client, task_id=args.task_id)
     pending: set[asyncio.Task] = set()
     try:

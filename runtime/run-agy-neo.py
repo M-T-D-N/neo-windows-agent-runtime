@@ -15,8 +15,7 @@ import uuid
 
 from neo_mcp_bridge import Bridge, GuardedProactorEventLoop
 from neo_cleanup import has_pending_cleanup
-from neo_transport import verified_backend_endpoint
-from neo_endpoint_identity import assert_owned_endpoint
+from neo_endpoint_identity import transport_browser_identity
 from process_environment import build_environment
 
 ROOT=Path(__file__).parent
@@ -33,8 +32,7 @@ async def finish_check(plan, task_id, execution_id):
     async def no_start():
         raise RuntimeError('Finish check must never start Neo')
     bridge=Bridge(plan['mcp_endpoint'],output.append,starter=no_start,state_root=root,task_id=task_id,
-                  backend_resolver=None,
-                  endpoint_guard=(lambda endpoint:assert_owned_endpoint(plan,endpoint)) if plan.get('runtime_mode') == 'DIRECT_LOOPBACK' else None)
+                  endpoint_guard=(lambda endpoint:transport_browser_identity(plan,endpoint)) if plan.get('runtime_mode') == 'DIRECT_LOOPBACK' else None)
     bridge.initialize={'params':{'capabilities':{},'clientInfo':{'name':'agy-finish-check','version':'1'}}}
     # This checks the same explicit CLI completion boundary, not another turn.
     # Matching execution_id prevents prior approvals from being carried forward.
