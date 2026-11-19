@@ -32,7 +32,7 @@ function Write-RuntimeStatus {
         $expected=$override.executable.Replace('/','\')
         $overrideActive=@($servers | Where-Object {$_.ExecutablePath -eq $expected}).Count -gt 0
     }
-    [pscustomobject]@{mcpReady=$health.mcpReady;effectiveMcpEndpoint=$health.effectiveMcpEndpoint;mcpIdentity=$health.mcpIdentity;mcpReadinessError=$health.mcpReadinessError;serverMode=$health.mode;serverOverrideBinaryActive=$overrideActive;serverPids=@($servers.ProcessId);running=$null -ne $Running -and @($Running).Count -gt 0;pids=@($Running.ProcessId);runtime=if(Test-Path $runtime){Get-Content -Encoding UTF8 $runtime -Raw}else{$null};profile=$plan.profile_root;version=$plan.version}
+    [pscustomobject]@{mcpReady=$health.mcpReady;effectiveMcpEndpoint=$health.effectiveMcpEndpoint;mcpIdentity=$health.mcpIdentity;mcpReadinessError=$health.mcpReadinessError;mcpProbeCleanupErrors=$health.mcpProbeCleanupErrors;serverMode=$health.mode;serverOverrideBinaryActive=$overrideActive;serverPids=@($servers.ProcessId);running=$null -ne $Running -and @($Running).Count -gt 0;pids=@($Running.ProcessId);runtime=if(Test-Path $runtime){Get-Content -Encoding UTF8 $runtime -Raw}else{$null};profile=$plan.profile_root;version=$plan.version}
 }
 if($Check){Write-RuntimeStatus (Get-DedicatedBrowser);return}
 # Add-Type's compiler intermediates belong to this runtime's D state as well.

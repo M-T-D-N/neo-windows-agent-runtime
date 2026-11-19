@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,9 +16,14 @@ def parser():
     sub = p.add_subparsers(dest="command", required=True)
     prepare = sub.add_parser("prepare")
     prepare.add_argument("operation_id")
-    for field in ("domain", "account", "channel", "manuscript-version", "approval-reference"):
-        prepare.add_argument("--" + field, required=True)
+    register = sub.add_parser("register", help="derive the operation ID from publication identity")
+    for command in (prepare, register):
+        for field in ("domain", "account", "channel", "manuscript-version", "approval-reference"):
+            command.add_argument("--" + field, required=True)
     prepare.add_argument("--attachment", action="append", default=[])
+    register.add_argument("--attachment-file", type=Path, action="append", default=[])
+    register.add_argument("--repeat", action="store_true", help="separately approved repost or retry after confirmed absence")
+    register.add_argument("--verified-legacy-operation", help="return the sole legacy ID after comparing the original ordered files")
     for name in ("begin", "status"):
         sp = sub.add_parser(name)
         sp.add_argument("operation_id", nargs="?" if name == "status" else None)
@@ -60,8 +66,23 @@ def main(argv=None):
         root = args.storage_root or Path(os.environ.get("BROWSEROS_NEO_STORAGE_ROOT", str(DEFAULT_STORAGE)))
         storage = resolve_storage("browseros-neo", app_name="browseros-neo", override=root, create=False)
         ledger = Ledger(storage.directory("data", "posting-ledger.json"))
-        if args.command == "prepare":
-            output = ledger.prepare(args.operation_id, domain=args.domain, account=args.account, channel=args.channel, manuscript_version=args.manuscript_version, attachments=args.attachment, approval_reference=args.approval_reference)
+        if args.command in ("prepare", "register"):
+            fields = {key: getattr(args, key) for key in (
+                "domain", "account", "channel", "manuscript_version", "approval_reference"
+            )}
+            if args.command == "register":
+                if len(args.attachment_file) > 32:
+                    raise LedgerError("register accepts up to 32 ordered attachment files")
+                attachments = []
+                for index, path in enumerate(args.attachment_file):
+                    if not path.is_file():
+                        raise LedgerError(f"attachment {index + 1} must be a file")
+                    with path.open("rb") as stream:
+                        attachments.append(f"{index}:sha256:{hashlib.file_digest(stream, 'sha256').hexdigest()}")
+                output = ledger.register(repeat=args.repeat, verified_legacy_operation=args.verified_legacy_operation,
+                                         attachments=attachments, **fields)
+            else:
+                output = ledger.prepare(args.operation_id, attachments=args.attachment, **fields)
         elif args.command == "begin":
             output = ledger.begin(args.operation_id)
         elif args.command == "status":

@@ -4,12 +4,15 @@ import hashlib
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from http.client import RemoteDisconnected
 from pathlib import Path
 from unittest.mock import patch
@@ -43,6 +46,21 @@ class RootTest(unittest.TestCase):
 
 
 class LedgerTests(RootTest):
+    def test_manual_id_cannot_repeat_verified_publication(self):
+        self.prepare("legacy")
+        self.ledger.begin("legacy")
+        verified = self.ledger.reconcile("legacy", "VERIFIED", post_id="one",
+            url="http://127.0.0.1/p/one", verification={"kind": "post-readback", "reference": "one"})
+        newer = IDENTITY | {"approval_reference": "approved-next"}
+        with self.assertRaises(Blocked):
+            self.prepare("another", **newer)
+        self.assertEqual(self.ledger.register(**newer), verified)
+        with self.assertRaises(Blocked):
+            self.ledger.register(repeat=True, **IDENTITY)
+        repeat = self.ledger.register(repeat=True, **newer)
+        self.assertEqual(self.ledger.register(repeat=True, **newer), repeat)
+        self.assertEqual(self.ledger.begin(repeat["operation_id"])["status"], "SUBMITTING")
+
     def test_restart_prevents_replay_and_verified_returns_existing_result(self):
         self.prepare()
         self.ledger.begin("test-op")
@@ -226,6 +244,114 @@ class FixtureTests(RootTest):
         self.assertEqual(self.ledger.begin("synthetic-op")["result"]["post_id"], post["post_id"])
         self.assertEqual(self.request("/api/posts")["submission_count"], 1)
 
+    def test_legacy_opaque_attachments_block_new_cli_for_verified_and_pending_posts(self):
+        path = self.root / "same.txt"
+        path.write_bytes(b"actual legacy attachment")
+        for terminal in (False, True):
+            with self.subTest(terminal=terminal):
+                root = self.root / str(terminal)
+                ledger = Ledger(root / "data" / "posting-ledger.json")
+                ledger.prepare("legacy", **(IDENTITY | {"attachments": ["opaque-original-attachment-id"]}))
+                ledger.begin("legacy")
+                legacy = ledger.uncertain("legacy", "outcome unknown")
+                if terminal:
+                    legacy = ledger.reconcile("legacy", "VERIFIED", post_id="old",
+                        url=self.base + "/api/posts/old", verification={"kind": "post-readback", "reference": "matched"})
+                args = ["--storage-root", str(root), "register", "--domain", IDENTITY["domain"],
+                        "--account", IDENTITY["account"], "--channel", IDENTITY["channel"],
+                        "--manuscript-version", IDENTITY["manuscript_version"], "--approval-reference", "new-review",
+                        "--attachment-file", str(path)]
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(main(args), 3)
+                self.assertEqual(json.loads(output.getvalue())["operation"], legacy)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(main(args + ["--verified-legacy-operation", "legacy"]), 0)
+                self.assertEqual(json.loads(output.getvalue()), legacy)
+                self.assertEqual(list(ledger.status()["operations"]), ["legacy"])
+        self.assertEqual(self.request("/api/posts")["submission_count"], 0)
+
+    def test_independent_image_uploads_share_fixture_guard_after_lost_response(self):
+        raw = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=")
+        records = [self.request("/api/upload", {"name": name, "type": "image/png",
+                   "base64": base64.b64encode(raw).decode()}) for name in ("image-a.png", "image-b.png")]
+        self.assertNotEqual(records[0]["id"], records[1]["id"])
+        barrier = threading.Barrier(2, timeout=8)
+
+        def worker(index):
+            op = f"synthetic-upload-{index}"
+            key = records[index]["id"]
+            content = self.content([key], operation_id=op, body_html=f'<img src="/api/uploads/{key}" alt="same">')
+            barrier.wait()
+            try:
+                result = self.request("/api/guard/begin", content)
+            except urllib.error.HTTPError as error:
+                self.assertEqual(error.code, 409)
+                return op, False
+            self.assertEqual(result["operation"]["status"], "SUBMITTING")
+            with self.assertRaises((RemoteDisconnected, urllib.error.URLError, ConnectionResetError)):
+                self.request("/api/publish", content | {"drop_after_commit": True})
+            self.request("/api/guard/uncertain", {"operation_id": op, "reference": "response-lost"})
+            return op, True
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(worker, (0, 1)))
+        winner, = [op for op, submitted in outcomes if submitted]
+        stored = self.request("/api/posts")
+        self.assertEqual(stored["submission_count"], 1)
+        post, = stored["posts"]
+        self.assertEqual(post["operation_id"], winner)
+        self.assertEqual(post["attachments"][0]["sha256"], hashlib.sha256(raw).hexdigest())
+        result = self.request("/api/guard/reconcile", {"operation_id": winner, "post_id": post["post_id"]})
+        self.assertEqual(result["operation"]["status"], "VERIFIED")
+
+    def test_independent_cli_workers_submit_same_publication_once_after_lost_response(self):
+        base = [sys.executable, "-B", "-m", "web_automation", "--storage-root", str(self.root / "workers")]
+        first, second = self.root / "first.txt", self.root / "second.txt"
+        for path in (first, second):
+            path.write_bytes(b"same attachment")
+        uploaded = self.upload(raw=first.read_bytes())
+        barrier = threading.Barrier(2, timeout=12)
+
+        def cli(*args):
+            run = subprocess.run([*base, *args], capture_output=True, encoding="utf-8",
+                                 env=os.environ | {"PYTHONIOENCODING": "utf-8"}, timeout=12)
+            return run.returncode, json.loads(run.stdout)
+
+        def worker(path):
+            code, operation = cli("register", "--domain", "127.0.0.1", "--account", "fixture",
+                                  "--channel", "board", "--manuscript-version", "approved-v1",
+                                  "--approval-reference", path.stem, "--attachment-file", str(path))
+            self.assertEqual(code, 0)
+            op_id = operation["operation_id"]
+            barrier.wait()
+            code, decision = cli("begin", op_id)
+            if code == 0 and decision["status"] == "SUBMITTING":
+                with self.assertRaises((RemoteDisconnected, urllib.error.URLError, ConnectionResetError)):
+                    self.request("/api/publish", self.content([uploaded["id"]], operation_id=op_id, drop_after_commit=True))
+                return op_id, "response-lost"
+            self.assertEqual(code, 3)
+            return op_id, "blocked"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(worker, (first, second)))
+        op_id = results[0][0]
+        self.assertEqual(op_id, results[1][0])
+        self.assertCountEqual([item[1] for item in results], ["blocked", "response-lost"])
+        self.assertEqual(cli("begin", op_id)[0], 3)
+        value = self.request("/api/posts")
+        self.assertEqual(value["submission_count"], 1)
+        self.assertEqual(len(value["posts"]), 1)
+        post = self.request("/api/posts/" + value["posts"][0]["post_id"])
+        self.assertEqual(post["title"], self.content()["title"])
+        self.assertEqual(post["attachments"][0]["sha256"], hashlib.sha256(first.read_bytes()).hexdigest())
+        code, decision = cli("reconcile", op_id, "--status", "VERIFIED", "--post-id", post["post_id"],
+                             "--url", post["url"], "--evidence-kind", "post-readback", "--reference", "saved")
+        self.assertEqual(code, 0)
+        self.assertEqual(cli("begin", op_id), (0, decision))
+        self.assertEqual(self.request("/api/posts")["submission_count"], 1)
+
     def test_server_has_no_hidden_idempotency(self):
         self.request("/api/publish", self.content())
         self.request("/api/publish", self.content())
@@ -285,6 +411,9 @@ class FixtureTests(RootTest):
         verified = self.request("/api/guard/reconcile", {"operation_id": "synthetic-op", "post_id": saved["post_id"]})
         self.assertEqual(verified["operation"]["status"], "VERIFIED")
         self.assertEqual(self.request("/api/guard/begin", content)["operation"]["status"], "VERIFIED")
+        with self.assertRaises(urllib.error.HTTPError) as alias:
+            self.request("/api/guard/begin", content | {"operation_id": "another-op"})
+        self.assertEqual(alias.exception.code, 409)
         self.assertEqual(self.request("/api/posts")["submission_count"], 1)
 
     def test_fixture_guard_rejects_mismatched_saved_content_and_duplicates(self):

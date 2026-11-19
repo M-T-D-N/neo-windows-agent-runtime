@@ -119,8 +119,9 @@ if($StopOwnedRecovery){Stop-Recovery; Stop-OrphanedManagedServer; [pscustomobjec
 $browser=@(Get-Browser)
 $owned=Get-OwnedServer
 if($Check){
+    $script:mcpProbeCleanupErrors=@()
     $ready=Test-McpReady
-    [pscustomobject]@{mcpReady=$ready;effectiveMcpEndpoint=$script:mcpEffectiveEndpoint;mcpIdentity=$script:mcpIdentity;mcpReadinessError=if(-not $ready){$script:mcpReadinessError};recoveryServerPids=@($owned.ProcessId);mode=if($owned){'WORKSPACE_DIRECT_RECOVERY'}else{'CHROMIUM_MANAGED'}}
+    [pscustomobject]@{mcpReady=$ready;effectiveMcpEndpoint=$script:mcpEffectiveEndpoint;mcpIdentity=$script:mcpIdentity;mcpReadinessError=if(-not $ready){$script:mcpReadinessError};mcpProbeCleanupErrors=$script:mcpProbeCleanupErrors;recoveryServerPids=@($owned.ProcessId);mode=if($owned){'WORKSPACE_DIRECT_RECOVERY'}else{'CHROMIUM_MANAGED'}}
     return
 }
 if($browser.Count -ne 1){throw 'Exactly one dedicated browser is required for live MCP recovery'}

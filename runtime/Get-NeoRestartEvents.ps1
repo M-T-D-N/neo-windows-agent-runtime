@@ -58,7 +58,9 @@ if ($IncidentTime -notmatch '(?:Z|[+-]\d{2}:\d{2})$') {
 }
 $when=[DateTimeOffset]::Parse($IncidentTime,[Globalization.CultureInfo]::InvariantCulture)
 $plan=Get-Content -Encoding UTF8 -LiteralPath $PlanPath -Raw | ConvertFrom-Json
-if ($plan.runtime_mode -ne 'DIRECT_LOOPBACK') { throw 'Select the plan of the affected direct Neo installation.' }
+if ($plan.runtime_mode -notin @( $null, 'CHROMIUM_MANAGED', 'DIRECT_LOOPBACK')) {
+    throw 'Select the plan of the affected managed or direct Neo installation.'
+}
 $browser=[IO.Path]::GetFullPath((Join-Path $plan.proposed_runtime_root 'Chrome-bin\chrome.exe'))
 $start=$when.AddMinutes(-$MinutesBefore).UtcDateTime.ToString('o')
 $end=$when.AddMinutes($MinutesAfter).UtcDateTime.ToString('o')
@@ -82,7 +84,7 @@ try {
     queryStatus=$status
     errorId=$errorId
     mcpPort=([Uri]$plan.mcp_endpoint).Port
-    cdpPort=$plan.cdp_port
+    cdpPort=if($plan.cdp_port){[int]$plan.cdp_port}else{9111}
     startUtc=$start
     endUtc=$end
     expectedBrowserPids=$BrowserPid

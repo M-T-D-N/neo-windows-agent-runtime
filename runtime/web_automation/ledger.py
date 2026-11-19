@@ -1,5 +1,6 @@
 """Fail-closed publishing intent ledger; it does not submit to any website."""
 import copy
+import hashlib
 import json
 import re
 from datetime import datetime, timezone
@@ -53,6 +54,27 @@ def identity(values):
     if len(set(attachments)) != len(attachments):
         raise LedgerError("attachment identifiers must be distinct")
     return copy.deepcopy(values)
+
+
+def publication(ident):
+    return {key: ident[key] for key in IDENTITY if key != "approval_reference"}
+
+
+def manuscript(ident):
+    return tuple(ident[key] for key in ("domain", "account", "channel", "manuscript_version"))
+
+
+def opaque_attachments(ident):
+    return any(not re.fullmatch(f"{index}:sha256:[a-f0-9]{{64}}", value)
+               for index, value in enumerate(ident["attachments"]))
+
+
+def publication_id(ident, *, repeat=False):
+    key = publication(ident)
+    if repeat:
+        key["repeat_approval_reference"] = ident["approval_reference"]
+    raw = json.dumps(key, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return ("repeat-" if repeat else "intent-") + hashlib.sha256(raw).hexdigest()
 
 
 def evidence(value, kind):
@@ -156,6 +178,25 @@ class Ledger:
             state = self._read()
             return copy.deepcopy(self._get(state, op_id) if op_id else state)
 
+    @staticmethod
+    def _same_publication(state, ident, *, include_opaque=False):
+        key = publication(ident)
+        return [
+            item for item in state["operations"].values()
+            if publication(item["identity"]) == key or (
+                include_opaque and manuscript(item["identity"]) == manuscript(ident)
+                and len(item["identity"]["attachments"]) == len(ident["attachments"])
+                and (opaque_attachments(item["identity"]) or opaque_attachments(ident))
+            )
+        ]
+
+    def _prepare(self, state, op_id, ident):
+        record = {"operation_id": op_id, "identity": ident, "status": "PREPARED", "updated_at": "", "result": None, "evidence": None}
+        self._update(record, "PREPARED")
+        state["operations"][op_id] = record
+        self._write(state)
+        return copy.deepcopy(record)
+
     def prepare(self, op_id, **values):
         slug(op_id)
         ident = identity(values)
@@ -166,11 +207,46 @@ class Ledger:
                 if existing["identity"] != ident:
                     raise Blocked("operation identity is immutable; intentional repost requires new approval and operation_id", existing)
                 return copy.deepcopy(existing)
-            record = {"operation_id": op_id, "identity": ident, "status": "PREPARED", "updated_at": "", "result": None, "evidence": None}
-            self._update(record, "PREPARED")
-            state["operations"][op_id] = record
-            self._write(state)
-            return copy.deepcopy(record)
+            if op_id in {publication_id(ident), publication_id(ident, repeat=True)}:
+                raise LedgerError("generated operation IDs must be created through register")
+            matches = self._same_publication(state, ident, include_opaque=True)
+            if matches:
+                raise Blocked("this publication already has an operation; use its recorded ID", matches[0])
+            return self._prepare(state, op_id, ident)
+
+    def register(self, *, repeat=False, verified_legacy_operation=None, **values):
+        ident = identity(values)
+        op_id = publication_id(ident, repeat=repeat)
+        with FileLock(self.transaction):
+            state = self._read()
+            candidates = self._same_publication(state, ident, include_opaque=True)
+            opaque = [item for item in candidates if publication(item["identity"]) != publication(ident)]
+            if verified_legacy_operation is not None:
+                if repeat or len(candidates) != 1 or not opaque or opaque[0]["operation_id"] != verified_legacy_operation:
+                    raise Blocked("the verified legacy ID must be the sole plausible operation for this manuscript")
+                return copy.deepcopy(opaque[0])
+            if opaque:
+                raise Blocked("legacy attachments may describe this publication; compare the original files before registering",
+                              opaque[0] if len(opaque) == 1 else None)
+            existing = state["operations"].get(op_id)
+            if existing:
+                if publication(existing["identity"]) != publication(ident) or (
+                    repeat and existing["identity"]["approval_reference"] != ident["approval_reference"]
+                ):
+                    raise Blocked("generated operation ID has a conflicting identity", existing)
+                return copy.deepcopy(existing)
+            matches = candidates
+            if not repeat:
+                if len(matches) > 1:
+                    raise Blocked("multiple existing operations match; inspect the ledger before submitting")
+                if matches:
+                    return copy.deepcopy(matches[0])
+            else:
+                if not matches or any(item["status"] not in {"VERIFIED", "FAILED_CONFIRMED"} for item in matches):
+                    raise Blocked("explicit repeat requires a prior final result and no unresolved matching operations")
+                if any(item["identity"]["approval_reference"] == ident["approval_reference"] for item in matches):
+                    raise Blocked("explicit repeat requires a new approval reference")
+            return self._prepare(state, op_id, ident)
 
     def begin(self, op_id):
         with FileLock(self.transaction):
@@ -184,6 +260,10 @@ class Ledger:
                 raise Blocked("previous submit may have committed; reconcile, never resubmit", record)
             if record["status"] != "PREPARED":
                 raise Blocked("terminal operation cannot be retried; new approval and operation_id required", record)
+            matches = [item for item in self._same_publication(state, record["identity"], include_opaque=True)
+                       if item["operation_id"] != op_id]
+            if matches and op_id != publication_id(record["identity"], repeat=True):
+                raise Blocked("this publication has another recorded operation; inspect the ledger before submitting", matches[0])
             for other in state["operations"].values():
                 if other["status"] in PENDING and all(other["identity"][key] == record["identity"][key] for key in ("domain", "account")):
                     raise Blocked(f"account is busy with {other['operation_id']}; reconcile it first", record)

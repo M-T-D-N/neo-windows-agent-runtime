@@ -110,7 +110,7 @@ Browser/server versions, dependency pins, profiles and permissions are unchanged
 
 ## Browser replacement and MCP diagnostics
 
-The launcher’s read-only check reports the MCP listener and browser identity
+The launcher’s optional MCP readiness probe reports the listener and browser identity
 separately. Inspect `mcpIdentity.code` and `mcpReadinessError` in the result:
 
 | Code | Observed state |
@@ -264,8 +264,16 @@ retrying navigation or closing. Never replay an input, upload or publish call wh
 result was lost. The local publishing-intent ledger can block a repeated local
 operation; **it is not distributed across PCs and is not an automatic wrapper
 around every site's Publish button**. A publishing workflow must use it explicitly
-and verify the public result before marking success. Keep one publishing PC per
-operation or coordinate state explicitly.
+and verify the public result before marking success. Start with
+`python -B -m web_automation register`, using the same approved manuscript version,
+target and ordered `--attachment-file` inputs across clients. Keep the returned
+ID for `begin` and `reconcile`. Submit only when `begin` succeeds with
+`SUBMITTING`. A `VERIFIED` result carries the existing post. An authorized
+repeat needs `--repeat` and a new approval reference. A plausible older entry
+with opaque attachment identifiers blocks registration. After comparing the
+original ordered file bytes, use `--verified-legacy-operation <id>` to retrieve
+that entry and its saved outcome. Keep one
+publishing PC per operation or coordinate state explicitly.
 
 ## Local editor and publishing-intent check
 
@@ -320,6 +328,14 @@ candidate in `local/scratch/<owned-task>`. It does not promote a new version.
 Keep browser/server/catalog compatibility and task preservation verified before
 switching versions. The bundled launcher disables the upstream installer updater;
 no weekly automation is installed for you.
+
+`runtime/diagnose-neo.ps1` reports local process identity, configured listeners,
+and the Windows registered browser version without opening an MCP session.
+`-ProbeMcp` opts into a temporary readiness session and reports cleanup errors.
+Use `-CheckUpdate` for the feed comparison.
+Optional `-IncidentTime` and `-BrowserPid` select existing Windows process audit
+events. Run `smoke-runtime.py --runtime <isolated-runtime> --client codex|agy`
+from the distribution bundle for a fresh fixture with separate ports and profile.
 
 To remove: finish active requests, preserve unsaved work, close only this dedicated
 browser normally, disconnect only this MCP entry, and verify no exact process is

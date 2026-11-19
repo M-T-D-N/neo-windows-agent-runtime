@@ -116,7 +116,11 @@ function Test-McpEndpointReady {
         return @($result.result.tools | Where-Object {$_.name -eq 'run'}).Count -eq 1
     } catch {$script:mcpReadinessError=$_.Exception.Message;return $false}
     finally {
-        if($session){try {Invoke-NeoOwnedWebRequest -UseBasicParsing -Uri $Endpoint -Method Delete -Headers $headers -TimeoutSec 2 | Out-Null}catch {}}
+        if($session){
+            $headers['Mcp-Session-Id']=$session
+            try {Invoke-NeoOwnedWebRequest -UseBasicParsing -Uri $Endpoint -Method Delete -Headers $headers -TimeoutSec 2 | Out-Null}
+            catch {$script:mcpProbeCleanupErrors+=@($_.Exception.Message)}
+        }
     }
 }
 function Test-McpReady {

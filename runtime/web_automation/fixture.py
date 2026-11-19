@@ -23,6 +23,15 @@ STATIC = Path(__file__).with_name("static")
 IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 
 
+def publication_content(content, uploads):
+    value = {key: val for key, val in content.items() if key != "operation_id"}
+    value["attachments"] = [item["sha256"] for item in content["attachments"]]
+    value["body_html"] = re.sub(r'(<img src=")/api/uploads/([a-f0-9]{32})"',
+                               lambda match: f'{match[1]}sha256:{uploads[match[2]]["sha256"]}"',
+                               content["body_html"])
+    return value
+
+
 class RichHTML(HTMLParser):
     def __init__(self, uploads):
         super().__init__(convert_charrefs=True)
@@ -159,9 +168,14 @@ class Fixture:
             def guard_begin(self, data, state):
                 content = fixture.content(data, state)
                 operation_id = content["operation_id"]
-                fingerprint = hashlib.sha256(json.dumps(content, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
-                fixture.guard.prepare(operation_id, domain="127.0.0.1", account="synthetic-fixture-account", channel="synthetic-fixture-board", manuscript_version=fingerprint, attachments=[item["id"] + ":" + item["sha256"] for item in content["attachments"]], approval_reference="fictional-fixture-request:" + operation_id)
                 if operation_id not in state["intents"]:
+                    canonical = publication_content(content, state["uploads"])
+                    for prior_id, prior in state["intents"].items():
+                        if canonical == publication_content(prior, state["uploads"]):
+                            raise LedgerError(f"publication already guarded by {prior_id}; use its saved result")
+                    fingerprint = hashlib.sha256(json.dumps(canonical, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+                    attachments = [f"{index}:sha256:{digest}" for index, digest in enumerate(canonical["attachments"])]
+                    fixture.guard.prepare(operation_id, domain="127.0.0.1", account="synthetic-fixture-account", channel="synthetic-fixture-board", manuscript_version=fingerprint, attachments=attachments, approval_reference="fictional-fixture-request:" + operation_id)
                     state["intents"][operation_id] = content
                     fixture.write(state)
                 elif state["intents"][operation_id] != content:
