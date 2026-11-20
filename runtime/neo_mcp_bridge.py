@@ -2,16 +2,19 @@
 
 Discovers tools locally; starts the dedicated runtime only for browser work. Only initialization/readiness is
 retried: a dispatched tool call is never replayed, including after response loss.
-The official server owns all tool schemas, results, metadata and browser state.
+The bridge adds local workflow guidance and opt-in content verification.
 """
 from __future__ import annotations
 
 import asyncio
 import copy
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -24,6 +27,7 @@ import httpx
 TOOL_PROTOCOL = "2026-07-28"
 SESSION_META_KEY = "com.browseros.neo/session"
 INVENTORY_META_KEY = "com.workspace.neo/inventory_receipt"
+WINDOW_BLOCK_META_KEY = "com.workspace.neo/window_restore_blocked"
 INVENTORY_PROPERTY = {"type":"string", "minLength":1, "description":
     "After a verified browser reset, echo the inventory_receipt returned by this connection's explicit tabs action=list. Select current page IDs/session from that result and issue a new request; never replay an old page request."}
 RECONNECT_GUIDANCE = (
@@ -33,6 +37,48 @@ RECONNECT_GUIDANCE = (
     'action returns NEO_RECONNECT_INITIALIZED with only a fresh tab catalog: requestedActionExecuted=false. '
     'It never executes or replays that original action. Select current IDs/session and construct a new '
     'request using that connection\'s inventory_receipt. Check/outputs never launch Neo. ')
+HOST_RECONNECT_GUIDANCE = (
+    'If even local MCP calls fail with Transport closed, use this host’s supported MCP '
+    'reconnect (mcp_control.restart where available), then verify from this same chat. '
+    'A running browser does not prove this client is connected. Never replay an '
+    'unconfirmed dispatched action. ')
+HELP_TOOLS = {'request_human_help', 'await_human_help'}
+HELP_WAIT_GUIDANCE = (
+    'Status: waiting. The request remains open and page work is paused. In Neo’s cockpit, select this '
+    'request, take control if needed, and choose “Hand back to the agent” after completing '
+    'the step. If Neo is in the tray, open its existing window to see the request; '
+    'if Windows is locked, return after unlocking. Signing in or replying in chat does not return Neo control. Tell the user '
+    'how to hand back control and yield this turn. On their return, await this same request '
+    'in the same Neo session once. Do not loop, open another request or delete the group. '
+    'Resume only after status resolved and a fresh page check.')
+HELP_WAIT_TEXT = re.compile(
+    r'Still waiting for a human \(\d+s so far\)\. Call await_human_help to keep waiting; do nothing else on the page\.'
+    r'|The wait call ended before a human responded\. Call await_human_help to keep waiting; do nothing else on the page\.')
+UPSTREAM_HELP_POLLING = (
+    'It returns a status: while it is "waiting", call await_human_help again and\n'
+    'do nothing else on the page; stop waiting only when the status is "resolved" (a\n'
+    'human handed control back, continue the task), "cancelled", or "timed_out".')
+READ_FRAME = re.compile(r'^\[UNTRUSTED_PAGE_CONTENT nonce=([a-f0-9]{16}) origin=[^\n]*\][^\n]*\n')
+READ_CONTENT_PROPERTY = {'type': 'boolean', 'description':
+    'Require nonempty rendered content for a markdown/text read. Use with a selector for the expected '
+    'page region. If Neo cannot verify content, inspect the current tab and page state, including '
+    'dialogs or an explicit empty-state message. This check does not navigate or reload.'}
+NAVIGATION_RESTORE_BLOCKS = {
+    'Ambiguous normal windows; no automatic restoration': 'multiple_windows',
+    'Cannot identify one existing native browser window': 'window_identity_unavailable',
+    'Native browser window was replaced or became ambiguous; no action dispatched': 'window_identity_changed',
+    'Foreground unavailable or changed; leave window untouched': 'foreground_unavailable',
+    'Foreground changed during background placement; no show dispatched': 'foreground_changed',
+    'Non-activating restore failed': 'restore_failed',
+    'Non-activating restoration not confirmed; action not dispatched': 'restore_unverified',
+}
+NAVIGATION_RESTORE_GUIDANCE = (
+    'NEO_WINDOW_RESTORE_BLOCKED: Neo reached the browser, and navigation was stopped before dispatch. '
+    'Keep the existing task tab. Use tabs list/read to check the same physical page. '
+    'If the task window is still inaccessible, restore that existing window from the tray or resume '
+    'after Windows is unlocked. When the window is available, select the current page and issue a fresh '
+    'navigation request. Preserve the original tab and do not restart MCP or create a replacement for '
+    'this status alone.')
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT.parent))
@@ -42,6 +88,72 @@ from neo_cleanup import CleanupPolicy, TOOL as CLEANUP_TOOL, TOOL_NAME as CLEANU
 from neo_task_state import TaskState
 from neo_tab_identity import credential_bearing_url, other_owner
 from neo_transport import BrowserRecordStale, OwnedEndpointTransition
+
+
+def apply_result_guidance(name, upstream, require_content):
+    content = upstream.get('content') or []
+    if upstream.get('isError'):
+        # Only the dedicated navigation tool can certify one action was skipped.
+        # A failed run may have executed earlier effects before reaching this guard.
+        first = content[0] if content else {}
+        prefix = 'navigate failed: '
+        if name == 'navigate' and first.get('type') == 'text' and first.get('text', '').startswith(prefix):
+            reason = NAVIGATION_RESTORE_BLOCKS.get(first['text'][len(prefix):])
+            if reason:
+                upstream.setdefault('_meta', {})[WINDOW_BLOCK_META_KEY] = {
+                    'reason': reason, 'requestedActionExecuted': False}
+                content.append({'type': 'text', 'text': NAVIGATION_RESTORE_GUIDANCE})
+        return
+    if name in HELP_TOOLS:
+        structured = upstream.get('structuredContent') or {}
+        waiting = isinstance(structured, dict) and structured.get('status') == 'waiting'
+        for block in content:
+            if block.get('type') == 'text' and HELP_WAIT_TEXT.fullmatch(block.get('text', '')):
+                block['text'] = HELP_WAIT_GUIDANCE
+                return
+        if waiting:
+            upstream.setdefault('content', []).append({'type': 'text', 'text': HELP_WAIT_GUIDANCE})
+    if name != 'read' or not require_content:
+        return
+    for block in content:
+        if block.get('type') != 'text':
+            continue
+        text = block.get('text', '')
+        start = READ_FRAME.match(text)
+        if start:
+            end = text.find(f'\n[END_UNTRUSTED_PAGE_CONTENT nonce={start[1]}]', start.end())
+            if end >= 0 and text[start.end():end].strip() not in ('', '(empty)'):
+                return
+    upstream['isError'] = True
+    upstream.setdefault('content', []).append({'type': 'text', 'text':
+        'NEO_CONTENT_UNVERIFIED: The read did not verify nonempty rendered content. Keep the '
+        'same physical tab and inspect the result above, the expected page region, and any '
+        'pending dialog. A successful navigation or PDF does not prove the destination '
+        'loaded. Do not count a blank page as an empty list or repeat print/save.'})
+
+
+def record_bridge_exit(log_root, client, task_id, started_at, reason, active_tool_handlers):
+    """Keep bounded, sanitized last-exit evidence, even on a forced stdio exit."""
+    try:
+        task = str(uuid.UUID(task_id)) if task_id else None
+    except ValueError:
+        task = None
+    slot = f'{sha256(task.encode("ascii")).digest()[0] % 64:02d}' if task else 'unbound'
+    # The task UUID only selects a bounded slot. The handler count excludes
+    # completed handlers whose responses may have been lost at the host pipe.
+    record = {'time_utc': datetime.now(timezone.utc).isoformat(),
+              'started_at_utc': started_at, 'pid': os.getpid(), 'parent_pid': os.getppid(),
+              'client': client, 'reason': reason, 'active_tool_handlers': active_tool_handlers}
+    try:
+        log_root.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(log_root / f'bridge-exit-{client}-{slot}.json',
+                          json.dumps(record, separators=(',', ':')) + '\n', backup_count=0)
+    except Exception:
+        # Diagnostics must not prevent teardown or write to the MCP output pipe.
+        try:
+            print(f'NEO_BRIDGE_EXIT: {reason} (exit record unavailable)', file=sys.stderr, flush=True)
+        except OSError:
+            pass
 
 
 class UpstreamError(Exception):
@@ -72,6 +184,8 @@ if sys.platform == "win32":
         process. Exit rather than retrying requests or waiting for blocked stdin
         executor shutdown. This hook is local to the bridge, not shared Python.
         """
+        on_wakeup_eof: Callable[[], None] | None = None
+
         def _loop_self_reading(self, f=None):
             if (f is not None and f is self._self_reading_future
                     and f.done() and not f.cancelled()):
@@ -82,11 +196,15 @@ if sys.platform == "win32":
                     pass
                 else:
                     if data == b"":
-                        print("NEO_LOOP_CHANNEL_CLOSED: Windows internal socket reached EOF; "
-                              "bridge exiting to prevent CPU spin. Dispatched actions "
-                              "must be inspected before retry; nothing is replayed.",
-                              file=sys.stderr, flush=True)
-                        os._exit(75)
+                        try:
+                            if self.on_wakeup_eof:
+                                self.on_wakeup_eof()
+                            print("NEO_LOOP_CHANNEL_CLOSED: Windows internal socket reached EOF; "
+                                  "bridge exiting to prevent CPU spin. Dispatched actions "
+                                  "must be inspected before retry; nothing is replayed.",
+                                  file=sys.stderr, flush=True)
+                        finally:
+                            os._exit(75)
             super()._loop_self_reading(f)
 
 
@@ -741,7 +859,9 @@ class Bridge:
                     self.initialize = message
                     value = copy.deepcopy(self.catalog['initialize'])
                     value['protocolVersion'] = message['params']['protocolVersion']
-                    value['instructions'] = RECONNECT_GUIDANCE + 'Workspace rules take precedence over the generic upstream tab advice below: resume prior recorded task tabs before opening any new tab. Reuse existing task tabs, and register actually reused business tabs with workspace_cleanup use/pageIds/reason; check mine plus registered physical targets at completion. Use/defer never grant close rights. ' + value.get('instructions','')
+                    upstream_instructions = value.get('instructions','').replace(
+                        UPSTREAM_HELP_POLLING, HELP_WAIT_GUIDANCE)
+                    value['instructions'] = RECONNECT_GUIDANCE + HOST_RECONNECT_GUIDANCE + 'Workspace rules take precedence over the generic upstream tab advice below: resume prior recorded task tabs before opening any new tab. Reuse existing task tabs, and register actually reused business tabs with workspace_cleanup use/pageIds/reason; check mine plus registered physical targets at completion. Use/defer never grant close rights. For human-help waiting, follow the returned hand-back guidance rather than polling continuously. ' + upstream_instructions
                     if self.cleanup.task_id:
                         value['instructions'] = f'Workspace task_id={self.cleanup.task_id} is already bound. Reuse prior recorded pages. Before final response call workspace_cleanup check including registered used targets; close disposable mine tabs, retain only specific next use or unsaved/pending work, and verify absence. For retain/release pass pageIds as an integer array, not page_id or pages; retain also requires a concrete reason. Every cleanup call requires task_id and has no session argument. ' + value['instructions']
                     result = {'jsonrpc':'2.0', 'id':message['id'], 'result':value}
@@ -753,11 +873,23 @@ class Bridge:
                 # Reclaim is an internal ledger-validated recovery operation, not
                 # an agent-selected way to acquire arbitrary existing groups.
                 for tool in value['tools']:
-                    if tool.get('name') == 'tabs':
+                    name = tool.get('name')
+                    properties = tool.setdefault('inputSchema', {}).setdefault('properties', {})
+                    properties['inventory_receipt'] = copy.deepcopy(INVENTORY_PROPERTY)
+                    if name in HELP_TOOLS:
+                        tool['description'] = (
+                            'Request help in the Neo cockpit.' if name == 'request_human_help'
+                            else 'Check the same open Neo cockpit request after the user returns.')
+                        tool['description'] += (
+                            ' To return control, the user chooses “Hand back to the agent”. '
+                            'If still waiting, tell the user and yield; resume only after resolved.')
+                    if name == 'read':
+                        properties['requireContent'] = copy.deepcopy(READ_CONTENT_PROPERTY)
+                    if name == 'pdf':
+                        tool['description'] += (' PDF success covers only this page. Before continuing on a '
+                                                'different page, verify that page’s expected content separately.')
+                    if name == 'tabs':
                         tool['description'] = RECONNECT_GUIDANCE + tool.get('description', '')
-                    tool.setdefault('inputSchema', {}).setdefault('properties', {})['inventory_receipt'] = copy.deepcopy(INVENTORY_PROPERTY)
-                    if tool.get('name') == 'tabs':
-                        properties = tool.get('inputSchema', {}).get('properties', {})
                         action = properties.get('action', {})
                         if isinstance(action.get('enum'), list):
                             action['enum'] = [item for item in action['enum'] if item not in ('reclaim','reclaim_expired','reclaim_restored')]
@@ -813,6 +945,9 @@ class Bridge:
                         requires_receipt = current_reset_id or self.endpoint_epoch
                         params = dict(message.get("params") or {})
                         args = dict(params.get("arguments") or {})
+                        require_content = args.pop('requireContent', False) if params.get('name') == 'read' else False
+                        if type(require_content) is not bool or (require_content and args.get('format', 'markdown') not in ('markdown', 'text')):
+                            raise ValueError('requireContent must be a boolean and requires a markdown/text read')
                         inventory_receipt = args.pop('inventory_receipt', None)
                         if inventory_receipt is not None and (not isinstance(inventory_receipt,str) or not inventory_receipt):
                             raise ValueError('inventory_receipt must be a nonempty string')
@@ -898,7 +1033,8 @@ class Bridge:
                         if isinstance(handle, str) and handle:
                             self.tool_session = handle
                             self.consume_reset_receipt()
-                        upstream = (result or {}).get("result") or {}
+                        upstream = (result or {}).get("result", {})
+                        apply_result_guidance(params.get('name'), upstream, require_content)
                         if (inventory_only and params.get('name')=='tabs' and isinstance(result,dict)
                                 and 'result' in result and 'error' not in result and not upstream.get('isError')
                                 and any(c.get('type')=='text' and c.get('text','').strip() for c in upstream.get('content',[]))):
@@ -1136,10 +1272,24 @@ class Bridge:
         await self.client.aclose()
 
 
-async def main():
-    plan = json.loads((ROOT / "runtime-plan.json").read_text(encoding="utf-8"))
+async def main(plan_path=ROOT / "runtime-plan.json"):
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    started_at = datetime.now(timezone.utc).isoformat()
+
+    def record_exit(reason):
+        record_bridge_exit(Path(plan['server_state_root']) / 'logs', args.client,
+                           bridge.cleanup.task_id, started_at, reason, len(bridge.active_tools))
+
     def emit(message):
-        print(json.dumps(message, ensure_ascii=False, separators=(",", ":")), flush=True)
+        try:
+            print(json.dumps(message, ensure_ascii=False, separators=(",", ":")), flush=True)
+        except OSError:
+            # No JSON-RPC response can reach the host. Stop once even if its
+            # input pipe is still open; waiting for that pipe can strand us.
+            try:
+                record_exit('host_stdout_write_failed')
+            finally:
+                os._exit(74)
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--task-id', default=os.environ.get('WORKSPACE_NEO_TASK_ID') or os.environ.get('CODEX_THREAD_ID'))
@@ -1152,9 +1302,20 @@ async def main():
     bridge = Bridge(plan["mcp_endpoint"], emit, startup_seconds=55, catalog=catalog,
                     endpoint_guard=lambda endpoint: transport_browser_identity(plan, endpoint),
                     state_root=Path(plan['ledger_root']) / 'task-tabs' / args.client, task_id=args.task_id)
+    loop = asyncio.get_running_loop()
+    if sys.platform == 'win32' and isinstance(loop, GuardedProactorEventLoop):
+        loop.on_wakeup_eof = lambda: record_exit('windows_loop_wakeup_eof')
     pending: set[asyncio.Task] = set()
     try:
-        while line := await asyncio.to_thread(sys.stdin.buffer.readline):
+        while True:
+            try:
+                line = await asyncio.to_thread(sys.stdin.buffer.readline)
+            except OSError:
+                record_exit('host_stdin_read_failed')
+                raise
+            if not line:
+                record_exit('host_stdin_eof')
+                break
             try:
                 message = json.loads(line)
                 if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
@@ -1173,6 +1334,8 @@ async def main():
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
         await bridge.close()
+        if sys.platform == 'win32' and isinstance(loop, GuardedProactorEventLoop):
+            loop.on_wakeup_eof = None
 
 
 if __name__ == "__main__":

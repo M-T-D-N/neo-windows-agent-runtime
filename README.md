@@ -134,6 +134,13 @@ bridge retries MCP readiness briefly. The same rule covers the gap between
 the old browser exiting and its replacement acquiring CDP. That request does
 not invoke the launcher if the existing listener disappears during the wait.
 
+For a closed stdio connection, correlate `logs/bridge-exit-<client>-<slot>.json`
+in the server state directory with the Claw logs using the UTC time and PID.
+Exit records retain a reason and process identifiers, with one record per slot.
+The task UUID is used only to choose a slot. `active_tool_handlers` counts
+handlers still running at exit. Even a zero count can accompany a lost response
+to a completed action. Verify the result before retrying an uncertain action.
+
 When Windows process auditing was enabled at the time of the incident, run
 the following in an elevated Windows PowerShell from the installation root.
 Use the affected installation's plan and replace the timestamp and PIDs.

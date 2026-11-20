@@ -31,6 +31,12 @@ or change permissions.
    user authorization. Dismiss `beforeunload` unless unsaved contents are safely
    saved/recovered or their loss is explicitly authorized. A timeout/response loss
    is uncertain; inspect actual results and never replay a dispatched publish call.
+   When Neo human help returns `waiting`, tell the user to choose **Hand back to
+   the agent** in the Neo cockpit and yield. After the user returns, check that
+   same request in the same session once. Resume after `resolved` and a fresh
+   page check. PDF success covers its own tab. For a required section on the
+   working tab, use `read` with its selector and `requireContent: true`. An
+   unverified read requires checking the tab, dialog or explicit empty state.
 6. At completion, close only this task's disposable owned tabs, verify absence,
    and call `workspace_cleanup check`. Preserve unsaved/pending work and concrete
    next-use pages, giving a reason with retain/defer. Check registered used pages
@@ -56,6 +62,9 @@ not bypass this by creating or activating a window. After an incarnation/snapsho
 session mismatch, inspect current inventory and obtain a fresh snapshot before a
 new request. Same-HWND hiding is tested separately from a tray replacing the HWND;
 first browser launch is outside this restoration guarantee.
+`NEO_WINDOW_RESTORE_BLOCKED` means a single navigation was stopped before dispatch.
+Check the existing page read-only. If needed, resume after the existing task
+window is restored from the tray or Windows is unlocked.
 
 The `CleanupPlan:` JSON is included in MCP text. This tool has no output schema,
 so wire conversion omits `structuredContent`; do not depend on that field. The

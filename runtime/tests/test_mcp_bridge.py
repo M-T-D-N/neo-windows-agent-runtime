@@ -4,12 +4,13 @@ import sys
 import subprocess
 import os
 from pathlib import Path
+import tempfile
 import unittest
 
 import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from neo_mcp_bridge import Bridge, SESSION_META_KEY, TOOL_PROTOCOL, UpstreamError
+from neo_mcp_bridge import Bridge, SESSION_META_KEY, TOOL_PROTOCOL, UpstreamError, WINDOW_BLOCK_META_KEY
 import neo_mcp_bridge
 
 INIT = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
@@ -19,14 +20,83 @@ CALL = {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
         "params": {"name": "run", "arguments": {"code": "return 1"}}}
 
 class StdioEncodingTests(unittest.TestCase):
+    def start_isolated_bridge(self, root, task_id=None):
+        plan = root / 'runtime-plan.json'
+        plan.write_text(json.dumps({
+            'mcp_endpoint': 'http://127.0.0.1:1/mcp',
+            'server_override': {'sha256': json.loads(
+                (Path(neo_mcp_bridge.__file__).parent / 'official-tools.json').read_text(encoding='utf-8')
+            )['server_sha256']},
+            'ledger_root': str(root / 'ledger'),
+            'server_state_root': str(root / 'server'),
+        }), encoding='utf-8')
+        environment = dict(os.environ, PYTHONUTF8='0', PYTHONIOENCODING='cp949')
+        environment.pop('WORKSPACE_NEO_TASK_ID', None)
+        environment.pop('CODEX_THREAD_ID', None)
+        program = """
+import asyncio, sys
+from pathlib import Path
+import neo_mcp_bridge as neo
+plan = Path(sys.argv.pop(1))
+sys.stdout.reconfigure(encoding='utf-8')
+sys.stderr.reconfigure(encoding='utf-8')
+with asyncio.Runner(loop_factory=getattr(neo, 'GuardedProactorEventLoop', None)) as runner:
+    runner.run(neo.main(plan))
+"""
+        command = [sys.executable, '-B', '-c', program, str(plan), '--client', 'agy']
+        if task_id:
+            command.extend(['--task-id', task_id])
+        return subprocess.Popen(command,
+                                cwd=Path(neo_mcp_bridge.__file__).parent, env=environment,
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
     def test_real_initialize_uses_utf8_even_with_windows_legacy_encoding(self):
-        environment=dict(os.environ,PYTHONUTF8='0',PYTHONIOENCODING='cp949')
-        result=subprocess.run([sys.executable,'-B',str(Path(neo_mcp_bridge.__file__)),'--client','agy'],
-            input=(json.dumps(INIT)+'\n').encode('utf-8'),capture_output=True,env=environment,timeout=15)
-        self.assertEqual(result.returncode,0,result.stderr.decode('utf-8'))
-        reply=json.loads(result.stdout.decode('utf-8'))
-        self.assertNotIn('error',reply)
-        self.assertEqual(reply['result']['serverInfo']['name'],'browseros-neo')
+        with tempfile.TemporaryDirectory(dir=os.environ.get('WEB_AUTOMATION_TEST_ROOT')) as folder:
+            root = Path(folder)
+            with self.start_isolated_bridge(root) as process:
+                try:
+                    stdout, stderr = process.communicate((json.dumps(INIT) + '\n').encode('utf-8'), timeout=15)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate()
+                    raise
+                self.assertEqual(process.returncode, 0, stderr)
+                reply = json.loads(stdout.decode('utf-8'))
+                self.assertNotIn('error', reply)
+                self.assertEqual(reply['result']['serverInfo']['name'], 'browseros-neo')
+                record = json.loads((root / 'server/logs/bridge-exit-agy-unbound.json').read_text(encoding='utf-8'))
+                self.assertEqual(record['reason'], 'host_stdin_eof')
+                # On Windows a virtualenv redirector may be the direct parent.
+                self.assertIn(process.pid, (record['pid'], record['parent_pid']))
+                self.assertEqual(record['active_tool_handlers'], 0)
+
+    def test_closed_host_output_logs_bound_exit_without_request_contents(self):
+        task_id = 'c858215e-f9cc-4376-bca1-cfd82896f849'
+        marker = 'SYNTHETIC_PRIVATE_TOOL_INPUT'
+        request = {'jsonrpc': '2.0', 'id': 4, 'method': 'tools/call', 'params': {
+            'name': 'workspace_cleanup', 'arguments': {'action': 'begin', 'task_id': task_id},
+            '_meta': {'clientContext': marker}}}
+        with tempfile.TemporaryDirectory(dir=os.environ.get('WEB_AUTOMATION_TEST_ROOT')) as folder:
+            root = Path(folder)
+            with self.start_isolated_bridge(root, task_id) as process:
+                try:
+                    process.stdout.close()
+                    process.stdin.write((json.dumps(request) + '\n').encode('utf-8'))
+                    process.stdin.flush()
+                    self.assertEqual(process.wait(timeout=15), 74)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                log, = (root / 'server/logs').glob('bridge-exit-agy-*.json')
+                self.assertRegex(log.name, r'^bridge-exit-agy-(0[0-9]|[1-5][0-9]|6[0-3])\.json$')
+                raw = log.read_text(encoding='utf-8')
+                self.assertNotIn(task_id, raw)
+                self.assertNotIn(marker, raw)
+                record = json.loads(raw)
+                self.assertEqual(set(record), {'time_utc', 'started_at_utc', 'pid', 'parent_pid',
+                                               'client', 'reason', 'active_tool_handlers'})
+                self.assertEqual(record['reason'], 'host_stdout_write_failed')
+                self.assertEqual(record['active_tool_handlers'], 0)
 
 
 def response(request, result=None, status=200, session="first"):
@@ -564,6 +634,142 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await bridge.handle(CALL)
         self.assertEqual(calls, ["ping", "initialize", "tools/call"])
         self.assertFalse(output[-1]["result"].get("isError", False))
+
+    async def test_help_wait_explains_handback_on_same_session_and_preserves_resolution(self):
+        body = 'Still waiting for a human (75s so far). Call await_human_help to keep waiting; do nothing else on the page.'
+        calls = []
+        def handler(request):
+            message = json.loads(request.content)
+            if message['method'] == 'ping':
+                return response(request)
+            params = message['params']
+            calls.append(params)
+            result = {'content': [{'type': 'text', 'text': body}], '_meta': {SESSION_META_KEY: 'same-help-session'}}
+            if params['name'] == 'await_human_help':
+                result['structuredContent'] = {'status': 'resolved', 'requestId': 'request-1'}
+                result['content'][0]['text'] = 'The human handed control back.'
+            return response(request, result)
+        bridge, output = await self.make_bridge(handler)
+        await bridge.handle(INIT)
+        instructions = output[-1]['result']['instructions']
+        self.assertIn('Hand back to the agent', instructions)
+        self.assertNotIn('call await_human_help again', instructions)
+        await bridge.handle({'jsonrpc': '2.0', 'id': 3, 'method': 'tools/list'})
+        tools = {tool['name']: tool for tool in output[-1]['result']['tools']}
+        self.assertIn('Hand back to the agent', tools['await_human_help']['description'])
+        await bridge.handle(dict(CALL, params={'name': 'request_human_help', 'arguments': {'reason': 'Sign in'}}))
+        waiting = output[-1]['result']
+        self.assertIn('Hand back to the agent', waiting['content'][0]['text'])
+        self.assertIn('yield this turn', waiting['content'][0]['text'])
+        self.assertEqual(waiting['_meta'][SESSION_META_KEY], 'same-help-session')
+        self.assertEqual([item['name'] for item in calls], ['request_human_help'])
+        await bridge.handle(dict(CALL, params={'name': 'await_human_help', 'arguments': {'requestId': 'request-1'}}))
+        self.assertEqual(calls[-1]['arguments']['requestId'], 'request-1')
+        self.assertEqual(calls[-1]['arguments']['session'], 'same-help-session')
+        self.assertEqual(output[-1]['result']['structuredContent']['status'], 'resolved')
+
+    async def test_pdf_result_does_not_validate_a_different_empty_tab(self):
+        nonce = '0123456789abcdef'
+        expected_shell = 'No sent messages'
+        reads = iter(('(empty)', expected_shell, '(empty)'))
+        calls = []
+        def handler(request):
+            message = json.loads(request.content)
+            if message['method'] == 'ping':
+                return response(request)
+            params = message['params']
+            calls.append((params['name'], params['arguments']))
+            if params['name'] == 'pdf':
+                body = 'PDF saved successfully'
+            else:
+                body = (f'[UNTRUSTED_PAGE_CONTENT nonce={nonce} origin=about:blank] Notice\n'
+                        f'{next(reads)}\n[END_UNTRUSTED_PAGE_CONTENT nonce={nonce}]')
+            return response(request, {'content': [{'type': 'text', 'text': body}],
+                                      '_meta': {SESSION_META_KEY: 'same-tabs'}})
+        bridge, output = await self.make_bridge(handler)
+        await bridge.handle(INIT)
+        await bridge.handle(dict(CALL, params={'name': 'pdf', 'arguments': {'page': 6}}))
+        self.assertIn('PDF saved', output[-1]['result']['content'][0]['text'])
+        read = dict(CALL, params={'name': 'read', 'arguments': {'page': 5, 'selector': '#sent', 'requireContent': True}})
+        await bridge.handle(read)
+        blank = output[-1]['result']
+        self.assertTrue(blank['isError'])
+        self.assertIn('NEO_CONTENT_UNVERIFIED', blank['content'][-1]['text'])
+        self.assertEqual(blank['_meta'][SESSION_META_KEY], 'same-tabs')
+        await bridge.handle(read)
+        self.assertFalse(output[-1]['result'].get('isError'))
+        self.assertIn(expected_shell, output[-1]['result']['content'][0]['text'])
+        await bridge.handle(dict(CALL, params={'name': 'read', 'arguments': {'page': 5}}))
+        self.assertFalse(output[-1]['result'].get('isError'))
+        self.assertEqual([(name, args['page']) for name, args in calls],
+                         [('pdf', 6), ('read', 5), ('read', 5), ('read', 5)])
+        self.assertTrue(all('requireContent' not in args for _, args in calls))
+
+    async def test_event_404_and_lost_http_session_keep_the_host_transport_alive(self):
+        observations = []
+        def handler(request):
+            if request.method == 'GET':
+                observations.append('event-get')
+                return httpx.Response(404)
+            message = json.loads(request.content)
+            method = message['method']
+            observations.append(method)
+            if method == 'ping' and request.headers.get('Mcp-Session-Id') == 'old':
+                return httpx.Response(404)
+            if method == 'initialize':
+                return response(request, {'protocolVersion': '2025-06-18'}, session='restored')
+            return response(request, {'content': [{'type': 'text', 'text': 'ok'}]}, session='restored')
+        bridge, output = await self.make_bridge(handler)
+        await bridge.handle(INIT)
+        bridge.session = 'old'
+        await bridge.events('old')
+        await bridge.handle({'jsonrpc': '2.0', 'id': 3, 'method': 'ping'})
+        self.assertEqual(output[-1], {'jsonrpc': '2.0', 'id': 3, 'result': {}})
+        await bridge.handle(CALL)
+        self.assertEqual(observations[:4], ['event-get', 'ping', 'initialize', 'tools/call'])
+        self.assertEqual(observations.count('tools/call'), 1)
+        self.assertFalse(output[-1]['result'].get('isError'))
+
+    async def test_window_restore_block_identifies_undispatched_navigation_only(self):
+        cases = [
+            ('navigate', 'navigate failed: Ambiguous normal windows; no automatic restoration', 'multiple_windows'),
+            ('navigate', 'navigate failed: Non-activating restoration not confirmed; action not dispatched',
+             'restore_unverified'),
+            ('navigate', 'navigate failed: Foreground unavailable or changed; leave window untouched',
+             'foreground_unavailable'),
+            ('navigate', 'navigate failed: upstream connection ended', None),
+            ('run', 'navigate failed: Ambiguous normal windows; no automatic restoration', None),
+        ]
+        next_result = iter(cases)
+        dispatches = []
+        def handler(request):
+            message = json.loads(request.content)
+            if message['method'] == 'ping':
+                return response(request)
+            name, raw_error, _ = next(next_result)
+            self.assertEqual(message['params']['name'], name)
+            dispatches.append(name)
+            return response(request, {
+                'isError': True, 'content': [{'type': 'text', 'text': raw_error}],
+                '_meta': {SESSION_META_KEY: 'same-tray-session'},
+            })
+        bridge, output = await self.make_bridge(handler)
+        await bridge.handle(INIT)
+        for name, raw_error, reason in cases:
+            args = {'page': 5, 'url': 'about:blank'} if name == 'navigate' else {'code': 'return 1'}
+            await bridge.handle(dict(CALL, params={'name': name, 'arguments': args}))
+            result = output[-1]['result']
+            self.assertTrue(result['isError'])
+            self.assertEqual(result['content'][0]['text'], raw_error)
+            self.assertEqual(result['_meta'][SESSION_META_KEY], 'same-tray-session')
+            if reason:
+                self.assertEqual(result['_meta'][WINDOW_BLOCK_META_KEY],
+                                 {'reason': reason, 'requestedActionExecuted': False})
+                self.assertIn('NEO_WINDOW_RESTORE_BLOCKED', result['content'][-1]['text'])
+            else:
+                self.assertNotIn(WINDOW_BLOCK_META_KEY, result['_meta'])
+                self.assertEqual(len(result['content']), 1)
+        self.assertEqual(dispatches, [case[0] for case in cases])
 
     async def test_other_preflight_422_is_not_treated_as_session_expiry(self):
         calls = []
