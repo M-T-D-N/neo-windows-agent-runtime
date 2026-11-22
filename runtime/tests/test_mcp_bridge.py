@@ -500,12 +500,12 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         from unittest.mock import AsyncMock
         bridge,out=await self.make_bridge(lambda request:self.fail('must not forward a mismatched external request id'))
         entered=asyncio.Event()
-        async def wait(message):
+        async def wait(message, *, operation_guard, arrival_retirement_id):
             entered.set();await asyncio.Event().wait()
         bridge.cleanup_call=AsyncMock(side_effect=wait)
         task=asyncio.create_task(bridge.handle(dict(jsonrpc='2.0',id=70,method='tools/call',
             params=dict(name='workspace_cleanup',arguments=dict(action='resume',task_id='00000000-0000-4000-8000-000000000001')))))
-        await entered.wait()
+        await asyncio.wait_for(entered.wait(), timeout=2)
         await bridge.handle(dict(jsonrpc='2.0',method='notifications/cancelled',params=dict(requestId=70)))
         with self.assertRaises(asyncio.CancelledError):await task
         self.assertNotIn(70,bridge.active_tools)

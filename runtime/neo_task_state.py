@@ -33,28 +33,43 @@ class TaskState:
         ensure_no_reparse_components(path)
         if self.record is not None and path.exists():
             fresh = json.loads(path.read_text(encoding='utf-8'))
+            self._validate_record(fresh, task_id)
             reset = fresh.get('browser_reset_id')
-            if reset is not None and (reset != self.record.get('browser_reset_id') or
-                    self.record.get('browser_reset_pending') is True and fresh.get('browser_reset_pending') is False):
-                self._validate_reset(fresh, task_id)
+            if (fresh.get('retirement_id') != self.record.get('retirement_id')
+                    or reset is not None and (reset != self.record.get('browser_reset_id') or
+                    self.record.get('browser_reset_pending') is True and fresh.get('browser_reset_pending') is False)):
                 fresh['outputs'] = self._merge_outputs(self.record, fresh)
                 self.record = fresh
         if self.record is None:
             fresh = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {
                 'schema_version': 1, 'task_id': task_id, 'session': None, 'pages': [], 'groups': [], 'retained': []}
-            if fresh.get('schema_version') != 1 or fresh.get('task_id') != task_id:
-                raise ValueError("Invalid/future task binding; preserve it for inspection")
-            if fresh.get('browser_reset_id') is not None or fresh.get('browser_reset_pending'):
-                self._validate_reset(fresh, task_id)
+            self._validate_record(fresh, task_id)
             self.record = fresh
         return self.record
+
+    @classmethod
+    def _validate_record(cls, record, task_id):
+        if (not isinstance(record, dict) or record.get('task_id') != task_id
+                or type(record.get('schema_version')) is not int or record['schema_version'] not in (1, 2)):
+            raise ValueError("Invalid/future task binding; preserve it for inspection")
+        receipt = record.get('retirement_id')
+        history = record.get('retired_bindings')
+        if record['schema_version'] == 2:
+            if (not isinstance(receipt, str) or str(uuid.UUID(receipt)) != receipt
+                    or not isinstance(history, list) or not history
+                    or not isinstance(history[-1], dict) or history[-1].get('id') != receipt):
+                raise ValueError('Invalid task retirement evidence; preserve it for inspection')
+        elif receipt is not None or history is not None:
+            raise ValueError('Unexpected retirement evidence on legacy task binding')
+        if record.get('browser_reset_id') is not None or record.get('browser_reset_pending'):
+            cls._validate_reset(record, task_id)
 
     @staticmethod
     def _validate_reset(record, task_id):
         reset = record.get('browser_reset_id')
         if (not isinstance(reset, str) or str(uuid.UUID(reset)) != reset
                 or record.get('browser_reset_verified') is not True
-                or record.get('schema_version') != 1 or record.get('task_id') != task_id):
+                or record.get('task_id') != task_id):
             raise ValueError('Invalid administrator reset evidence; preserve task bindings')
         pending = record.get('browser_reset_pending')
         if pending is True:
@@ -131,10 +146,11 @@ class TaskState:
         self._write_record(updated, consume_reset=True)
         self.record=updated
 
-    def _write_record(self, record=None, *, administrator_reset=False, consume_reset=False, expected_state=None, operation_guard=None):
-        if administrator_reset:
+    def _write_record(self, record=None, *, administrator_reset=False, consume_reset=False,
+                      retire_binding=False, expected_state=None, operation_guard=None):
+        if administrator_reset or retire_binding:
             if not isinstance(operation_guard,OperationBoundary):
-                raise ValueError('Administrator reset requires the profile exclusive operation boundary')
+                raise ValueError('Task administration requires the profile exclusive operation boundary')
             operation_guard.require_exclusive(self.browser_operation().path)
         target = self.root / (self.task_id + '.json')
         ensure_no_reparse_components(target)
@@ -144,14 +160,22 @@ class TaskState:
         # survive every task-state update, including administrator close-all.
         with _file_lock(target.with_suffix('.update'), timeout=5):
             disk = json.loads(target.read_text(encoding='utf-8')) if target.exists() else {}
-            if disk and (disk.get('task_id') != self.task_id or disk.get('schema_version') != 1):
-                raise ValueError('Foreign task record; preserve it')
+            if disk:
+                self._validate_record(disk, self.task_id)
+            self._validate_record(updated, self.task_id)
+            if administrator_reset or retire_binding:
+                if not isinstance(expected_state,dict) or disk != expected_state:
+                    boundary = 'closure verification' if administrator_reset else 'verification'
+                    raise ValueError(f'Task changed since {boundary}; preserve current browser bindings')
+            if retire_binding:
+                if updated.get('retirement_id') == disk.get('retirement_id'):
+                    raise ValueError('Task retirement receipt was already issued')
+            elif disk.get('retirement_id') != updated.get('retirement_id'):
+                raise ValueError('Task retirement changed in another connection; bind before writing')
             if administrator_reset:
                 self._validate_reset(updated, self.task_id)
                 if updated.get('browser_reset_pending') is not True:
                     raise ValueError('Administrator reset must start with a closed pending receipt')
-                if not isinstance(expected_state,dict) or disk != expected_state:
-                    raise ValueError('Task changed since closure verification; preserve current browser bindings')
                 if disk.get('browser_reset_id') == updated.get('browser_reset_id'):
                     raise ValueError('Reset receipt was already issued; verify a new closure boundary')
             elif disk.get('browser_reset_id') != updated.get('browser_reset_id') or (
@@ -165,6 +189,61 @@ class TaskState:
                 raise ValueError('Invalid task revision; preserve current state')
             updated['state_revision'] = revision + 1
             atomic_write_json(target, updated, backup_count=0)
+
+    def read_record(self):
+        """Read a validated disk snapshot without refreshing cached page authority."""
+        target = self.root / (self.task_id + '.json')
+        ensure_no_reparse_components(target)
+        if target.exists():
+            record = json.loads(target.read_text(encoding='utf-8'))
+        elif self.record and not self.record.get('state_revision'):
+            record = self.record
+        else:
+            raise ValueError('Persisted task record is missing; inspect it before continuing')
+        self._validate_record(record, self.task_id)
+        return record
+
+    def retirement_record(self, group_id, expected_revision, target_ids):
+        """Take the exact disk revision before collecting browser evidence."""
+        record = self.read_record()
+        if record.get('state_revision', 0) != expected_revision:
+            raise ValueError('Task revision changed; inspect the current record before retirement')
+        pages = [p for p in record['pages'] if p.get('groupId') == group_id]
+        history = [p for p in record.get('prior_bindings', []) if p.get('groupId') == group_id]
+        if (not pages or {p['targetId'] for p in pages + history} != set(target_ids)
+                or any(not isinstance(p.get('url'), str) or not p['url'].strip()
+                       or type(p.get('tabId')) is not int for p in pages + history)
+                or any(p.get('targetId') in target_ids and p.get('groupId') != group_id
+                       for p in record['pages'] + record.get('prior_bindings', []))):
+            raise ValueError('Recorded group membership is different or ambiguous; preserve prior bindings')
+        return record
+
+    def retire_missing_group(self, record, group_id, target_ids, operation_guard):
+        """Archive the approved absent binding inside the same CAS transaction."""
+        archived = {}
+        updated = dict(record)
+        belongs = {
+            'pages': lambda p: p.get('groupId') == group_id,
+            'groups': lambda g: g.get('id', g.get('groupId')) == group_id,
+            'prior_bindings': lambda p: p.get('groupId') == group_id,
+            'used_tabs': lambda p: p['targetId'] in target_ids,
+            'retained': lambda entry: entry[0][1] in target_ids,
+            'review_required': lambda key: key[1] in target_ids,
+        }
+        for name, selected in belongs.items():
+            if name in record:
+                archived[name] = [row for row in record[name] if selected(row)]
+                updated[name] = [row for row in record[name] if not selected(row)]
+        receipt_id = str(uuid.uuid4())
+        receipt = dict(id=receipt_id, groupId=group_id, targetIds=sorted(target_ids),
+                       revision=record.get('state_revision', 0), removed=archived,
+                       session=record.get('session'), pages_session=record.get('pages_session'))
+        # Legacy bridges already refuse to write a schema they cannot read.
+        # Only a ledger with an explicit retirement moves to the new schema.
+        updated.update(schema_version=2, retirement_id=receipt_id,
+                       retired_bindings=[*record.get('retired_bindings', []), receipt])
+        self._write_record(updated, retire_binding=True, expected_state=record, operation_guard=operation_guard)
+        return updated['state_revision']
 
     def checkpoint_session(self, session):
         if self.task_id and session and self.record.get('session') != session:

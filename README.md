@@ -129,6 +129,20 @@ and use the current page IDs. The bridge rejects queued requests from before
 the replacement. Local tool discovery and the passive event stream never
 perform the repair.
 
+If the operator explicitly abandons an absent task group, use the binding's
+`stateRevision` and `recordedGroupTargets` from `workspace_cleanup begin`.
+Call `workspace_cleanup` with `action: "retire"`, the same `task_id`, and
+`retirement: {group_id, revision, target_ids, confirmed: true}` for the one
+authorized group. Reconnect the affected chat with the current bridge before
+retiring a binding. The tool compares two native inventories, including hidden
+tabs, window and group membership, and unmapped page targets. The final
+inventory follows browser identity verification and must agree with Neo's SDK
+aliases. A live or possibly restoring tab, inconsistent inventory, or changed
+revision preserves the binding. The profile operation boundary gates bridge
+requests. Desktop changes can still occur after the final observation.
+After retirement, the current bridge requires `tabs action=list` and the new
+inventory receipt for subsequent actions.
+
 If a transport reset occurs while an owned listener is still present, the
 bridge retries MCP readiness briefly. The same rule covers the gap between
 the old browser exiting and its replacement acquiring CDP. That request does
