@@ -137,6 +137,14 @@ and use the current page IDs. The bridge rejects queued requests from before
 the replacement. Local tool discovery and the passive event stream never
 perform the repair.
 
+A `resume` response with zero restored candidates means that the group could
+not be matched. Use `workspace_cleanup assess_retirement` with the same
+`task_id` and exact old `group_id` from `begin`. Call `tabs action=list` separately
+and pass its inventory receipt when present. Assessment does not reconnect or consume a reset receipt.
+The assessment reads two complete inventories and returns exact retirement
+arguments only when absence is verified. It never archives a binding or grants
+authorization. Live or unresolved tabs keep the binding pending.
+
 If the operator explicitly abandons an absent task group, use the binding's
 `stateRevision` and `recordedGroupTargets` from `workspace_cleanup begin`.
 Call `workspace_cleanup` with `action: "retire"`, the same `task_id`, and

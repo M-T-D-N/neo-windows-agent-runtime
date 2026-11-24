@@ -125,9 +125,30 @@ class RetireMissingGroupTests(unittest.IsolatedAsyncioTestCase):
         await bridge.handle(self.cleanup_request('resume'))
         self.assertIn('read-only restored candidates', json.dumps(output[-1]))
         reason = output[-1]['result']['structuredContent']['reason']
-        self.assertEqual(json.loads(reason.split('candidates: ', 1)[1]),
+        self.assertEqual(json.loads(reason.rsplit('candidates: ', 1)[1]),
                          [{'priorGroupId': 'old-group', 'candidates': []}])
         self.assertEqual(json.loads(self.path.read_bytes()), self.saved)
+        self.assertIn('No restored candidates', reason)
+        self.assertIn('assess_retirement', reason)
+        self.assertNotIn('Explicit human designation required', reason)
+        await bridge.handle(self.cleanup_request('check'))
+        check_reason = output[-1]['result']['structuredContent']['reason']
+        self.assertIn('No restored candidates', check_reason)
+        self.assertIn('assess_retirement', check_reason)
+        await bridge.handle(self.tabs_request('list'))
+        receipt = output[-1]['result'].get('_meta', {}).get('com.workspace.neo/inventory_receipt')
+        baseline = self.path.read_bytes()
+        await bridge.handle(self.cleanup_request('assess_retirement', group_id='old-group',
+                                                 inventory_receipt=receipt))
+        assessment = output[-1]['result']['structuredContent']
+        self.assertEqual(assessment['retirementStatus'], 'absent_at_assessment')
+        self.assertEqual(assessment['retirementInput'],
+                         dict(group_id='old-group', revision=73, target_ids=['old-target']))
+        self.assertTrue(assessment['userAuthorizationRequired'])
+        self.assertEqual(self.path.read_bytes(), baseline)
+        await bridge.handle(self.cleanup_request(retirement=assessment['retirementInput']))
+        self.assertEqual(output[-1]['result']['structuredContent']['decision'], 'block')
+        self.assertEqual(self.path.read_bytes(), baseline)
         queued = stale.handle(self.tabs_request('new', url='about:blank'))
         await bridge.handle(self.cleanup_request(retirement=self.selection))
         value = output[-1]['result']['structuredContent']
@@ -282,6 +303,40 @@ class RetireMissingGroupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(observed['recordedGroupTargets']['old-group'], ['also-recorded', 'old-target'])
         self.assertEqual(first.task_state.record['state_revision'], 73)
         self.assertEqual(self.calls, [])
+
+    async def test_retirement_assessment_preserves_possible_live_tab_and_rejects_drift(self):
+        for case in ('same-address', 'different-revision', 'inventory-drift', 'unknown-group'):
+            with self.subTest(case=case):
+                self.setup_task()
+                if case == 'same-address':
+                    # An ungrouped same-address tab is not a restored group candidate.
+                    self.pages.append(dict(targetId='separate', tabId=41, pageId=41,
+                                           groupId=None, url=self.saved['pages'][0]['url'],
+                                           windowId=30, ownership='user'))
+                if case == 'different-revision':
+                    self.change_revision_during_proof = True
+                if case == 'inventory-drift':
+                    def change_between_reads(count, data):
+                        if count == 2:
+                            data['targets'].append(dict(targetId='new-service-worker',
+                                                        type='service_worker', url='https://example.com/sw'))
+                    self.inventory_transform = change_between_reads
+                bridge, output = self.connect()
+                await bridge.handle(self.tabs_request('list'))
+                receipt = output[-1]['result'].get('_meta', {}).get('com.workspace.neo/inventory_receipt')
+                before = self.path.read_bytes()
+                group = 'unknown-group' if case == 'unknown-group' else 'old-group'
+                await bridge.handle(self.cleanup_request('assess_retirement', group_id=group,
+                                                         inventory_receipt=receipt))
+                value = output[-1]['result']['structuredContent']
+                self.assertEqual(value['decision'], 'block')
+                self.assertNotIn('retirementInput', value)
+                if case == 'different-revision':
+                    self.assertEqual(json.loads(self.path.read_bytes()), dict(self.saved, state_revision=74))
+                else:
+                    self.assertEqual(self.path.read_bytes(), before)
+                self.assertEqual([args['action'] for name, args in self.calls if name == 'tabs'], ['list'])
+                self.assertEqual(self.neighbor.read_text(encoding='utf-8'), 'unrelated untouched')
 
     async def test_abandon_archives_only_old_binding_and_preserves_same_url_tabs(self):
         self.setup_task()

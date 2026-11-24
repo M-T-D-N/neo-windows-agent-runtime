@@ -218,6 +218,14 @@ class TaskState:
         self._validate_record(record, self.task_id)
         return record
 
+    @staticmethod
+    def recorded_group_targets(record):
+        by_group = {}
+        for page in record.get('pages', []) + record.get('prior_bindings', []):
+            if page.get('groupId') and page.get('targetId'):
+                by_group.setdefault(page['groupId'], set()).add(page['targetId'])
+        return {group: sorted(targets) for group, targets in by_group.items()}
+
     def retirement_record(self, group_id, expected_revision, target_ids):
         """Take the exact disk revision before collecting browser evidence."""
         record = self.read_record()

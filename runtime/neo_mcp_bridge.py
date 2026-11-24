@@ -404,7 +404,7 @@ class Bridge:
             f'request with inventory_receipt={receipt}. Do not repeat an unverified save/upload/post.'})
         return {'jsonrpc': '2.0', 'id': message['id'], 'result': upstream}
 
-    async def internal_tool(self, name, arguments):
+    async def internal_tool(self, name, arguments, *, observation_session=None):
         self.sequence += 1
         call = {'jsonrpc':'2.0', 'id':f'neo-task-{self.sequence}', 'method':'tools/call',
                 'params':{'name':name, 'arguments':arguments}}
@@ -414,7 +414,10 @@ class Bridge:
             raise UpstreamError('Task reconciliation RPC failed; preserve existing bindings')
         result = (reply or {}).get('result') or {}
         handle = (result.get('_meta') or {}).get(SESSION_META_KEY)
-        if handle:
+        if observation_session is not None:
+            if self.reset_pending or handle != observation_session:
+                raise UpstreamError('Neo session changed during assessment; call tabs action=list separately')
+        elif handle:
             self.tool_session = handle
             self.consume_reset_receipt()
         if result.get('isError'):
@@ -486,14 +489,14 @@ class Bridge:
                 'recoveryPages': [{'targetId': target, 'url': url} for target, url in recovery_pages.items()],
                 'notice': 'Observation is not ownership or recovery approval. Resume rechecks every current alias, URL and owner.'}
 
-    async def verify_retirement_absence(self, record, selection, *, abandon=False):
+    async def verify_retirement_absence(self, record, selection, *, abandon=False, observation_session=None):
         """Use full native inventory, including targets hidden from the SDK."""
         observed = await self.internal_tool('run', {'code':
             'return {tabs:(await browser.cdp("Browser.getTabs",{includeHidden:true})).tabs, '
             'windows:(await browser.cdp("Browser.getWindows",{})).windows, '
             'groups:(await browser.cdp("Browser.getTabGroups",{})).groups, '
             'targets:(await browser.cdp("Target.getTargets",{})).targetInfos, '
-            'pages:await browser.pages.list()};'})
+            'pages:await browser.pages.list()};'}, observation_session=observation_session)
         result = observed.get('structuredContent') or {}
         info = result.get('value')
         if result.get('ok') is not True or not isinstance(info, dict):
@@ -573,18 +576,44 @@ class Bridge:
             {t['targetId']: tuple(t.get(key) for key in identity_keys) for t in tabs})
         return counts, fingerprint
 
-    async def retire_task_group(self, message, selection, operation_guard, *, abandon=False):
+    async def stable_retirement_evidence(self, baseline, selection, *, abandon=False, assessment=False):
         if not self.task_state or not self.tool_session:
             raise UpstreamError('Retirement requires a durable task and an existing Neo session')
-        baseline = self.task_state.retirement_record(
-            selection['group_id'], selection['revision'], selection['target_ids'])
-        await self.ensure_ready(allow_start=False)
-        _, first = await self.verify_retirement_absence(baseline, selection, abandon=abandon)
+        if not assessment:
+            await self.ensure_ready(allow_start=False)
+        observation_session = self.tool_session if assessment else None
+        _, first = await self.verify_retirement_absence(
+            baseline, selection, abandon=abandon, observation_session=observation_session)
         if await self.guard_endpoint() is False:
             raise UpstreamError('Browser became unavailable during retirement; preserve the recorded binding')
-        evidence, latest = await self.verify_retirement_absence(baseline, selection, abandon=abandon)
+        evidence, latest = await self.verify_retirement_absence(
+            baseline, selection, abandon=abandon, observation_session=observation_session)
         if first != latest:
             raise UpstreamError('Browser inventory changed during retirement; preserve the recorded binding')
+        return evidence
+
+    async def assess_retirement(self, group_id):
+        if not self.task_state:
+            raise UpstreamError('Retirement assessment requires a durable task')
+        baseline = self.task_state.read_record()
+        targets = self.task_state.recorded_group_targets(baseline).get(group_id)
+        if not targets:
+            raise ValueError('The selected group is not recorded for this task')
+        selection = dict(group_id=group_id, revision=baseline.get('state_revision', 0), target_ids=targets)
+        self.task_state.retirement_record(group_id, selection['revision'], targets)
+        evidence = await self.stable_retirement_evidence(baseline, selection, assessment=True)
+        if self.task_state.read_record() != baseline:
+            raise UpstreamError('Task record changed during assessment; inspect the latest revision')
+        return dict(groupId=group_id, retirementStatus='absent_at_assessment', absenceVerified=evidence,
+                    retirementInput=selection, userAuthorizationRequired=True,
+                    notice='Ask the user to authorize retirement. Retire rechecks browser inventory and revision.')
+
+    async def retire_task_group(self, message, selection, operation_guard, *, abandon=False):
+        if not self.task_state:
+            raise UpstreamError('Retirement requires a durable task')
+        baseline = self.task_state.retirement_record(
+            selection['group_id'], selection['revision'], selection['target_ids'])
+        evidence = await self.stable_retirement_evidence(baseline, selection, abandon=abandon)
         revision = self.task_state.archive_group(
             baseline, selection['group_id'], set(selection['target_ids']), operation_guard, abandon=abandon)
         self.bind_task(self.task_state.task_id)
@@ -624,7 +653,18 @@ class Bridge:
                 native_targets=info.get('targets'), observed_session=self.tool_session)
             if missing:
                 self.task_prepared = False
-                raise UpstreamError('Restored task evidence requires explicit recovery; preserve original binding: ' + json.dumps(missing))
+                raise UpstreamError('Restored task evidence requires explicit recovery; preserve original binding: '
+                                    + self.restored_binding_details(missing))
+
+    @staticmethod
+    def restored_binding_details(missing):
+        no_match = [group['priorGroupId'] for group in missing if not group['candidates']]
+        if not no_match:
+            return 'read-only restored candidates: ' + json.dumps(missing)
+        return ('No restored candidates for ' + json.dumps(no_match)
+                + '. Candidate absence does not prove tab absence. Use assess_retirement with the exact old '
+                  'group ID, then retire only after user authorization. '
+                  'read-only restored candidates: ' + json.dumps(missing))
 
     async def prepare_task(self, *, claim=True, recovery=None, allow_expired=False):
         if not self.task_state:
@@ -645,8 +685,11 @@ class Bridge:
                 hint = ('With direct authorization to give up a specific old binding, '
                         'use retire for a group proven absent, or abandon to archive the old binding '
                         'while leaving every current tab untouched. These do not grant tab ownership. ')
-                raise UpstreamError('Explicit human designation required; ' + hint
-                                    + 'read-only restored candidates: ' + json.dumps(missing))
+                if not any(group['candidates'] for group in missing):
+                    hint = 'Previous bindings remain pending; '
+                else:
+                    hint = 'Explicit human designation required for groups with candidates; ' + hint
+                raise UpstreamError(hint + self.restored_binding_details(missing))
         if conflicts or (candidates and not claim):
             raise UpstreamError(f'Prior task tabs require ownership reconciliation: {conflicts}')
         restored = None
@@ -1282,8 +1325,9 @@ class Bridge:
             raise ValueError('condition is accepted only by defer')
         if 'recovery' in args and args.get('action') != 'resume':
             raise ValueError('Explicit recovery is accepted only by resume')
-        if 'group_id' in args and args.get('action') != 'inventory':
-            raise ValueError('group_id is accepted only by inventory')
+        observation_actions = ('inventory', 'assess_retirement')
+        if 'group_id' in args and args.get('action') not in observation_actions:
+            raise ValueError('group_id is accepted only by inventory or assess_retirement')
         action = args.get('action')
         group_actions = {'retire': 'retirement', 'abandon': 'abandonment', 'unpark_recovery': 'parked_binding'}
         if action in group_actions or set(group_actions.values()) & args.keys():
@@ -1303,25 +1347,29 @@ class Bridge:
             if action in ('retire', 'abandon'):
                 return await self.retire_task_group(message, selection, operation_guard, abandon=action == 'abandon')
             return await self.unpark_binding(message, selection, operation_guard)
-        if args.get('action') == 'inventory' and (
+        if action in observation_actions and (
                 set(args) != {'action', 'task_id', 'group_id'}
                 or not isinstance(args['group_id'], str) or not args['group_id'].strip()):
-            raise ValueError('inventory accepts only action, task_id and a nonempty exact group_id')
+            raise ValueError(f'{action} accepts only action, task_id and a nonempty exact group_id')
         self.bind_task(args.get("task_id"), refresh_scope=args.get('action') not in ('begin', 'outputs'))
         current = (self.task_state.record or {}) if self.task_state else {}
         if (arrival_retirement_id != current.get('retirement_id')
-                and args.get('action') not in ('begin', 'outputs', 'check', 'inventory')):
+                and action not in ('begin', 'outputs', 'check', *observation_actions)):
             raise UpstreamError('Cleanup predates task retirement; inspect a fresh tabs list and issue a new request')
-        if self.reset_requires_inventory and args.get('action') not in ('begin','outputs','check'):
+        if action == 'assess_retirement' and (self.reset_requires_inventory or self.reset_pending):
+            raise UpstreamError('Retirement assessment requires a fresh inventory; call tabs action=list separately')
+        if self.reset_requires_inventory and action not in ('begin','outputs','check'):
             return await self.reconnect_inventory(message)
         recorded_reset = current.get('browser_reset_id') or current.get('retirement_id')
         if (self.endpoint_epoch or recorded_reset) and args.get('action') not in ('begin','outputs','check'):
             if not self.inventory_receipt or inventory_receipt != self.inventory_receipt:
                 raise UpstreamError('Post-reset cleanup requires inventory_receipt from this connection\'s tabs action=list; use current page IDs and issue a fresh request')
-        if args.get('action') == 'inventory':
-            # Resolve the recovery-input/prepare_task cycle through a fixed read,
-            # never by allowing arbitrary run code past reconciliation.
-            value = await self.recovery_inventory(args['group_id'])
+        if action in observation_actions:
+            # Only fixed observations bypass reconciliation.
+            if action == 'assess_retirement':
+                value = await self.assess_retirement(args['group_id'])
+            else:
+                value = await self.recovery_inventory(args['group_id'])
             result = {'content': [{'type': 'text', 'text': json.dumps(value, ensure_ascii=False)}],
                       'structuredContent': value}
             if self.tool_session:
@@ -1338,13 +1386,9 @@ class Bridge:
         if args.get('action') == 'begin':
             self.reset_requires_begin = False
             record = self.task_state.read_record() if self.task_state else {}
-            by_group = {}
-            for page in record.get('pages', []) + record.get('prior_bindings', []):
-                if page.get('groupId') and page.get('targetId'):
-                    by_group.setdefault(page['groupId'], set()).add(page['targetId'])
             value = {'taskBound':True, 'browserStarted':False, 'priorPages':record.get('pages',[]), 'resumeRequired':bool(record.get('pages')), 'priorUsedTabs':record.get('used_tabs',[]),
                      'stateRevision':record.get('state_revision', 0),
-                     'recordedGroupTargets': {group: sorted(targets) for group, targets in by_group.items()}}
+                     'recordedGroupTargets': self.task_state.recorded_group_targets(record) if self.task_state else {}}
             if parked := self.task_state.parked_groups(record) if self.task_state else {}:
                 value['parkedGroupTargets'] = {g: receipt['targetIds'] for g, receipt in parked.items()}
             if record.get('browser_reset_pending'):

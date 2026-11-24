@@ -183,6 +183,66 @@ class DispatchBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 if queued is not None:queued.close()
                 await bridge.close()
 
+    async def test_assess_retirement_never_consumes_pending_reset_receipt(self):
+        for existing in (False, True):
+            with self.subTest(existing_bridge=existing), tempfile.TemporaryDirectory(
+                dir=os.environ['WEB_AUTOMATION_TEST_ROOT']
+            ) as directory:
+                output, calls = [], []
+                state = TaskState(directory)
+                state.bind(TASK)
+                state.save('old-session', [], [])
+                path = Path(directory) / (TASK + '.json')
+
+                def handler(request):
+                    calls.append(json.loads(request.content))
+                    return reply(request, dict(content=[dict(type='text', text='No tabs')]))
+
+                def bridge_for_record():
+                    return Bridge('http://127.0.0.1:9010/mcp', output.append, state_root=directory,
+                                  task_id=TASK, client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+                bridge = bridge_for_record() if existing else None
+                try:
+                    expected = state.read_record()
+                    with state.browser_operation(exclusive=True) as guard:
+                        state._write_record(closed(expected), administrator_reset=True,
+                                            expected_state=expected, operation_guard=guard)
+                    bridge = bridge or bridge_for_record()
+                    bridge.ensure_ready = AsyncMock()
+
+                    def rpc(name, args):
+                        return dict(jsonrpc='2.0', id=1, method='tools/call',
+                                    params=dict(name=name, arguments=args))
+
+                    async def assess(**kwargs):
+                        await bridge.handle(rpc('workspace_cleanup', dict(
+                            action='assess_retirement', task_id=TASK, group_id='old-group', **kwargs)))
+                        return output[-1]['result']['structuredContent']
+
+                    before = path.read_bytes()
+                    blocked = await assess()
+                    self.assertEqual(blocked['decision'], 'block')
+                    self.assertIn('tabs action=list separately', blocked['reason'])
+                    self.assertEqual(path.read_bytes(), before)
+                    self.assertTrue(json.loads(before)['browser_reset_pending'])
+                    self.assertEqual(json.loads(before)['state_revision'], state.read_record()['state_revision'])
+                    self.assertEqual(calls, [])
+                    bridge.ensure_ready.assert_not_awaited()
+
+                    await bridge.handle(rpc('tabs', dict(action='list')))
+                    receipt = output[-1]['result']['_meta'][INVENTORY_META_KEY]
+                    listed = path.read_bytes()
+                    self.assertFalse(json.loads(listed)['browser_reset_pending'])
+                    self.assertEqual(len(calls), 1)
+                    self.assertIn('not recorded for this task',
+                                  (await assess(inventory_receipt=receipt))['reason'])
+                    self.assertEqual(path.read_bytes(), listed)
+                    self.assertEqual(len(calls), 1)
+                finally:
+                    if bridge is not None:
+                        await bridge.close()
+
     async def test_administrator_waits_for_inflight_post_and_internal_reconciliation(self):
         for phase in ('dispatch','reconciliation'):
             with self.subTest(phase=phase),tempfile.TemporaryDirectory(dir=os.environ['WEB_AUTOMATION_TEST_ROOT']) as directory:
