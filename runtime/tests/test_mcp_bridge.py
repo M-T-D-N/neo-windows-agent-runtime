@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from queue import Queue
+from threading import Thread
 
 import httpx
 
@@ -20,7 +22,7 @@ CALL = {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
         "params": {"name": "run", "arguments": {"code": "return 1"}}}
 
 class StdioEncodingTests(unittest.TestCase):
-    def start_isolated_bridge(self, root, task_id=None):
+    def start_isolated_bridge(self, root, task_id=None, client='agy'):
         plan = root / 'runtime-plan.json'
         plan.write_text(json.dumps({
             'mcp_endpoint': 'http://127.0.0.1:1/mcp',
@@ -43,7 +45,7 @@ sys.stderr.reconfigure(encoding='utf-8')
 with asyncio.Runner(loop_factory=getattr(neo, 'GuardedProactorEventLoop', None)) as runner:
     runner.run(neo.main(plan))
 """
-        command = [sys.executable, '-B', '-c', program, str(plan), '--client', 'agy']
+        command = [sys.executable, '-B', '-c', program, str(plan), '--client', client]
         if task_id:
             command.extend(['--task-id', task_id])
         return subprocess.Popen(command,
@@ -69,6 +71,49 @@ with asyncio.Runner(loop_factory=getattr(neo, 'GuardedProactorEventLoop', None))
                 # On Windows a virtualenv redirector may be the direct parent.
                 self.assertIn(process.pid, (record['pid'], record['parent_pid']))
                 self.assertEqual(record['active_tool_handlers'], 0)
+
+    def test_real_stdio_omits_and_blocks_human_help_for_both_clients_while_offline(self):
+        names = ('request_human_help', 'await_human_help')
+        for client in ('codex', 'agy'):
+            with self.subTest(client=client), tempfile.TemporaryDirectory(
+                dir=os.environ.get('WEB_AUTOMATION_TEST_ROOT')
+            ) as folder:
+                requests = [INIT, {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'}]
+                requests.extend(dict(CALL, id=number, params={'name': name, 'arguments': {}})
+                                for number, name in enumerate(names, 3))
+                with self.start_isolated_bridge(Path(folder), client=client) as process:
+                    lines = Queue()
+
+                    def read_replies():
+                        for line in process.stdout:
+                            lines.put(line)
+
+                    Thread(target=read_replies, daemon=True).start()
+                    replies = {}
+                    try:
+                        for request in requests:
+                            process.stdin.write((json.dumps(request) + '\n').encode('utf-8'))
+                            process.stdin.flush()
+                            reply = json.loads(lines.get(timeout=10))
+                            self.assertEqual(reply['id'], request['id'])
+                            replies[reply['id']] = reply['result']
+                        process.stdin.close()
+                        self.assertEqual(process.wait(timeout=10), 0, process.stderr.read())
+                    finally:
+                        if process.poll() is None:
+                            process.kill()
+                            process.wait(timeout=10)
+                instructions = replies[1]['instructions']
+                self.assertIn('ask in chat', instructions)
+                self.assertTrue(all(name not in instructions for name in names))
+                tools = {tool['name'] for tool in replies[2]['tools']}
+                self.assertTrue({'tabs', 'run', 'workspace_cleanup'}.issubset(tools))
+                self.assertTrue(tools.isdisjoint(names))
+                for number in (3, 4):
+                    result = replies[number]
+                    self.assertTrue(result['isError'])
+                    self.assertEqual(result['structuredContent'], dict(
+                        code='NEO_HUMAN_HELP_DISABLED', requestedActionExecuted=False))
 
     def test_closed_host_output_logs_bound_exit_without_request_contents(self):
         task_id = 'c858215e-f9cc-4376-bca1-cfd82896f849'
@@ -639,39 +684,6 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await bridge.handle(CALL)
         self.assertEqual(calls, ["ping", "initialize", "tools/call"])
         self.assertFalse(output[-1]["result"].get("isError", False))
-
-    async def test_help_wait_explains_handback_on_same_session_and_preserves_resolution(self):
-        body = 'Still waiting for a human (75s so far). Call await_human_help to keep waiting; do nothing else on the page.'
-        calls = []
-        def handler(request):
-            message = json.loads(request.content)
-            if message['method'] == 'ping':
-                return response(request)
-            params = message['params']
-            calls.append(params)
-            result = {'content': [{'type': 'text', 'text': body}], '_meta': {SESSION_META_KEY: 'same-help-session'}}
-            if params['name'] == 'await_human_help':
-                result['structuredContent'] = {'status': 'resolved', 'requestId': 'request-1'}
-                result['content'][0]['text'] = 'The human handed control back.'
-            return response(request, result)
-        bridge, output = await self.make_bridge(handler)
-        await bridge.handle(INIT)
-        instructions = output[-1]['result']['instructions']
-        self.assertIn('Hand back to the agent', instructions)
-        self.assertNotIn('call await_human_help again', instructions)
-        await bridge.handle({'jsonrpc': '2.0', 'id': 3, 'method': 'tools/list'})
-        tools = {tool['name']: tool for tool in output[-1]['result']['tools']}
-        self.assertIn('Hand back to the agent', tools['await_human_help']['description'])
-        await bridge.handle(dict(CALL, params={'name': 'request_human_help', 'arguments': {'reason': 'Sign in'}}))
-        waiting = output[-1]['result']
-        self.assertIn('Hand back to the agent', waiting['content'][0]['text'])
-        self.assertIn('yield this turn', waiting['content'][0]['text'])
-        self.assertEqual(waiting['_meta'][SESSION_META_KEY], 'same-help-session')
-        self.assertEqual([item['name'] for item in calls], ['request_human_help'])
-        await bridge.handle(dict(CALL, params={'name': 'await_human_help', 'arguments': {'requestId': 'request-1'}}))
-        self.assertEqual(calls[-1]['arguments']['requestId'], 'request-1')
-        self.assertEqual(calls[-1]['arguments']['session'], 'same-help-session')
-        self.assertEqual(output[-1]['result']['structuredContent']['status'], 'resolved')
 
     async def test_pdf_result_does_not_validate_a_different_empty_tab(self):
         nonce = '0123456789abcdef'

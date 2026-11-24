@@ -42,22 +42,11 @@ HOST_RECONNECT_GUIDANCE = (
     'reconnect (mcp_control.restart where available), then verify from this same chat. '
     'A running browser does not prove this client is connected. Never replay an '
     'unconfirmed dispatched action. ')
-HELP_TOOLS = {'request_human_help', 'await_human_help'}
-HELP_WAIT_GUIDANCE = (
-    'Status: waiting. The request remains open and page work is paused. In Neo’s cockpit, select this '
-    'request, take control if needed, and choose “Hand back to the agent” after completing '
-    'the step. If Neo is in the tray, open its existing window to see the request; '
-    'if Windows is locked, return after unlocking. Signing in or replying in chat does not return Neo control. Tell the user '
-    'how to hand back control and yield this turn. On their return, await this same request '
-    'in the same Neo session once. Do not loop, open another request or delete the group. '
-    'Resume only after status resolved and a fresh page check.')
-HELP_WAIT_TEXT = re.compile(
-    r'Still waiting for a human \(\d+s so far\)\. Call await_human_help to keep waiting; do nothing else on the page\.'
-    r'|The wait call ended before a human responded\. Call await_human_help to keep waiting; do nothing else on the page\.')
-UPSTREAM_HELP_POLLING = (
-    'It returns a status: while it is "waiting", call await_human_help again and\n'
-    'do nothing else on the page; stop waiting only when the status is "resolved" (a\n'
-    'human handed control back, continue the task), "cancelled", or "timed_out".')
+DISABLED_HELP_TOOLS = ('request_human_help', 'await_human_help')
+CHAT_HELP_GUIDANCE = (
+    'If a human must complete a sign-in, verification, account choice, or approval, ask in chat. '
+    'Pause the affected browser work. On return, inspect the same tab and verify the needed step '
+    'before resuming within the original authorization. ')
 READ_FRAME = re.compile(r'^\[UNTRUSTED_PAGE_CONTENT nonce=([a-f0-9]{16}) origin=[^\n]*\][^\n]*\n')
 READ_CONTENT_PROPERTY = {'type': 'boolean', 'description':
     'Require nonempty rendered content for a markdown/text read. Use with a selector for the expected '
@@ -104,15 +93,6 @@ def apply_result_guidance(name, upstream, require_content):
                     'reason': reason, 'requestedActionExecuted': False}
                 content.append({'type': 'text', 'text': NAVIGATION_RESTORE_GUIDANCE})
         return
-    if name in HELP_TOOLS:
-        structured = upstream.get('structuredContent') or {}
-        waiting = isinstance(structured, dict) and structured.get('status') == 'waiting'
-        for block in content:
-            if block.get('type') == 'text' and HELP_WAIT_TEXT.fullmatch(block.get('text', '')):
-                block['text'] = HELP_WAIT_GUIDANCE
-                return
-        if waiting:
-            upstream.setdefault('content', []).append({'type': 'text', 'text': HELP_WAIT_GUIDANCE})
     if name != 'read' or not require_content:
         return
     for block in content:
@@ -1010,8 +990,16 @@ class Bridge:
         delivered_page_inventory = False
         try:
             if method == 'tools/call':
-                p=message.get('params') or {}
-                a=p.get('arguments') or {}
+                p = message.get('params') or {}
+                if p.get('name') in DISABLED_HELP_TOOLS:
+                    result = {'isError': True,
+                              'content': [{'type': 'text', 'text': 'NEO_HUMAN_HELP_DISABLED: '
+                                  'In-browser help is disabled. Ask the user in chat if a human step is required.'}],
+                              'structuredContent': {'code': 'NEO_HUMAN_HELP_DISABLED',
+                                                    'requestedActionExecuted': False}}
+                    self.emit({'jsonrpc': '2.0', 'id': message['id'], 'result': result})
+                    return
+                a = p.get('arguments') or {}
                 if not (p.get('name') == CLEANUP_TOOL_NAME and a.get('action') in ('begin','outputs')):
                     await self.guard_endpoint(defer_recovery=True)  # Reject foreign owners before task bookkeeping.
             if method == "ping":
@@ -1022,9 +1010,10 @@ class Bridge:
                     self.initialize = message
                     value = copy.deepcopy(self.catalog['initialize'])
                     value['protocolVersion'] = message['params']['protocolVersion']
-                    upstream_instructions = value.get('instructions','').replace(
-                        UPSTREAM_HELP_POLLING, HELP_WAIT_GUIDANCE)
-                    value['instructions'] = RECONNECT_GUIDANCE + HOST_RECONNECT_GUIDANCE + 'Workspace rules take precedence over the generic upstream tab advice below: resume prior recorded task tabs before opening any new tab. Reuse existing task tabs, and register actually reused business tabs with workspace_cleanup use/pageIds/reason; check mine plus registered physical targets at completion. Use/defer never grant close rights. For human-help waiting, follow the returned hand-back guidance rather than polling continuously. ' + upstream_instructions
+                    upstream_instructions = '\n\n'.join(
+                        paragraph for paragraph in value.get('instructions', '').split('\n\n')
+                        if not any(name in paragraph for name in DISABLED_HELP_TOOLS))
+                    value['instructions'] = RECONNECT_GUIDANCE + HOST_RECONNECT_GUIDANCE + CHAT_HELP_GUIDANCE + 'Workspace rules take precedence over the generic upstream tab advice below: resume prior recorded task tabs before opening any new tab. Reuse existing task tabs, and register actually reused business tabs with workspace_cleanup use/pageIds/reason; check mine plus registered physical targets at completion. Use/defer never grant close rights. ' + upstream_instructions
                     if self.cleanup.task_id:
                         value['instructions'] = f'Workspace task_id={self.cleanup.task_id} is already bound. Reuse prior recorded pages. Before final response call workspace_cleanup check including registered used targets; close disposable mine tabs, retain only specific next use or unsaved/pending work, and verify absence. For retain/release pass pageIds as an integer array, not page_id or pages; retain also requires a concrete reason. Every cleanup call requires task_id and has no session argument. ' + value['instructions']
                     result = {'jsonrpc':'2.0', 'id':message['id'], 'result':value}
@@ -1033,19 +1022,13 @@ class Bridge:
                 return
             elif method == 'tools/list':
                 value = copy.deepcopy(self.catalog['catalog'])
+                value['tools'] = [tool for tool in value['tools'] if tool.get('name') not in DISABLED_HELP_TOOLS]
                 # Reclaim is an internal ledger-validated recovery operation, not
                 # an agent-selected way to acquire arbitrary existing groups.
                 for tool in value['tools']:
                     name = tool.get('name')
                     properties = tool.setdefault('inputSchema', {}).setdefault('properties', {})
                     properties['inventory_receipt'] = copy.deepcopy(INVENTORY_PROPERTY)
-                    if name in HELP_TOOLS:
-                        tool['description'] = (
-                            'Request help in the Neo cockpit.' if name == 'request_human_help'
-                            else 'Check the same open Neo cockpit request after the user returns.')
-                        tool['description'] += (
-                            ' To return control, the user chooses “Hand back to the agent”. '
-                            'If still waiting, tell the user and yield; resume only after resolved.')
                     if name == 'read':
                         properties['requireContent'] = copy.deepcopy(READ_CONTENT_PROPERTY)
                     if name == 'pdf':

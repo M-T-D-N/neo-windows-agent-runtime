@@ -31,10 +31,9 @@ or change permissions.
    user authorization. Dismiss `beforeunload` unless unsaved contents are safely
    saved/recovered or their loss is explicitly authorized. A timeout/response loss
    is uncertain; inspect actual results and never replay a dispatched publish call.
-   When Neo human help returns `waiting`, tell the user to choose **Hand back to
-   the agent** in the Neo cockpit and yield. After the user returns, check that
-   same request in the same session once. Resume after `resolved` and a fresh
-   page check. PDF success covers its own tab. For a required section on the
+   Ask in chat when the user must complete sign-in, verification or approval.
+   Pause the affected tab, then verify the required step on that same tab before
+   resuming. PDF success covers its own tab. For a required section on the
    working tab, use `read` with its selector and `requireContent: true`. An
    unverified read requires checking the tab, dialog or explicit empty state.
 6. At completion, close only this task's disposable owned tabs, verify absence,

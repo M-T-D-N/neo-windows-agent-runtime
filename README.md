@@ -5,6 +5,14 @@ BrowserOS neo. The qualified combination is **BrowserOS neo 0.52.1.1**
 (Chromium 155.0.8318.26) and the protected **Claw Server 0.0.65**.
 Current-PC isolated qualification covers this version pair. Other-PC testing is deferred.
 
+## Unattended operation
+
+The stdio bridge omits the two in-browser human-help tools for Codex and AGY.
+A stale call to either tool is rejected locally before launching Neo or reaching
+the browser. If sign-in, verification, or approval requires a person, ask in
+chat and recheck the same tab before resuming. This applies to connections through
+this bridge. Neo still uses its dedicated Windows browser window.
+
 ## v0.1.9: browser update and screen-lock restart
 
 The launcher disables Chromium's screen-lock Smart Restart trigger for the dedicated
