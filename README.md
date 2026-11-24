@@ -356,6 +356,13 @@ returned `inventory_receipt`. Initialization never starts an off browser, adopts
 groups, or replays a save/upload/post. Failed inventory/delivery and previously
 queued requests cannot authorize page operations.
 
+After inventory has been delivered, a missing or outdated receipt returns
+`NEO_INVENTORY_RECEIPT_REQUIRED` in the first text field and the structured
+error code. Use the receipt and identifiers from this connection's latest
+tab list. A pre-dispatch readiness failure returns `NEO_NOT_READY`. If the
+response was lost after dispatch, `OUTCOME_UNKNOWN` requires checking the
+actual result before considering another request.
+
 For a managed restart that preserves task tabs, check active requests and unsaved
 input, then run the installed runtime's `stop-neo.py --confirmed-safe` with its
 private Python. The command verifies the dedicated process and loopback identity,

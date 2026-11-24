@@ -1326,9 +1326,9 @@ class Bridge:
                             if sent else "Tool request was NOT dispatched. Fix runtime readiness before invoking the tool again.")
                 result = {"isError": True}
                 if isinstance(error, InventoryReceiptRequired) and not sent:
+                    status = "NEO_INVENTORY_RECEIPT_REQUIRED"
                     guidance = 'Tool request was NOT dispatched. Use the receipt and current identifiers from your latest tabs list.'
-                    result["structuredContent"] = {"code": "NEO_INVENTORY_RECEIPT_REQUIRED",
-                                                   "requestedActionExecuted": False}
+                    result["structuredContent"] = {"code": status, "requestedActionExecuted": False}
                 result["content"] = [{"type": "text", "text": f"{status}: {guidance} {detail}"}]
                 self.emit({"jsonrpc": "2.0", "id": message["id"], "result": result})
             else:

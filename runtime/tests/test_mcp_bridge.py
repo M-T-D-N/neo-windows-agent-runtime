@@ -803,7 +803,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         bridge.initialize = INIT
         await bridge.handle(CALL)
         self.assertEqual(calls, ["ping"])
-        self.assertIn("NEO_NOT_READY", output[-1]["result"]["content"][0]["text"])
+        self.assertEqual(output[-1]["result"]["content"][0]["text"].partition(":")[0], "NEO_NOT_READY")
 
     async def test_dispatched_initialize_required_error_never_replays_tool(self):
         calls = []
@@ -817,7 +817,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         bridge.initialize = INIT
         await bridge.handle(CALL)
         self.assertEqual(calls, ["ping", "tools/call"])
-        self.assertIn("OUTCOME_UNKNOWN", output[-1]["result"]["content"][0]["text"])
+        self.assertEqual(output[-1]["result"]["content"][0]["text"].partition(":")[0], "OUTCOME_UNKNOWN")
 
     async def test_503_while_starting_is_retried_only_for_initialization(self):
         state = {"ready": False}
@@ -1083,11 +1083,14 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await bridge.handle({'jsonrpc':'2.0','id':2,'method':'tools/call','params':{
             'name':'tabs','arguments':{'action':'list'}}})
         self.assertEqual(output[-1]['result']['_meta']['com.workspace.neo/inventory_receipt'],bridge.inventory_receipt)
-        await bridge.handle(dict(old,id=3))
-        self.assertIn('requires inventory_receipt',output[-1]['result']['content'][0]['text'])
-        self.assertNotIn('Fix runtime readiness',output[-1]['result']['content'][0]['text'])
-        self.assertEqual(output[-1]['result']['structuredContent'],
-                         {'code':'NEO_INVENTORY_RECEIPT_REQUIRED','requestedActionExecuted':False})
+        for extra in ({}, {'inventory_receipt': 'outdated'}):
+            with self.subTest(extra=extra):
+                await bridge.handle(dict(old, id=3, params={
+                    'name': 'tabs', 'arguments': {'action': 'close', 'page': 5, **extra}}))
+                result = output[-1]['result']
+                self.assertEqual(result['content'][0]['text'].partition(':')[0], 'NEO_INVENTORY_RECEIPT_REQUIRED')
+                self.assertEqual(result['structuredContent'],
+                                 {'code': 'NEO_INVENTORY_RECEIPT_REQUIRED', 'requestedActionExecuted': False})
         self.assertEqual(sent,['ping','ping','tabs'])
         bridge.starter.assert_not_awaited()
 
