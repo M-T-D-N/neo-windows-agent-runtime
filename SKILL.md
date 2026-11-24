@@ -61,9 +61,12 @@ not bypass this by creating or activating a window. After an incarnation/snapsho
 session mismatch, inspect current inventory and obtain a fresh snapshot before a
 new request. Same-HWND hiding is tested separately from a tray replacing the HWND;
 first browser launch is outside this restoration guarantee.
-`NEO_WINDOW_RESTORE_BLOCKED` means a single navigation was stopped before dispatch.
-Check the existing page read-only. If needed, resume after the existing task
-window is restored from the tray or Windows is unlocked.
+`NEO_WINDOW_RESTORE_BLOCKED` with `requestedActionExecuted=false` identifies a
+single navigation or tab close stopped before dispatch. Inspect the current
+inventory. For a close, verify the same session, physical target, ownership and
+continued permission to close. Then issue one fresh close and verify target
+absence. If the guard still blocks it, preserve the binding until the window
+state changes. Resume navigation on the same page when the window is available.
 
 The `CleanupPlan:` JSON is included in MCP text. This tool has no output schema,
 so wire conversion omits `structuredContent`; do not depend on that field. The

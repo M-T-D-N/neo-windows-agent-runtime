@@ -304,6 +304,83 @@ class RetireMissingGroupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.task_state.record['state_revision'], 73)
         self.assertEqual(self.calls, [])
 
+    async def test_non_tab_worker_at_prior_url_is_not_a_restored_browser_tab(self):
+        self.setup_task()
+        self.native_only = [dict(type='service_worker', targetId='worker',
+                                 url=self.saved['pages'][0]['url'])]
+        bridge, output = self.connect()
+        await bridge.handle(self.tabs_request('list'))
+        before = self.path.read_bytes()
+        await bridge.handle(self.cleanup_request('assess_retirement', group_id='old-group'))
+        self.assertEqual(output[-1]['result']['structuredContent']['retirementStatus'], 'absent_at_assessment')
+        self.assertEqual(self.path.read_bytes(), before)
+        self.native_only[0]['tabId'] = 506
+        await bridge.handle(self.cleanup_request('assess_retirement', group_id='old-group'))
+        self.assertEqual(output[-1]['result']['structuredContent']['decision'], 'block')
+        self.assertEqual(self.path.read_bytes(), before)
+
+    async def test_two_restored_groups_report_both_even_after_selecting_one(self):
+        self.setup_task()
+        selections = []
+        for index, prior in enumerate(self.saved['pages']):
+            group = 'restored-' + str(index)
+            target = 'restored-target-' + str(index)
+            selections.append(dict(prior_group_id=prior['groupId'], group_id=group,
+                reason='Operator selected the complete restored group',
+                pages=[dict(targetId=target, url=prior['url'])]))
+        self.pages = [dict(pageId=40+i, tabId=40+i, windowId=30, groupId=s['group_id'],
+                           ownership='user', ownerAgentId=None, **s['pages'][0]) for i,s in enumerate(selections)]
+        self.groups = [dict(id=s['group_id']) for s in selections]
+        bridge, output = self.connect()
+        await bridge.handle(self.tabs_request('list'))
+        for selection in selections:
+            await bridge.handle(self.cleanup_request('resume', recovery=selection))
+            why = output[-1]['result']['structuredContent']['reason']
+            self.assertIn('multiple prior groups', why)
+            for group in selections:
+                self.assertIn(group['prior_group_id'], why)
+        self.assertFalse(any(name == 'tabs' and args['action'] != 'list' for name,args in self.calls))
+        self.assertEqual(bridge.task_state.record['pages'], self.saved['pages'])
+
+        # A user authorizes a fresh start, leaving the two restored tabs in place.
+        # Each archive must check the latest revision, even in the same bridge.
+        live = copy.deepcopy(self.pages)
+        for index, selection in enumerate(selections):
+            await bridge.handle(self.cleanup_request('begin'))
+            state = output[-1]['result']['structuredContent']
+            old_group = selection['prior_group_id']
+            abandonment = dict(group_id=old_group, revision=state['stateRevision'],
+                               target_ids=state['recordedGroupTargets'][old_group], confirmed=True)
+            if index:
+                await bridge.handle(self.cleanup_request('abandon', abandonment=dict(abandonment, revision=old_revision)))
+                self.assertIn('revision', output[-1]['result']['structuredContent']['reason'])
+            old_revision = abandonment['revision']
+            await bridge.handle(self.cleanup_request('abandon', abandonment=abandonment))
+            self.assertEqual(output[-1]['result']['structuredContent']['abandonedGroupId'], old_group)
+        await bridge.handle(self.tabs_request('list'))
+        receipt = output[-1]['result']['_meta']['com.workspace.neo/inventory_receipt']
+        await bridge.handle(self.tabs_request('new', url='about:blank', inventory_receipt=receipt))
+        self.assertFalse(output[-1]['result'].get('isError'))
+        self.assertEqual(self.pages[:-1], live)
+        self.assertEqual(self.neighbor.read_text(encoding='utf-8'), 'unrelated untouched')
+
+    async def test_failed_recovery_save_does_not_replace_in_memory_scope(self):
+        self.setup_task()
+        state = TaskState(self.root)
+        state.bind(TASK)
+        before = copy.deepcopy(state.record)
+        changed = dict(before, state_revision=before['state_revision']+1)
+        self.path.write_text(json.dumps(changed), encoding='utf-8')
+        pages = [dict(p, ownership='mine') for p in before['pages']]
+        with self.assertRaisesRegex(ValueError, 'changed in another connection'):
+            state.save(before['pages_session'], pages, before['groups'])
+        self.assertEqual(state.record, before)
+        self.assertEqual(state.read_record(), changed)
+        with self.assertRaisesRegex(ValueError, 'changed in another connection'):
+            state.checkpoint_session('another-session')
+        self.assertEqual(state.record, before)
+        self.assertEqual(state.read_record(), changed)
+
     async def test_retirement_assessment_preserves_possible_live_tab_and_rejects_drift(self):
         for case in ('same-address', 'different-revision', 'inventory-drift', 'unknown-group'):
             with self.subTest(case=case):

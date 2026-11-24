@@ -747,15 +747,19 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(observations.count('tools/call'), 1)
         self.assertFalse(output[-1]['result'].get('isError'))
 
-    async def test_window_restore_block_identifies_undispatched_navigation_only(self):
+    async def test_window_restore_block_identifies_only_known_single_actions(self):
         cases = [
-            ('navigate', 'navigate failed: Ambiguous normal windows; no automatic restoration', 'multiple_windows'),
-            ('navigate', 'navigate failed: Non-activating restoration not confirmed; action not dispatched',
+            ('navigate', None, 'navigate failed: Ambiguous normal windows; no automatic restoration', 'multiple_windows'),
+            ('navigate', None, 'navigate failed: Non-activating restoration not confirmed; action not dispatched',
              'restore_unverified'),
-            ('navigate', 'navigate failed: Foreground unavailable or changed; leave window untouched',
+            ('navigate', None, 'navigate failed: Foreground unavailable or changed; leave window untouched',
              'foreground_unavailable'),
-            ('navigate', 'navigate failed: upstream connection ended', None),
-            ('run', 'navigate failed: Ambiguous normal windows; no automatic restoration', None),
+            ('navigate', None, 'navigate failed: upstream connection ended', None),
+            ('run', None, 'navigate failed: Ambiguous normal windows; no automatic restoration', None),
+            ('tabs', 'close', 'tabs failed: Non-activating restoration not confirmed; action not dispatched',
+             'restore_unverified'),
+            ('tabs', 'close', 'tabs failed: close timed out', None),
+            ('tabs', 'new', 'tabs failed: Non-activating restoration not confirmed; action not dispatched', None),
         ]
         next_result = iter(cases)
         dispatches = []
@@ -763,7 +767,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             message = json.loads(request.content)
             if message['method'] == 'ping':
                 return response(request)
-            name, raw_error, _ = next(next_result)
+            name, _, raw_error, _ = next(next_result)
             self.assertEqual(message['params']['name'], name)
             dispatches.append(name)
             return response(request, {
@@ -772,8 +776,10 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             })
         bridge, output = await self.make_bridge(handler)
         await bridge.handle(INIT)
-        for name, raw_error, reason in cases:
+        for name, action, raw_error, reason in cases:
             args = {'page': 5, 'url': 'about:blank'} if name == 'navigate' else {'code': 'return 1'}
+            if name == 'tabs':
+                args = {'action': action, 'page': 5} if action == 'close' else {'action': 'new'}
             await bridge.handle(dict(CALL, params={'name': name, 'arguments': args}))
             result = output[-1]['result']
             self.assertTrue(result['isError'])
@@ -1079,6 +1085,9 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(output[-1]['result']['_meta']['com.workspace.neo/inventory_receipt'],bridge.inventory_receipt)
         await bridge.handle(dict(old,id=3))
         self.assertIn('requires inventory_receipt',output[-1]['result']['content'][0]['text'])
+        self.assertNotIn('Fix runtime readiness',output[-1]['result']['content'][0]['text'])
+        self.assertEqual(output[-1]['result']['structuredContent'],
+                         {'code':'NEO_INVENTORY_RECEIPT_REQUIRED','requestedActionExecuted':False})
         self.assertEqual(sent,['ping','ping','tabs'])
         bridge.starter.assert_not_awaited()
 

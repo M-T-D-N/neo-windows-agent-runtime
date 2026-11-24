@@ -130,12 +130,13 @@ class TaskState:
                 raise ValueError('Credential-bearing URL cannot be stored; preserve existing binding')
         group_ids = {p.get('groupId') for p in selected}
         matched = [g for g in groups if g.get('id', g.get('groupId')) in group_ids]
-        self.record.update(session=session, pages_session=session, pages=selected, groups=matched)
-        self.record['prior_bindings'] = [p for p in self.record.get('prior_bindings', [])
-                                        if p.get('targetId') not in mine]
+        updated = dict(self.record, session=session, pages_session=session, pages=selected, groups=matched)
+        updated['prior_bindings'] = [p for p in self.record.get('prior_bindings', [])
+                                     if p.get('targetId') not in mine]
         if retained is not None:
-            self.record['retained'] = list(retained)
-        self._write_record()
+            updated['retained'] = list(retained)
+        self._write_record(updated)
+        self.record = updated
 
     def save_used(self, used):
         """Persist explicit business scope even if later ownership bookkeeping fails."""
@@ -298,14 +299,15 @@ class TaskState:
 
     def checkpoint_session(self, session):
         if self.task_id and session and self.record.get('session') != session:
+            updated = dict(self.record, session=session)
             owner_session = self.record.get('pages_session')
             if owner_session and owner_session != session:
                 prior = {p['targetId']:p for p in self.record.get('prior_bindings', [])}
                 for page in self.record.get('pages', []):
                     prior[page['targetId']] = dict(page, session=owner_session)
-                self.record['prior_bindings'] = list(prior.values())
-            self.record['session'] = session
-            self._write_record()
+                updated['prior_bindings'] = list(prior.values())
+            self._write_record(updated)
+            self.record = updated
 
     def mark_execution(self, execution_id):
         if execution_id and self.task_id:

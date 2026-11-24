@@ -79,19 +79,26 @@ from neo_tab_identity import credential_bearing_url, other_owner
 from neo_transport import BrowserRecordStale, OwnedEndpointTransition
 
 
-def apply_result_guidance(name, upstream, require_content):
+def apply_result_guidance(name, upstream, require_content, action=None):
     content = upstream.get('content') or []
     if upstream.get('isError'):
-        # Only the dedicated navigation tool can certify one action was skipped.
+        # Both native paths prepare the window before sending the page command.
         # A failed run may have executed earlier effects before reaching this guard.
         first = content[0] if content else {}
-        prefix = 'navigate failed: '
-        if name == 'navigate' and first.get('type') == 'text' and first.get('text', '').startswith(prefix):
+        close = name == 'tabs' and action == 'close'
+        prefix = f'{name} failed: '
+        if (name == 'navigate' or close) and first.get('type') == 'text' and first.get('text', '').startswith(prefix):
             reason = NAVIGATION_RESTORE_BLOCKS.get(first['text'][len(prefix):])
             if reason:
                 upstream.setdefault('_meta', {})[WINDOW_BLOCK_META_KEY] = {
                     'reason': reason, 'requestedActionExecuted': False}
-                content.append({'type': 'text', 'text': NAVIGATION_RESTORE_GUIDANCE})
+                guidance = (
+                    'NEO_WINDOW_RESTORE_BLOCKED: The close was stopped before dispatch. Keep the binding. '
+                    'Read the current inventory and verify the same session, physical target, and task ownership. '
+                    'If they still match, issue a fresh close when the existing window is available. '
+                    'Do not mark it closed until inventory confirms absence.'
+                    if close else NAVIGATION_RESTORE_GUIDANCE)
+                content.append({'type': 'text', 'text': guidance})
         return
     if name != 'read' or not require_content:
         return
@@ -142,6 +149,10 @@ class UpstreamError(Exception):
 
 class EndpointIdentityError(UpstreamError):
     pass
+
+
+class InventoryReceiptRequired(UpstreamError):
+    """The request was refused locally before dispatch."""
 
 
 class BrowserGenerationChanged(EndpointIdentityError):
@@ -556,12 +567,17 @@ class Bridge:
         prior_urls = {p['url'] for p in prior}
         prior_tabs = {p['tabId'] for p in prior}
         if (old_group in group_ids or old_targets.intersection(ids)
-                or any(t.get('tabId') in prior_tabs for t in targets + tabs)
-                or (not abandon and any(p['url'] in prior_urls for p in targets + tabs + pages))):
+                or any(t.get('tabId') in prior_tabs for t in targets + tabs)):
             # A browser tab can survive a renderer replacement, group move and
             # navigation. Older records lack a browser generation, so even an
             # ambiguous tab-ID match is evidence to preserve, never to claim.
             raise UpstreamError('Recorded group, target, or possible restored page still exists; preserve the binding')
+        if not abandon and any(row['url'] in prior_urls and
+                               (row['type'] not in ('service_worker', 'shared_worker', 'worker') or
+                                'tabId' in row or 'windowId' in row) for row in targets):
+            raise UpstreamError('A possible restored page still exists at the recorded URL. Preserve it. '
+                                'For a fresh start, use abandon only with explicit user authorization '
+                                'for this exact old binding; abandon verifies original IDs separately.')
         if any(row['targetId'] not in physical and row['type'] not in non_tab_types
                and not (row['type'] == 'browser_ui' and row['url'].startswith('chrome://')
                         and 'tabId' not in row and 'windowId' not in row)
@@ -659,9 +675,15 @@ class Bridge:
     @staticmethod
     def restored_binding_details(missing):
         no_match = [group['priorGroupId'] for group in missing if not group['candidates']]
+        prefix = ''
+        if len(missing) > 1:
+            prefix = ('There are multiple prior groups. Selecting one restored group cannot resolve the others. '
+                      'For a fresh start, inspect each exact old group: retire only proven-absent bindings, '
+                      'or abandon explicitly authorized original bindings while preserving current tabs. '
+                      'Read the latest revision with begin after each change. ')
         if not no_match:
-            return 'read-only restored candidates: ' + json.dumps(missing)
-        return ('No restored candidates for ' + json.dumps(no_match)
+            return prefix + 'read-only restored candidates: ' + json.dumps(missing)
+        return (prefix + 'No restored candidates for ' + json.dumps(no_match)
                 + '. Candidate absence does not prove tab absence. Use assess_retirement with the exact old '
                   'group ID, then retire only after user authorization. '
                   'read-only restored candidates: ' + json.dumps(missing))
@@ -679,13 +701,12 @@ class Bridge:
         candidates, conflicts = self.task_state.reconciliation(info['pages'], info['groups'], recovery=recovery,
             allow_expired=claim and allow_expired and 'reclaim_expired' in actions, native_targets=info.get('targets'))
         if 'reclaim_restored' in actions:
-            missing = [item for item in self.task_state.restored_candidates(info['pages'], info['groups'], native_targets=info.get('targets'))
-                       if recovery is None or item['priorGroupId'] != recovery['prior_group_id']]
-            if missing:
+            missing = self.task_state.restored_candidates(info['pages'], info['groups'], native_targets=info.get('targets'))
+            if any(recovery is None or item['priorGroupId'] != recovery['prior_group_id'] for item in missing):
                 hint = ('With direct authorization to give up a specific old binding, '
                         'use retire for a group proven absent, or abandon to archive the old binding '
                         'while leaving every current tab untouched. These do not grant tab ownership. ')
-                if not any(group['candidates'] for group in missing):
+                if len(missing) > 1 or not any(group['candidates'] for group in missing):
                     hint = 'Previous bindings remain pending; '
                 else:
                     hint = 'Explicit human designation required for groups with candidates; ' + hint
@@ -787,8 +808,8 @@ class Bridge:
                 native_targets=info.get('targets'))
             if remaining or conflicts:
                 raise UpstreamError('Selected group recovery remains unverified; preserve prior bindings')
-        self.task_prepared = True
         self.task_state.save(self.tool_session, info['pages'], info['groups'], native_targets=info.get('targets'), recovery=recovery, native_recoveries=native_recoveries)
+        self.task_prepared = True
 
     async def remember_task(self, *, info=None):
         if self.task_state and self.task_state.task_id:
@@ -1171,7 +1192,7 @@ class Bridge:
                             raise UpstreamError('Fresh caller-visible inventory required after reset: call tabs action=list, select its current page IDs/session, then issue a fresh request. Queued prior requests are not replayed')
                         if (requires_receipt and not inventory_only
                                 and (not self.inventory_receipt or inventory_receipt != self.inventory_receipt)):
-                            raise UpstreamError('Post-reset request requires inventory_receipt from this connection\'s tabs action=list. Select current page IDs/session and issue a fresh request; old requests are not replayed')
+                            raise InventoryReceiptRequired('Post-reset request requires inventory_receipt from this connection\'s tabs action=list. Select current page IDs/session and issue a fresh request; old requests are not replayed')
                         if requires_receipt and supplied_session is not None and supplied_session != self.tool_session:
                             if not inventory_only:
                                 raise UpstreamError('Retired session hint cannot address current pages. Select current page IDs/session from tabs action=list and issue a fresh request')
@@ -1234,7 +1255,7 @@ class Bridge:
                             self.tool_session = handle
                             self.consume_reset_receipt()
                         upstream = (result or {}).get("result", {})
-                        apply_result_guidance(params.get('name'), upstream, require_content)
+                        apply_result_guidance(params.get('name'), upstream, require_content, args.get('action'))
                         if (inventory_only and params.get('name')=='tabs' and isinstance(result,dict)
                                 and 'result' in result and 'error' not in result and not upstream.get('isError')
                                 and any(c.get('type')=='text' and c.get('text','').strip() for c in upstream.get('content',[]))):
@@ -1303,8 +1324,13 @@ class Bridge:
                 status = "OUTCOME_UNKNOWN" if sent else "NEO_NOT_READY"
                 guidance = ("Request was dispatched and will NOT be replayed. Inspect the actual page/saved result before retrying any action."
                             if sent else "Tool request was NOT dispatched. Fix runtime readiness before invoking the tool again.")
-                self.emit({"jsonrpc": "2.0", "id": message["id"], "result": {
-                    "isError": True, "content": [{"type": "text", "text": f"{status}: {guidance} {detail}"}]}})
+                result = {"isError": True}
+                if isinstance(error, InventoryReceiptRequired) and not sent:
+                    guidance = 'Tool request was NOT dispatched. Use the receipt and current identifiers from your latest tabs list.'
+                    result["structuredContent"] = {"code": "NEO_INVENTORY_RECEIPT_REQUIRED",
+                                                   "requestedActionExecuted": False}
+                result["content"] = [{"type": "text", "text": f"{status}: {guidance} {detail}"}]
+                self.emit({"jsonrpc": "2.0", "id": message["id"], "result": result})
             else:
                 self.emit({"jsonrpc": "2.0", "id": message["id"],
                            "error": {"code": -32000, "message": detail}})
