@@ -23,7 +23,10 @@ class TaskState:
         root=self.root.parent.parent if self.root.parent.name=='task-tabs' else self.root
         return OperationBoundary(root/'browser-operations.lock',exclusive=exclusive,timeout=timeout)
 
-    def bind(self, task_id):
+    def task_operation(self):
+        return OperationBoundary(self.root / (self.task_id + '.operation'), exclusive=True)
+
+    def bind(self, task_id, *, refresh_scope=False):
         if str(uuid.UUID(task_id)) != task_id:
             raise ValueError("Use the actual lowercase task UUID")
         if self.task_id and self.task_id != task_id:
@@ -35,7 +38,8 @@ class TaskState:
             fresh = json.loads(path.read_text(encoding='utf-8'))
             self._validate_record(fresh, task_id)
             reset = fresh.get('browser_reset_id')
-            if (fresh.get('retirement_id') != self.record.get('retirement_id')
+            if (refresh_scope and fresh.get('state_revision') != self.record.get('state_revision')
+                    or fresh.get('retirement_id') != self.record.get('retirement_id')
                     or reset is not None and (reset != self.record.get('browser_reset_id') or
                     self.record.get('browser_reset_pending') is True and fresh.get('browser_reset_pending') is False)):
                 fresh['outputs'] = self._merge_outputs(self.record, fresh)
@@ -50,11 +54,11 @@ class TaskState:
     @classmethod
     def _validate_record(cls, record, task_id):
         if (not isinstance(record, dict) or record.get('task_id') != task_id
-                or type(record.get('schema_version')) is not int or record['schema_version'] not in (1, 2)):
+                or type(record.get('schema_version')) is not int or record['schema_version'] not in (1, 2, 3)):
             raise ValueError("Invalid/future task binding; preserve it for inspection")
         receipt = record.get('retirement_id')
         history = record.get('retired_bindings')
-        if record['schema_version'] == 2:
+        if record['schema_version'] in (2, 3):
             if (not isinstance(receipt, str) or str(uuid.UUID(receipt)) != receipt
                     or not isinstance(history, list) or not history
                     or not isinstance(history[-1], dict) or history[-1].get('id') != receipt):
@@ -147,7 +151,7 @@ class TaskState:
         self.record=updated
 
     def _write_record(self, record=None, *, administrator_reset=False, consume_reset=False,
-                      retire_binding=False, expected_state=None, operation_guard=None):
+                      retire_binding=False, expected_state=None, operation_guard=None, outputs_only=False):
         if administrator_reset or retire_binding:
             if not isinstance(operation_guard,OperationBoundary):
                 raise ValueError('Task administration requires the profile exclusive operation boundary')
@@ -183,10 +187,21 @@ class TaskState:
                 raise ValueError('Reset changed in another connection; bind before writing')
             elif consume_reset and disk.get('browser_reset_pending') is False and disk.get('session') != updated.get('session'):
                 raise ValueError('Reset was consumed by another connection; bind before continuing')
-            updated['outputs'] = self._merge_outputs(disk, self.record, updated)
             revision = disk.get('state_revision',0)
             if type(revision) is not int or revision < 0:
                 raise ValueError('Invalid task revision; preserve current state')
+            outputs = self._merge_outputs(disk, self.record, updated)
+            if outputs_only:
+                # An output receipt cannot write a cached page binding back.
+                stored = dict(disk or updated, outputs=outputs, state_revision=revision+1)
+                atomic_write_json(target, stored, backup_count=0)
+                updated['outputs'] = outputs
+                if updated.get('state_revision',0) == revision:
+                    updated['state_revision'] = revision+1
+                return
+            if expected_state is None and revision != updated.get('state_revision',0):
+                raise ValueError('Task scope changed in another connection; inspect current inventory')
+            updated['outputs'] = outputs
             updated['state_revision'] = revision + 1
             atomic_write_json(target, updated, backup_count=0)
 
@@ -218,8 +233,14 @@ class TaskState:
             raise ValueError('Recorded group membership is different or ambiguous; preserve prior bindings')
         return record
 
-    def retire_missing_group(self, record, group_id, target_ids, operation_guard):
-        """Archive the approved absent binding inside the same CAS transaction."""
+    @staticmethod
+    def parked_groups(record):
+        receipts = {item['groupId']: item for item in record.get('retired_bindings', [])
+                    if item.get('disposition') in ('parked', 'resumed')}
+        return {group: item for group, item in receipts.items() if item['disposition'] == 'parked'}
+
+    def archive_group(self, record, group_id, target_ids, operation_guard, *, abandon=False):
+        """Archive only the approved prior binding in the same CAS transaction."""
         archived = {}
         updated = dict(record)
         belongs = {
@@ -238,10 +259,32 @@ class TaskState:
         receipt = dict(id=receipt_id, groupId=group_id, targetIds=sorted(target_ids),
                        revision=record.get('state_revision', 0), removed=archived,
                        session=record.get('session'), pages_session=record.get('pages_session'))
+        if abandon:
+            receipt['disposition'] = 'abandoned'
         # Legacy bridges already refuse to write a schema they cannot read.
         # Only a ledger with an explicit retirement moves to the new schema.
-        updated.update(schema_version=2, retirement_id=receipt_id,
+        updated.update(schema_version=record['schema_version'] if record['schema_version'] == 3 else 2, retirement_id=receipt_id,
                        retired_bindings=[*record.get('retired_bindings', []), receipt])
+        self._write_record(updated, retire_binding=True, expected_state=record, operation_guard=operation_guard)
+        return updated['state_revision']
+
+    def resume_parked_group(self, record, group_id, target_ids, operation_guard):
+        receipt = next((item for item in reversed(record.get('retired_bindings', []))
+                        if item.get('groupId') == group_id), None)
+        if (not receipt or receipt.get('disposition') != 'parked'
+                or receipt['targetIds'] != sorted(target_ids) or record['pages']):
+            raise ValueError('Parked membership changed or the current task still owns tabs; preserve the parked binding')
+        updated = dict(record, pages_session=receipt['pages_session'])
+        for name, rows in receipt['removed'].items():
+            current = record.get(name, [])
+            if name not in ('pages', 'groups', 'prior_bindings', 'used_tabs', 'retained', 'review_required'):
+                raise ValueError('Unsupported parked scope; preserve the record')
+            if name == 'used_tabs' and {p['targetId'] for p in current} & set(target_ids):
+                raise ValueError('Active work is tracking the parked target; preserve both scopes')
+            updated[name] = [*current, *(row for row in rows if row not in current)]
+        resumed = dict(id=str(uuid.uuid4()), groupId=group_id, targetIds=sorted(target_ids),
+                       revision=record.get('state_revision', 0), disposition='resumed')
+        updated.update(retirement_id=resumed['id'], retired_bindings=[*record['retired_bindings'], resumed])
         self._write_record(updated, retire_binding=True, expected_state=record, operation_guard=operation_guard)
         return updated['state_revision']
 
@@ -345,7 +388,7 @@ class TaskState:
             raise ValueError('Output path already recorded; preserve its original provenance')
         entries.append(entry)
         updated['outputs'] = entries
-        self._write_record(updated)
+        self._write_record(updated, outputs_only=True)
         self.record = updated
         return True
 

@@ -143,6 +143,17 @@ requests. Desktop changes can still occur after the final observation.
 After retirement, the current bridge requires `tabs action=list` and the new
 inventory receipt for subsequent actions.
 
+After an interrupted server exit, a different physical tab at the same
+address might be a restored tab or one opened separately. If the user
+explicitly gives up the exact old binding, use `workspace_cleanup abandon`
+with `abandonment: {group_id, revision, target_ids, confirmed: true}`.
+The bridge checks the native inventories before archiving the old record.
+Any surviving original group, physical target or tab ID, incomplete
+inventory, or concurrent change blocks abandonment. Same-address tabs
+with different identities stay open under their current owners. No tab is
+closed, claimed, or navigated by abandonment. Fetch a fresh tab list and use
+an existing compatible tab when permitted before opening another.
+
 If a transport reset occurs while an owned listener is still present, the
 bridge retries MCP readiness briefly. The same rule covers the gap between
 the old browser exiting and its replacement acquiring CDP. That request does

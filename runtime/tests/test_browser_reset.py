@@ -214,12 +214,34 @@ class BrowserResetTests(unittest.IsolatedAsyncioTestCase):
         def append(state,name):
             updated=dict(state.record,outputs=state.record['outputs']+[{'path':name}])
             barrier.wait(timeout=5)
-            state._write_record(updated)
+            state._write_record(updated, outputs_only=True)
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures=[executor.submit(append,s,n) for s,n in ((a,'a-output'),(b,'b-output'))]
             for future in futures:future.result(timeout=10)
         disk=json.loads(self.path.read_text(encoding='utf-8'))
         self.assertEqual({e['path'] for e in disk['outputs']},{'preserved-output','a-output','b-output'})
+
+    async def test_stale_scope_writer_cannot_drop_other_reused_tabs_or_restore_released_scope(self):
+        from neo_task_state import TaskState
+        first, second = TaskState(self.temp.name), TaskState(self.temp.name)
+        first.bind(TASK)
+        second.bind(TASK)
+        one = {'targetId': 'external-one'}
+        two = {'targetId': 'external-two'}
+        first.save_used([one])
+        with self.assertRaisesRegex(ValueError, 'Task scope changed'):
+            second.save_used([two])
+        refreshed = second.bind(TASK, refresh_scope=True)
+        second.save_used([*refreshed['used_tabs'], two])
+        first._write_record(dict(first.record, outputs=[{'path':'direct-output'}]), outputs_only=True)
+        disk = second.read_record()
+        self.assertEqual(disk['used_tabs'], [one, two])
+        self.assertIn('direct-output', {item['path'] for item in disk['outputs']})
+        second.bind(TASK, refresh_scope=True)
+        second.save_used([two])
+        with self.assertRaisesRegex(ValueError, 'Task scope changed'):
+            first.save_used([one])
+        self.assertEqual(second.read_record()['used_tabs'], [two])
 
     async def test_two_inflight_reset_mints_cannot_replace_first_consumed_handle(self):
         from neo_mcp_bridge import UpstreamError
@@ -277,6 +299,7 @@ class BrowserResetTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError,'changed since closure'):
             self.admin_write(state,receipt,None)
         self.assertEqual(self.path.read_bytes(),before)
+        state.bind(TASK, refresh_scope=True)
         state._write_record()  # mutation-capable dispatch advances revision
         after=self.path.read_bytes()
         self.assertNotEqual(json.loads(after)['state_revision'],expected['state_revision'])

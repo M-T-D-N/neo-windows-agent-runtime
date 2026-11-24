@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "server_sha256": "a42e0d13788dbc2a67f883899865ddaa4462b07304e22f72d4aa978e6df07bcc",
+  "server_sha256": "b971b183953a5effeb4dcc396ecbe1a1f0f3f3fbfa25db3353e88d6f09fa1525",
   "initialize": {
     "protocolVersion": "2025-06-18",
     "capabilities": {

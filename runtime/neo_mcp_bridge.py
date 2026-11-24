@@ -312,14 +312,15 @@ class Bridge:
         raise UpstreamError('Browser replacement verified. Call tabs action=list and select current IDs; '
                             'the original request was not dispatched.')
 
-    def bind_task(self, task_id):
+    def bind_task(self, task_id, *, refresh_scope=False):
         self.cleanup.bind(task_id)
         if self.task_state:
             was_bound = self.task_state.task_id is not None
             prior_reset = (self.task_state.record or {}).get('browser_reset_id')
             prior_pending = (self.task_state.record or {}).get('browser_reset_pending')
             prior_retirement = (self.task_state.record or {}).get('retirement_id')
-            record = self.task_state.bind(task_id)
+            previous = self.task_state.record
+            record = self.task_state.bind(task_id, refresh_scope=refresh_scope)
             retired = record.get('retirement_id') != prior_retirement
             reset_changed = was_bound and (record.get('browser_reset_id') != prior_reset or
                 prior_pending is True and record.get('browser_reset_pending') is False)
@@ -343,20 +344,25 @@ class Bridge:
                 self.reset_pending = True
             if self.tool_session is None:
                 self.tool_session = record['session']
+            if previous is not record:
+                self.cleanup_empty_session = self.cleanup_closed_session = None
             if record.get('browser_closed') and not record.get('pages') and not record.get('used_tabs'):
                 self.cleanup_closed_session = self.tool_session
-            if not was_bound or reset_changed or retired:
+            if not was_bound or reset_changed or retired or previous is not record:
                 self.cleanup.retained = {tuple(k):v for k,v in record.get('retained',[])}
-                self.cleanup.review_required = set(self.cleanup.retained)
+                new_boundary = not was_bound or reset_changed or retired
+                self.cleanup.review_required = (
+                    set(self.cleanup.retained) if new_boundary else
+                    {tuple(key) for key in record.get('review_required', [])})
                 self.cleanup.used = {item['targetId']:item for item in record.get('used_tabs',[])}
                 for item in self.cleanup.used.values():
-                    if item.get('deferred'):
+                    if new_boundary and item.get('deferred'):
                         item['deferred']['review_required'] = True
 
     def refresh_reset_binding(self, message):
         """Observe a verified close-all boundary without starting the browser."""
         if self.task_state and self.task_state.task_id:
-            self.bind_task(self.task_state.task_id)
+            self.bind_task(self.task_state.task_id, refresh_scope=True)
             record = self.task_state.record
             if record.get('browser_reset_id') or record.get('retirement_id'):
                 params = dict(message.get('params') or {})
@@ -375,7 +381,11 @@ class Bridge:
             yield
         else:
             async with self.task_state.browser_operation(exclusive=exclusive) as guard:
-                yield guard
+                if self.task_state.task_id:
+                    async with self.task_state.task_operation():
+                        yield guard
+                else:
+                    yield guard
 
     def consume_reset_receipt(self):
         if self.reset_pending:
@@ -428,6 +438,15 @@ class Bridge:
             self.tool_session = handle
             self.consume_reset_receipt()
         if result.get('isError'):
+            if name == 'tabs' and arguments.get('action') == 'reclaim_restored' and any(
+                    item.get('type') == 'text' and item.get('text') in (
+                        'reclaim_expired: No complete normally closed original task proof',
+                        'reclaim_expired: No complete original task closure and claim proof',
+                    ) for item in result.get('content', []) if isinstance(item, dict)):
+                raise UpstreamError(
+                    'NEO_RESTORE_CLOSURE_PROOF_MISSING: The server could not verify the prior '
+                    'session closure and exact released tab claims. Preserve the original binding '
+                    'and restored tabs; do not retry unchanged recovery inputs.')
             raise UpstreamError('Task reconciliation failed; no browser action may be replayed')
         return result
 
@@ -487,7 +506,7 @@ class Bridge:
                 'recoveryPages': [{'targetId': target, 'url': url} for target, url in recovery_pages.items()],
                 'notice': 'Observation is not ownership or recovery approval. Resume rechecks every current alias, URL and owner.'}
 
-    async def verify_retirement_absence(self, record, selection):
+    async def verify_retirement_absence(self, record, selection, *, abandon=False):
         """Use full native inventory, including targets hidden from the SDK."""
         observed = await self.internal_tool('run', {'code':
             'return {tabs:(await browser.cdp("Browser.getTabs",{includeHidden:true})).tabs, '
@@ -555,7 +574,7 @@ class Bridge:
         prior_tabs = {p['tabId'] for p in prior}
         if (old_group in group_ids or old_targets.intersection(ids)
                 or any(t.get('tabId') in prior_tabs for t in targets + tabs)
-                or any(p['url'] in prior_urls for p in targets + tabs + pages)):
+                or (not abandon and any(p['url'] in prior_urls for p in targets + tabs + pages))):
             # A browser tab can survive a renderer replacement, group move and
             # navigation. Older records lack a browser generation, so even an
             # ambiguous tab-ID match is evidence to preserve, never to claim.
@@ -574,23 +593,48 @@ class Bridge:
             {t['targetId']: tuple(t.get(key) for key in identity_keys) for t in tabs})
         return counts, fingerprint
 
-    async def retire_task_group(self, message, selection, operation_guard):
+    async def retire_task_group(self, message, selection, operation_guard, *, abandon=False):
         if not self.task_state or not self.tool_session:
             raise UpstreamError('Retirement requires a durable task and an existing Neo session')
         baseline = self.task_state.retirement_record(
             selection['group_id'], selection['revision'], selection['target_ids'])
         await self.ensure_ready(allow_start=False)
-        _, first = await self.verify_retirement_absence(baseline, selection)
+        _, first = await self.verify_retirement_absence(baseline, selection, abandon=abandon)
         if await self.guard_endpoint() is False:
             raise UpstreamError('Browser became unavailable during retirement; preserve the recorded binding')
-        evidence, latest = await self.verify_retirement_absence(baseline, selection)
+        evidence, latest = await self.verify_retirement_absence(baseline, selection, abandon=abandon)
         if first != latest:
             raise UpstreamError('Browser inventory changed during retirement; preserve the recorded binding')
-        revision = self.task_state.retire_missing_group(
-            baseline, selection['group_id'], set(selection['target_ids']), operation_guard)
+        revision = self.task_state.archive_group(
+            baseline, selection['group_id'], set(selection['target_ids']), operation_guard, abandon=abandon)
         self.bind_task(self.task_state.task_id)
-        value = {'retiredGroupId': selection['group_id'], 'previousRevision': selection['revision'],
-                 'stateRevision': revision, 'absenceVerified': evidence, 'freshInventoryRequired': True}
+        value = {'previousRevision': selection['revision'], 'stateRevision': revision,
+                 'freshInventoryRequired': True}
+        if abandon:
+            value.update(abandonedGroupId=selection['group_id'], recordedIdentitiesAbsent=evidence,
+                         browserTabsChanged=False,
+                         notice='Existing tabs were preserved and were not claimed. Reinspect before opening a tab.')
+        else:
+            value.update(retiredGroupId=selection['group_id'], absenceVerified=evidence)
+        return {'jsonrpc':'2.0', 'id':message['id'], 'result':{
+            'content':[{'type':'text','text':json.dumps(value)}], 'structuredContent':value}}
+
+    async def unpark_binding(self, message, selection, operation_guard):
+        if not self.task_state or not self.tool_session:
+            raise UpstreamError('Parking requires a durable task and an existing Neo session')
+        group_id = selection['group_id']
+        targets = set(selection['target_ids'])
+        record = self.task_state.read_record()
+        if record.get('state_revision', 0) != selection['revision']:
+            raise UpstreamError('Task revision changed; inspect the current record before parking')
+        await self.ensure_ready(allow_start=False)
+        info = await self.inventory()
+        if any(page.get('ownership') == 'mine' for page in info['pages']):
+            raise UpstreamError('Current session still owns tabs; preserve the parked binding')
+        revision = self.task_state.resume_parked_group(record, group_id, targets, operation_guard)
+        self.bind_task(self.task_state.task_id)
+        value = {'groupId': group_id, 'stateRevision': revision, 'browserTabsChanged': False,
+                 'parked': False, 'freshInventoryRequired': True}
         return {'jsonrpc':'2.0', 'id':message['id'], 'result':{
             'content':[{'type':'text','text':json.dumps(value)}], 'structuredContent':value}}
 
@@ -618,9 +662,11 @@ class Bridge:
             missing = [item for item in self.task_state.restored_candidates(info['pages'], info['groups'], native_targets=info.get('targets'))
                        if recovery is None or item['priorGroupId'] != recovery['prior_group_id']]
             if missing:
-                hint = (' For an absent group, use retire only if the user authorized abandonment and live inventory confirms absence.'
-                        if any(not item['candidates'] for item in missing) else '')
-                raise UpstreamError('Explicit human designation required; read-only restored candidates: ' + json.dumps(missing) + hint)
+                hint = ('With direct authorization to give up a specific old binding, '
+                        'use retire for a group proven absent, or abandon to archive the old binding '
+                        'while leaving every current tab untouched. These do not grant tab ownership. ')
+                raise UpstreamError('Explicit human designation required; ' + hint
+                                    + 'read-only restored candidates: ' + json.dumps(missing))
         if conflicts or (candidates and not claim):
             raise UpstreamError(f'Prior task tabs require ownership reconciliation: {conflicts}')
         restored = None
@@ -1009,7 +1055,8 @@ class Bridge:
                         tool['description'] = RECONNECT_GUIDANCE + tool.get('description', '')
                         action = properties.get('action', {})
                         if isinstance(action.get('enum'), list):
-                            action['enum'] = [item for item in action['enum'] if item not in ('reclaim','reclaim_expired','reclaim_restored')]
+                            action['enum'] = [item for item in action['enum'] if item not in (
+                                'reclaim','reclaim_expired','reclaim_restored')]
                         properties.pop('expected', None)
                         properties.pop('priorSession', None)
                         properties.pop('priorGroupId', None)
@@ -1039,7 +1086,8 @@ class Bridge:
                 try:
                     action = (message.get('params') or {}).get('arguments', {}).get('action')
                     async with self.tool_lock, self.browser_operation(
-                            local_only=action in ('begin','outputs'), exclusive=action == 'retire') as guard:
+                            local_only=action in ('begin','outputs'),
+                            exclusive=action in ('retire','abandon','unpark_recovery')) as guard:
                         if (arrival_endpoint_epoch != self.endpoint_epoch and
                                 (message.get('params') or {}).get('arguments',{}).get('action') not in ('begin','outputs')):
                             raise UpstreamError('Cleanup was queued before browser replacement; use current tab inventory')
@@ -1074,8 +1122,9 @@ class Bridge:
                             raise ValueError('inventory_receipt must be a nonempty string')
                         params['arguments'] = args
                         message = dict(message,params=params)
-                        if params.get('name') == 'tabs' and (args.get('action') in ('reclaim','reclaim_expired','reclaim_restored')
-                                or any(k in args for k in ('expected','priorSession','priorGroupId','prior'))):
+                        if params.get('name') == 'tabs' and (args.get('action') in (
+                                'reclaim','reclaim_expired','reclaim_restored')
+                                or any(k in args for k in ('expected','priorSession','priorGroupId','prior','expectedTabId','expectedWindowId'))):
                             raise ValueError('Task recovery is internal; use workspace_cleanup begin to reconcile recorded tabs')
                         requested_session = args.get("session")
                         if "session" in args and (not isinstance(requested_session, str) or not requested_session):
@@ -1131,6 +1180,8 @@ class Bridge:
                         # replacing the saved task's previous physical bindings.
                         if not observation_only:
                             await self.prepare_task()
+                            if self.task_state and self.task_state.parked_groups(self.task_state.record):
+                                raise UpstreamError('A legacy parked binding must return to recovery before browser mutations')
                         request, headers = self.tool_request(message)
                         if self.task_state and not observation_only:
                             # Advance durable state before a mutation-capable
@@ -1243,16 +1294,19 @@ class Bridge:
         schema = CLEANUP_TOOL['inputSchema']
         if (not isinstance(args, dict) or set(args) - schema['properties'].keys()
                 or any(key not in args for key in schema['required'])):
-            raise ValueError('workspace_cleanup requires action and task_id. Allowed fields: action, task_id, pageIds, reason, condition (defer only), stop_hook_active, recovery (resume only), group_id (inventory only), retirement (retire only). For retain/release use pageIds=[integer pageId]; retain requires reason. No session argument. No task state or browser was changed.')
+            raise ValueError('workspace_cleanup requires action and task_id. For retain/release use pageIds=[integer pageId]; retain requires reason. Use the tool schema for other action-specific arguments. No session argument. No task state or browser was changed.')
         if 'condition' in args and args.get('action') != 'defer':
             raise ValueError('condition is accepted only by defer')
         if 'recovery' in args and args.get('action') != 'resume':
             raise ValueError('Explicit recovery is accepted only by resume')
         if 'group_id' in args and args.get('action') != 'inventory':
             raise ValueError('group_id is accepted only by inventory')
-        if 'retirement' in args or args.get('action') == 'retire':
-            selection = args.get('retirement')
-            if (args.get('action') != 'retire' or set(args) != {'action', 'task_id', 'retirement'}
+        action = args.get('action')
+        group_actions = {'retire': 'retirement', 'abandon': 'abandonment', 'unpark_recovery': 'parked_binding'}
+        if action in group_actions or set(group_actions.values()) & args.keys():
+            key = group_actions.get(action)
+            selection = args.get(key)
+            if (key is None or set(args) != {'action', 'task_id', key}
                     or not isinstance(selection, dict)
                     or set(selection) != {'group_id', 'revision', 'target_ids', 'confirmed'}
                     or selection['confirmed'] is not True
@@ -1261,14 +1315,16 @@ class Bridge:
                     or not isinstance(selection['target_ids'], list) or not selection['target_ids']
                     or any(not isinstance(t, str) or not t.strip() for t in selection['target_ids'])
                     or len(set(selection['target_ids'])) != len(selection['target_ids'])):
-                raise ValueError('retire requires user confirmation, an exact group ID, revision, and unique prior target IDs')
-            self.bind_task(args['task_id'])
-            return await self.retire_task_group(message, selection, operation_guard)
+                raise ValueError('Group binding changes require user confirmation, an exact group ID, revision, and unique prior target IDs')
+            self.bind_task(args['task_id'], refresh_scope=True)
+            if action in ('retire', 'abandon'):
+                return await self.retire_task_group(message, selection, operation_guard, abandon=action == 'abandon')
+            return await self.unpark_binding(message, selection, operation_guard)
         if args.get('action') == 'inventory' and (
                 set(args) != {'action', 'task_id', 'group_id'}
                 or not isinstance(args['group_id'], str) or not args['group_id'].strip()):
             raise ValueError('inventory accepts only action, task_id and a nonempty exact group_id')
-        self.bind_task(args.get("task_id"))
+        self.bind_task(args.get("task_id"), refresh_scope=args.get('action') not in ('begin', 'outputs'))
         current = (self.task_state.record or {}) if self.task_state else {}
         if (arrival_retirement_id != current.get('retirement_id')
                 and args.get('action') not in ('begin', 'outputs', 'check', 'inventory')):
@@ -1306,6 +1362,8 @@ class Bridge:
             value = {'taskBound':True, 'browserStarted':False, 'priorPages':record.get('pages',[]), 'resumeRequired':bool(record.get('pages')), 'priorUsedTabs':record.get('used_tabs',[]),
                      'stateRevision':record.get('state_revision', 0),
                      'recordedGroupTargets': {group: sorted(targets) for group, targets in by_group.items()}}
+            if parked := self.task_state.parked_groups(record) if self.task_state else {}:
+                value['parkedGroupTargets'] = {g: receipt['targetIds'] for g, receipt in parked.items()}
             if record.get('browser_reset_pending'):
                 value.update(browserReset=True, priorHandlesRetired=True)
             if self.reset_requires_inventory:
@@ -1333,6 +1391,10 @@ class Bridge:
             value = {"pendingPageIds": [], "retained": [], "browserUsed": False}
         else:
             value = await self.review_task_tabs(args)
+        if args.get('action') == 'check' and self.task_state:
+            parked = self.task_state.parked_groups(self.task_state.record)
+            if parked:
+                value['parkedRecoveryGroupIds'] = sorted(parked)
         return {"jsonrpc": "2.0", "id": message["id"], "result": {
             "content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}], "structuredContent": value}}
 
@@ -1393,7 +1455,13 @@ class Bridge:
             value['pendingReconciliationGroups'] = pending_reconciliation
             value['cleanupStatus'] = 'reconciliation_required'
             if args.get('action') == 'check':
-                value.update(decision='block', reason='Prior task ownership is unresolved; preserve tabs and inspect pendingReconciliationGroups.')
+                reason = 'Prior task ownership is unresolved; preserve tabs and inspect pendingReconciliationGroups.'
+                if args.get('stop_hook_active') is True:
+                    value.pop('decision', None)
+                    value.pop('reason', None)
+                    value['systemMessage'] = reason
+                else:
+                    value.update(decision='block', reason=reason)
         if self.task_state and self.execution_id and args.get('action') in ('use','defer'):
             self.task_state.record.update(execution_id=self.execution_id, execution_incomplete=True)
         if self.task_state and self.execution_id and args.get('action') == 'check':

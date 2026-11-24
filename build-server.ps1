@@ -26,7 +26,8 @@ try {
     if($LASTEXITCODE){throw 'Sparse source selection failed'}
     & git checkout --detach $pins.server_override.source_commit
     if($LASTEXITCODE){throw 'Pinned checkout failed'}
-    foreach($name in @('neo-workspace-runtime.patch','neo-close-notice-0.0.65.patch','neo-expired-recovery-0.0.65.patch','neo-restored-recovery-0.0.65.patch','neo-page-alias-0.0.65.patch','neo-unload-window-0.0.65.patch', 'neo-shutdown-drain-0.0.65.patch')){
+    foreach($name in @('neo-workspace-runtime.patch','neo-close-notice-0.0.65.patch','neo-expired-recovery-0.0.65.patch','neo-restored-recovery-0.0.65.patch','neo-page-alias-0.0.65.patch','neo-unload-window-0.0.65.patch', 'neo-shutdown-drain-0.0.65.patch',
+            'neo-background-restore-settle-0.0.65.patch')){
         & git apply --directory=packages/browseros-agent --check (Join-Path (Join-Path $BundleRoot 'patches') $name)
         if($LASTEXITCODE){throw 'Patch check failed'}
         & git apply --directory=packages/browseros-agent (Join-Path (Join-Path $BundleRoot 'patches') $name)

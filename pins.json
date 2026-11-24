@@ -8,7 +8,7 @@
   "session_idle_ms": 86400000,
   "server_override": {
     "version": "0.0.65",
-    "sha256": "a42e0d13788dbc2a67f883899865ddaa4462b07304e22f72d4aa978e6df07bcc",
+    "sha256": "b971b183953a5effeb4dcc396ecbe1a1f0f3f3fbfa25db3353e88d6f09fa1525",
     "source_commit": "c83de8f0947b2e45074c7f71b9899365b433d421"
   },
   "upstream_repository": "https://github.com/browseros-ai/BrowserOS.git",
@@ -19,6 +19,7 @@
     "neo-restored-recovery-0.0.65.patch": "0469e9080ab0be18983451de3383abe4f202a77914e247af8ad20394db5ec140",
     "neo-page-alias-0.0.65.patch": "1cc2201d2382c1ee41230cfa83933163b444a4902fe3283d4ee801681b3db8f2",
     "neo-unload-window-0.0.65.patch": "b8a31b58aee33fbe9ae34b40bfaacd57c3ca9890a52ae5ff7c38cbc8d5cdcca3",
-    "neo-shutdown-drain-0.0.65.patch": "a4b02df3022ec1044401b22b2cd4ac7048496944d85e0799f7ee8fee11a5ab99"
+    "neo-shutdown-drain-0.0.65.patch": "a4b02df3022ec1044401b22b2cd4ac7048496944d85e0799f7ee8fee11a5ab99",
+    "neo-background-restore-settle-0.0.65.patch": "5a57e3d25ad217c0414e53a707d340e431a713e04006dd88297d5251c62147ad"
   }
 }

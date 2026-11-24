@@ -1,0 +1,98 @@
+--- a/crates/browseros-core/src/native_window.rs
++++ b/crates/browseros-core/src/native_window.rs
+@@ -1,7 +1,7 @@
+ // Windows-only restoration that never calls SetForegroundWindow or activates Neo.
+ // These FFI calls are confined here; the caller proves a unique existing CDP
+ // normal window and derives the browser PID from that same CDP connection.
+-use std::{ffi::c_void, thread, time::Duration};
++use std::{ffi::c_void, thread, time::{Duration, Instant}};
+ type Hwnd = *mut c_void;
+ #[link(name = "user32")]
+ unsafe extern "system" {
+@@ -136,6 +136,15 @@
+     }
+     Ok(())
+ }
++
++fn place_at_bottom(window: Hwnd) -> std::io::Result<()> {
++    // NOSIZE | NOMOVE | NOACTIVATE | NOOWNERZORDER | ASYNCWINDOWPOS.
++    if unsafe { SetWindowPos(window, 1usize as Hwnd, 0, 0, 0, 0, 0x4213) } == 0 {
++        return Err(std::io::Error::last_os_error());
++    }
++    Ok(())
++}
++
+ pub(crate) fn restore(ticket: WindowTicket) -> Result<(), String> {
+     validate(&ticket)?;
+     let window = ticket.window as Hwnd;
+@@ -155,13 +164,7 @@
+     validate(&ticket)?;
+     // Queue a non-activating placement at HWND_BOTTOM before show. This never
+     // uses another app's HWND as an insertion target (including fullscreen games).
+-    // NOSIZE|NOMOVE|NOACTIVATE|NOOWNERZORDER|ASYNCWINDOWPOS.
+-    if unsafe { SetWindowPos(window, 1usize as Hwnd, 0, 0, 0, 0, 0x4213) } == 0 {
+-        return Err(format!(
+-            "Background placement failed; no show dispatched: {}",
+-            std::io::Error::last_os_error()
+-        ));
+-    }
++    place_at_bottom(window).map_err(|error| format!("Background placement failed; no show dispatched: {error}"))?;
+     for _ in 0..50 {
+         if behind(window, foreground) {
+             break;
+@@ -181,21 +184,43 @@
+     if unsafe { ShowWindowAsync(window, 4) } == 0 {
+         return Err("Non-activating restore failed".into());
+     }
+-    for _ in 0..50 {
+-        if unsafe { IsIconic(window) == 0 && IsWindowVisible(window) != 0 } {
+-            break;
++    // ShowWindowAsync can settle visibility and stacking on separate events.
++    // Wait for the complete postcondition without accepting a focus change.
++    let deadline = Instant::now() + Duration::from_millis(500);
++    let mut corrected_stacking = false;
++    loop {
++        if unsafe { GetForegroundWindow() != foreground } {
++            return Err("Foreground changed after non-activating show; browser action not dispatched".into());
++        }
++        if owner(window) != pid || !live(process) {
++            return Err("Browser window identity changed after show; browser action not dispatched".into());
++        }
++        let iconic = unsafe { IsIconic(window) != 0 };
++        let visible = unsafe { IsWindowVisible(window) != 0 };
++        let in_background = behind(window, foreground);
++        if visible && !iconic && in_background {
++            validate(&ticket)?;
++            if unsafe { GetForegroundWindow() == foreground } && behind(window, foreground) {
++                return Ok(());
++            }
++        }
++        if visible && !iconic && !in_background && !corrected_stacking {
++            // Windows can reorder a restored window despite preserving keyboard
++            // focus. Correct only this verified HWND and never activate it.
++            validate(&ticket)?;
++            if unsafe { GetForegroundWindow() != foreground } {
++                return Err("Foreground changed before background correction; browser action not dispatched".into());
++            }
++            place_at_bottom(window).map_err(|error| format!("Restored window could not be placed behind foreground; browser action not dispatched: {error}"))?;
++            corrected_stacking = true;
++        }
++        if Instant::now() >= deadline {
++            return Err(format!(
++                "Non-activating show did not settle (visible={visible}, minimized={iconic}, behind={in_background}); browser action not dispatched"
++            ));
+         }
+         thread::sleep(Duration::from_millis(10));
+     }
+-    if unsafe {
+-        GetForegroundWindow() != foreground || IsIconic(window) != 0 || IsWindowVisible(window) == 0
+-    } || !behind(window, foreground)
+-        || owner(window) != pid
+-        || !live(process)
+-    {
+-        return Err("Non-activating restoration not confirmed; action not dispatched".into());
+-    }
+-    Ok(())
+ }
+ 
+ #[cfg(test)]

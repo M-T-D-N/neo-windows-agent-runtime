@@ -93,7 +93,9 @@ class RetireMissingGroupTests(unittest.IsolatedAsyncioTestCase):
             if name == 'tabs':
                 if args['action'] == 'new':
                     self.pages.append(dict(targetId='fresh-target', pageId=99, tabId=99,
-                                           url='about:blank', groupId=None, windowId=30, ownership='mine'))
+                                           url=args['url'], groupId=None, windowId=30, ownership='mine'))
+                if args['action'] == 'close':
+                    self.pages = [page for page in self.pages if page['pageId'] != args['page']]
                 result['content'] = [{'type':'text','text':'native tabs response'}]
             return httpx.Response(200, json={'jsonrpc':'2.0', 'id':rpc['id'], 'result':result})
         bridge = Bridge('http://127.0.0.1:9010/mcp', output.append,
@@ -122,7 +124,9 @@ class RetireMissingGroupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(begin['recordedGroupTargets']['old-group'], ['old-target'])
         await bridge.handle(self.cleanup_request('resume'))
         self.assertIn('read-only restored candidates', json.dumps(output[-1]))
-        self.assertIn('"candidates": []', output[-1]['result']['structuredContent']['reason'])
+        reason = output[-1]['result']['structuredContent']['reason']
+        self.assertEqual(json.loads(reason.split('candidates: ', 1)[1]),
+                         [{'priorGroupId': 'old-group', 'candidates': []}])
         self.assertEqual(json.loads(self.path.read_bytes()), self.saved)
         queued = stale.handle(self.tabs_request('new', url='about:blank'))
         await bridge.handle(self.cleanup_request(retirement=self.selection))
@@ -278,6 +282,79 @@ class RetireMissingGroupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(observed['recordedGroupTargets']['old-group'], ['also-recorded', 'old-target'])
         self.assertEqual(first.task_state.record['state_revision'], 73)
         self.assertEqual(self.calls, [])
+
+    async def test_abandon_archives_only_old_binding_and_preserves_same_url_tabs(self):
+        self.setup_task()
+        old = self.saved['pages'][0]
+        same_address = [
+            dict(old, targetId='restored-or-reopened', groupId='different-group',
+                 tabId=41, pageId=41, windowId=30, ownership='user', ownerAgentId=None),
+            dict(old, targetId='peer-target', groupId='peer-group',
+                 tabId=42, pageId=42, windowId=30, ownership='other-agent', ownerAgentId='peer'),
+        ]
+        self.pages.extend(same_address)
+        self.groups.extend(dict(id=p['groupId']) for p in same_address)
+        visible_pages = copy.deepcopy(self.pages)
+        bridge, output = self.connect()
+        stale, stale_output = self.connect()
+        await bridge.handle(self.cleanup_request(retirement=self.selection))
+        self.assertIn('still exists', output[-1]['result']['structuredContent']['reason'])
+        self.assertEqual(json.loads(self.path.read_bytes()), self.saved)
+        queued = stale.handle(self.tabs_request('new', url='https://example.com/new'))
+        await bridge.handle(self.cleanup_request('abandon', abandonment=self.selection))
+        value = output[-1]['result']['structuredContent']
+        self.assertEqual(value['abandonedGroupId'], 'old-group')
+        self.assertEqual(value['stateRevision'], 74)
+        self.assertFalse(value['browserTabsChanged'])
+        self.assertTrue(value['freshInventoryRequired'])
+        self.assertEqual(self.pages, visible_pages)
+        record = json.loads(self.path.read_bytes())
+        self.assertEqual(record['pages'], [self.saved['pages'][1]])
+        self.assertEqual(record['outputs'], self.saved['outputs'])
+        receipt = record['retired_bindings'][-1]
+        self.assertEqual(receipt['disposition'], 'abandoned')
+        self.assertEqual(receipt['removed']['pages'], [old])
+        self.assertEqual(self.neighbor.read_text(encoding='utf-8'), 'unrelated untouched')
+        # The two evidence snapshots are the only native calls during abandonment.
+        self.assertEqual(self.inventory_reads, 3)  # rejected retire + two abandonment reads
+        self.assertTrue(all('Browser.getTabs' in args['code'] for name, args in self.calls if name == 'run'))
+        self.assertFalse(any(name == 'tabs' for name, _ in self.calls))
+        await queued
+        self.assertIn('predates task retirement', json.dumps(stale_output[-1]))
+        await stale.handle(self.tabs_request('list'))
+        inventory = stale_output[-1]['result']['_meta']['com.workspace.neo/inventory_receipt']
+        await stale.handle(self.tabs_request('new', url='https://example.com/new', inventory_receipt=inventory))
+        self.assertFalse(stale_output[-1]['result'].get('isError'))
+        self.assertEqual(self.pages[:-1], visible_pages)
+
+    async def test_abandon_rejects_original_ids_unverified_inventory_or_stale_record(self):
+        for case in ('group', 'target', 'tab', 'stale', 'incomplete', 'drift', 'unconfirmed'):
+            with self.subTest(case=case):
+                self.setup_task()
+                old = self.saved['pages'][0]
+                if case in ('group', 'target', 'tab'):
+                    current = dict(old, targetId='different-target', groupId='different-group',
+                                   tabId=41, pageId=41, windowId=30, ownership='user')
+                    key = dict(group='groupId', target='targetId', tab='tabId')[case]
+                    current[key] = old[key]
+                    self.pages.append(current)
+                    self.groups.append(dict(id=current['groupId']))
+                if case == 'incomplete':
+                    self.disagree = True
+                if case == 'drift':
+                    def change_between_reads(count, data):
+                        if count == 2:
+                            data['targets'].append(dict(targetId='new-service-worker',
+                                                        type='service_worker', url='https://example.com/sw'))
+                    self.inventory_transform = change_between_reads
+                bridge, output = self.connect()
+                selection = dict(self.selection, revision=72 if case == 'stale' else 73,
+                                 confirmed=case != 'unconfirmed')
+                before = self.path.read_bytes()
+                await bridge.handle(self.cleanup_request('abandon', abandonment=selection))
+                self.assertIn('block', json.dumps(output[-1]))
+                self.assertEqual(self.path.read_bytes(), before)
+                self.assertFalse(any(name == 'tabs' for name, _ in self.calls))
 
 
 class RecoveryInventoryTests(unittest.IsolatedAsyncioTestCase):

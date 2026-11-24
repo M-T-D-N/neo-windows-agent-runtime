@@ -37,7 +37,7 @@ TOOL = {
     "description": "Workspace task tab lifecycle. Bind the actual task UUID with begin locally before browser work. Register actually reused business tabs with use/pageIds/reason before work; business research/reading/review also counts as actual reuse; incidental inventory/status observation of another task must not enroll tabs. Use never grants close rights. Check includes durable used physical targets even outside mine. For registered non-mine tabs use defer/pageIds/condition/reason after fresh inspection when unsaved, pending, actively owned elsewhere, lacking close rights, needed next or inspection failed. Deferred is preserved, not cleaned. Direct raw HTTP bypasses this local lifecycle. Resume explicitly restores uniquely proven recorded task groups through the official native group path; this action may start Neo. Inventory requires group_id and returns current physical metadata for that group without reconciliation, adoption, task-record writes or browser startup; use its recoveryPages in explicit resume recovery. Other-owner metadata remains readable, never claimable by inspection. Check/retain/release/outputs/use/defer/inventory never start Neo. Outputs is a local read-only inventory of proven direct-tool spill files, with exact identity/status/size and retention reason; inspect it at producer closeout and recycle only exact unused files after preserving follow-up/export needs. No output deletion or age expiry is performed. Automatic post-action and historical outputs remain untracked. Before ending work, check remaining task tabs. Close disposable tabs using native Neo tools. Explicitly retain pages only for confirmed next use, unsaved/pending work, or a documented inspection failure; supply a concrete reason. Retention is tied to the exact session, target and URL and accepted for one Stop boundary. Reaffirm its purpose at the next boundary. Other tasks' pages are never claimed or closed. resume recovery is only for a group explicitly selected by the human user when automatic matching fails; supply the exact current targetId/URL membership and prior group. A task or matching title alone is not user approval. Other active owners and changed membership are rejected.",
     "inputSchema": {
         "type": "object", "properties": {
-            "action": {"type": "string", "enum": ["begin", "resume", "check", "retain", "release", "outputs", "use", "defer", "inventory", "retire"]},
+            "action": {"type": "string", "enum": ["begin", "resume", "check", "retain", "release", "outputs", "use", "defer", "inventory", "retire", "abandon", "unpark_recovery"]},
             "task_id": {"type": "string", "description": "Actual stable Codex task or AGY conversation UUID. Begin binds locally without launching Neo; resume reconciles that task's recorded groups before new tabs."},
             "group_id": {"type": "string", "minLength": 1, "description": "inventory only. Exact current group ID from tab_groups/tabs list; returns physical targetId/URL metadata without adoption or page content."},
             "pageIds": {"type": "array", "items": {"type": "integer"}},
@@ -70,7 +70,22 @@ TOOL['inputSchema']['properties']['recovery']['description'] += (
     ' session/claim evidence and all current aliases are rechecked. A normal server-session receipt alone does not prove'
     ' a normal browser restart. Without a selection, preserve the original binding and inspect read-only candidates.')
 TOOL['description'] += (' Retire is a separate, explicitly authorized operation for one absent recorded group. '
-                        'It verifies native browser inventory and archives the removed binding before reuse.')
+                        'It verifies native browser inventory and archives the removed binding before reuse. '
+                        'Abandon archives only an exact old binding after direct user authorization and conclusive '
+                        'absence of all its original native IDs. It preserves every live tab and transfers no ownership.')
+TOOL['inputSchema']['properties']['parked_binding'] = {
+    **TOOL['inputSchema']['properties']['retirement'],
+    'description': ('unpark_recovery only, for returning older parked records to recovery. Use begin for '
+                    'the exact revision, group and target IDs. Never closes, adopts or starts tabs.'),
+}
+TOOL['inputSchema']['properties']['abandonment'] = {
+    **TOOL['inputSchema']['properties']['retirement'],
+    'description': ('abandon only. Requires direct authorization to give up this exact prior group and all '
+                    'its target IDs at the current revision. If the original group or any original target or tab '
+                    'ID is live or inventory is uncertain, preserve the binding. Same-address tabs with different '
+                    'identities stay open and unclaimed. This changes only the current task record.'),
+}
+
 
 class CleanupPolicy:
     def __init__(self):

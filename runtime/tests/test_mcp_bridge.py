@@ -458,7 +458,9 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(args['priorGroupId'],'original')
                         self.assertEqual(args['prior'],[dict(tabId=101,targetId='old-target',url=old['url'])])
                         self.assertEqual(args['expected'],[dict(targetId='restored-target',url=old['url'])])
-                        if mode=='rejected':return response(request,dict(isError=True,content=[dict(type='text',text='not normally closed')]))
+                        if mode=='rejected':
+                            return response(request,dict(isError=True,content=[dict(type='text',
+                                text='reclaim_expired: No complete normally closed original task proof')]))
                         if mode=='accepted':pages[0]['ownership']='mine'
                         return response(request,dict(content=[dict(type='text',text='recovery ACK')]))
                     self.assertEqual(name,'run')
@@ -495,6 +497,9 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                 else:self.assertEqual(out[-1]['result']['structuredContent']['decision'],'block')
                 if mode in ('no-designation','renamed-group','missing-group','ambiguous-groups'):
                     self.assertIn('read-only restored candidates',str(out[-1]))
+                if mode=='rejected':
+                    self.assertIn('NEO_RESTORE_CLOSURE_PROOF_MISSING',
+                                  out[-1]['result']['structuredContent']['reason'])
 
     async def test_cleanup_resume_cancellation_cancels_the_actual_internal_waiter(self):
         from unittest.mock import AsyncMock
@@ -1494,9 +1499,13 @@ class UsedBridgeTests(unittest.IsolatedAsyncioTestCase):
                 reason='Original owner recovery unresolved; preserve unfinished work')
             self.assertEqual(deferred['pendingUsedTargetIds'],[])
             self.assertEqual(len(deferred['deferredUsedPages']),1)
+            first=await invoke('check',stop_hook_active=False)
+            self.assertEqual(first['decision'],'block')
             checked=await invoke('check',stop_hook_active=True)
             self.assertTrue(checked['pendingReconciliationGroups'])
-            self.assertTrue(has_pending_cleanup(checked));self.assertEqual(checked['decision'],'block')
+            self.assertTrue(has_pending_cleanup(checked))
+            self.assertIn('systemMessage',checked)
+            self.assertNotIn('decision',checked)
             after=json.loads((Path(root)/(task+'.json')).read_text(encoding='utf-8'))
             for key in ('pages','groups','retained','session'):
                 self.assertEqual(after.get(key),before.get(key))
