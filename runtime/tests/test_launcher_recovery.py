@@ -21,6 +21,7 @@ $script:stopped=$false;$script:changed=$false
 function Get-Browser { if('__MODE__' -eq 'live'){[pscustomobject]@{ProcessId=11}} }
 function Test-Path {return $true}
 function Get-Content {
+ if('__MODE__' -like 'recycled-*'){return '{"ProcessId":11,"CreationDate":"\/Date(1735689600000)\/","CommandLine":"\"D:\\owned\\chrome.exe\" --user-data-dir=D:\\owned\\profile "}'}
  if('__MODE__' -eq 'upgraded'){return '{"ProcessId":11,"CommandLine":"\"D:\\owned\\old-chrome.exe\" --user-data-dir=D:\\owned\\profile "}'}
  return '{"ProcessId":11,"CommandLine":"\"D:\\owned\\chrome.exe\" --user-data-dir=D:\\owned\\profile "}'
 }
@@ -29,7 +30,15 @@ function Invoke-CimMethod {[pscustomobject]@{ReturnValue=0;Sid=[Security.Princip
 function Get-CimInstance {
  param($ClassName,$Filter)
  if('__MODE__' -eq 'upgraded'){return}
- if($Filter -eq 'ProcessId=11'){return}
+ if($Filter -eq 'ProcessId=11'){
+    if('__MODE__' -like 'recycled-*'){
+        $birth=if('__MODE__' -eq 'recycled-new-child'){[datetime]'2025-12-01'}else{[datetime]'2026-02-01'}
+        $exe=if('__MODE__' -eq 'recycled-unknown'){$null}else{'D:\other\app.exe'}
+        return [pscustomobject]@{CreationDate=$birth;ExecutablePath=$exe}
+    }
+    return
+ }
+ if('__MODE__' -in @('recycled-empty','recycled-unknown')){return}
  if($script:stopped){return}
  if($Filter -eq 'ProcessId=22' -and '__MODE__' -eq 'changed'){ $copy=$server.PSObject.Copy();$copy.CreationDate=[datetime]'2026-01-02';return $copy }
  return $server
@@ -38,8 +47,10 @@ function Get-NetTCPConnection {
  [pscustomobject]@{LocalPort=9210;LocalAddress='127.0.0.1';OwningProcess=$(if('__MODE__' -eq 'foreign'){99}else{22})}
 }
 function Invoke-RestMethod { $script:stopped=$true }
-try {Stop-OrphanedManagedServer; if('__MODE__' -eq 'upgraded'){if($script:stopped){exit 2}} elseif('__MODE__' -ne 'valid' -or -not $script:stopped){exit 2}}
-catch {if('__MODE__' -in @('valid','upgraded') -or $script:stopped){Write-Output $_;exit 3}}
+$noChild='__MODE__' -in @('upgraded','recycled-empty')
+$recover='__MODE__' -eq 'valid'
+try {Stop-OrphanedManagedServer; if($noChild){if($script:stopped){exit 2}} elseif(-not $recover -or -not $script:stopped){exit 2}}
+catch {if($recover -or $noChild -or $script:stopped){Write-Output $_;exit 3}}
 exit 0
 """.replace('__SOURCE__', str(source)).replace('__MODE__', mode)
         result = subprocess.run(['powershell.exe', '-NoProfile', '-Command', code], capture_output=True, text=True, timeout=10)
@@ -49,6 +60,11 @@ exit 0
     def test_foreign_port_owner_is_preserved(self): self.check('foreign')
     def test_live_browser_is_preserved(self): self.check('live')
     def test_reused_pid_is_preserved(self): self.check('changed')
+
+    def test_recycled_browser_pid(self):
+        for mode in ('recycled-empty', 'recycled-old-child', 'recycled-new-child', 'recycled-unknown'):
+            with self.subTest(mode=mode):
+                self.check(mode)
 
     def test_previous_version_record_without_server_does_not_block_upgrade(self): self.check('upgraded')
 

@@ -69,8 +69,15 @@ function Stop-OrphanedManagedServer {
     $launchPath=Join-Path (Split-Path $state -Parent) 'evidence\browser-launch.json'
     if(-not(Test-Path -LiteralPath $launchPath)){return}
     $launch=Get-Content -Encoding UTF8 -LiteralPath $launchPath -Raw | ConvertFrom-Json
-    if(Get-CimInstance Win32_Process -Filter "ProcessId=$($launch.ProcessId)"){
-        throw 'Recorded browser PID is still present; refusing orphan recovery'
+    $parentFilter="ProcessId=$($launch.ProcessId)"
+    $holder=Get-CimInstance Win32_Process -Filter $parentFilter -ErrorAction Stop
+    if($holder){
+        # Windows can recycle the PID. A legacy JSON timestamp has millisecond precision.
+        if($launch.CreationDate -isnot [datetime] -or $holder.CreationDate -isnot [datetime] -or
+           $holder.CreationDate.ToUniversalTime() -lt $launch.CreationDate.ToUniversalTime().AddMilliseconds(1) -or
+           -not $holder.ExecutablePath -or $holder.ExecutablePath -eq $browserExe){
+            throw 'Recorded browser PID is live or its replacement is unverified; refusing orphan recovery'
+        }
     }
     $override=$plan.server_override
     if(-not $override.enabled){return}
@@ -80,6 +87,7 @@ function Stop-OrphanedManagedServer {
         $_.ParentProcessId -eq $launch.ProcessId -and $_.ExecutablePath -eq $serverExe -and $_.CommandLine -eq $expectedCommand
     })
     if(-not $servers.Count){return}
+    if($holder){throw 'Managed server parent PID was recycled; preserve the server with uncertain parentage'}
     # A completed version switch has no child to stop; its older launch record
     # must not block a new browser. Validate before any actual orphan mutation.
     $expectedBrowser='"'+$browserExe+'" --user-data-dir='+$profile+' '
@@ -98,7 +106,7 @@ function Stop-OrphanedManagedServer {
     if(-not $current -or $current.CreationDate -ne $server.CreationDate -or
        $current.CommandLine -ne $server.CommandLine -or $current.ExecutablePath -ne $server.ExecutablePath -or
        $current.ParentProcessId -ne $server.ParentProcessId -or @(Get-Browser).Count -or
-       (Get-CimInstance Win32_Process -Filter "ProcessId=$($launch.ProcessId)")){throw 'Orphan identity changed before shutdown'}
+       (Get-CimInstance Win32_Process -Filter $parentFilter -ErrorAction Stop)){throw 'Orphan identity changed before shutdown'}
     Invoke-RestMethod -Uri "http://127.0.0.1:$backendPort/system/shutdown" -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 3 | Out-Null
     $deadline=[DateTime]::UtcNow.AddSeconds(10)
     do {
