@@ -83,8 +83,16 @@ function Stop-OrphanedManagedServer {
     if(-not $override.enabled){return}
     $serverExe=$override.executable.Replace('/','\')
     $expectedCommand='"'+$serverExe+'" --config="'+(Join-Path $profile '.browseros\config.json')+'"'
-    $servers=@(Get-CimInstance Win32_Process -Filter "Name='browseros-claw-server.exe'" | Where-Object {
-        $_.ParentProcessId -eq $launch.ProcessId -and $_.ExecutablePath -eq $serverExe -and $_.CommandLine -eq $expectedCommand
+    $children=@(Get-CimInstance Win32_Process -Filter "Name='browseros-claw-server.exe'" -ErrorAction Stop | Where-Object {
+        $_.ParentProcessId -eq $launch.ProcessId
+    })
+    foreach($child in $children){
+        if([string]::IsNullOrWhiteSpace($child.ExecutablePath) -or [string]::IsNullOrWhiteSpace($child.CommandLine)){
+            throw 'Managed server identity is incomplete; preserve the server before starting Neo'
+        }
+    }
+    $servers=@($children | Where-Object {
+        $_.ExecutablePath -eq $serverExe -and $_.CommandLine -eq $expectedCommand
     })
     if(-not $servers.Count){return}
     if($holder){throw 'Managed server parent PID was recycled; preserve the server with uncertain parentage'}

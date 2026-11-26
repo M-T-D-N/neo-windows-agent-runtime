@@ -39,6 +39,9 @@ function Get-CimInstance {
     return
  }
  if('__MODE__' -in @('recycled-empty','recycled-unknown')){return}
+ if('__MODE__' -eq 'recycled-no-command'){$server.CommandLine=$null}
+ if('__MODE__' -eq 'recycled-no-path'){$server.ExecutablePath=' '}
+ if('__MODE__' -eq 'recycled-unrelated'){$server.ExecutablePath='D:\other\server.exe'}
  if($script:stopped){return}
  if($Filter -eq 'ProcessId=22' -and '__MODE__' -eq 'changed'){ $copy=$server.PSObject.Copy();$copy.CreationDate=[datetime]'2026-01-02';return $copy }
  return $server
@@ -47,10 +50,13 @@ function Get-NetTCPConnection {
  [pscustomobject]@{LocalPort=9210;LocalAddress='127.0.0.1';OwningProcess=$(if('__MODE__' -eq 'foreign'){99}else{22})}
 }
 function Invoke-RestMethod { $script:stopped=$true }
-$noChild='__MODE__' -in @('upgraded','recycled-empty')
+$noChild='__MODE__' -in @('upgraded','recycled-empty','recycled-unrelated')
 $recover='__MODE__' -eq 'valid'
 try {Stop-OrphanedManagedServer; if($noChild){if($script:stopped){exit 2}} elseif(-not $recover -or -not $script:stopped){exit 2}}
-catch {if($recover -or $noChild -or $script:stopped){Write-Output $_;exit 3}}
+catch {
+ if($recover -or $noChild -or $script:stopped){Write-Output $_;exit 3}
+ if('__MODE__' -in @('recycled-no-command','recycled-no-path') -and $_.Exception.Message -notlike 'Managed server identity is incomplete*'){Write-Output $_;exit 4}
+}
 exit 0
 """.replace('__SOURCE__', str(source)).replace('__MODE__', mode)
         result = subprocess.run(['powershell.exe', '-NoProfile', '-Command', code], capture_output=True, text=True, timeout=10)
@@ -62,7 +68,8 @@ exit 0
     def test_reused_pid_is_preserved(self): self.check('changed')
 
     def test_recycled_browser_pid(self):
-        for mode in ('recycled-empty', 'recycled-old-child', 'recycled-new-child', 'recycled-unknown'):
+        for mode in ('recycled-empty', 'recycled-old-child', 'recycled-new-child', 'recycled-unknown',
+                     'recycled-no-command', 'recycled-no-path', 'recycled-unrelated'):
             with self.subTest(mode=mode):
                 self.check(mode)
 
